@@ -190,6 +190,7 @@ function createSchema(database: Database): void {
       is_bot_message INTEGER DEFAULT 0,
       is_terminal_agent_reply INTEGER DEFAULT 0,
       is_steering_message INTEGER DEFAULT 0,
+      operation_id TEXT,
       PRIMARY KEY (id, chat_jid),
       FOREIGN KEY (chat_jid) REFERENCES chats(jid)
     );
@@ -414,6 +415,12 @@ function createSchema(database: Database): void {
     CREATE TABLE IF NOT EXISTS chat_cursors (
       chat_jid             TEXT PRIMARY KEY,
       cursor_ts            TEXT NOT NULL DEFAULT '',
+      operation_id         TEXT,
+      operation_source_seq INTEGER,
+      operation_phase      TEXT,
+      operation_generation INTEGER,
+      operation_cancel_cause TEXT,
+      operation_cancel_requested_at TEXT,
       preflight_prev_ts    TEXT,
       preflight_message_id TEXT,
       preflight_started_at TEXT,
@@ -435,6 +442,68 @@ function createSchema(database: Database): void {
       auto_compaction_warned_count INTEGER,
       auto_compaction_updated_at TEXT
     );
+
+    -- Append-only accepted work registry. source_seq is the canonical order;
+    -- operation_id is bound once at frontier claim (or intent acceptance).
+    CREATE TABLE IF NOT EXISTS chat_accepted_sources (
+      source_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      chat_jid TEXT NOT NULL,
+      source_class TEXT NOT NULL,
+      source_kind TEXT NOT NULL,
+      source_id TEXT NOT NULL,
+      accepted_at TEXT NOT NULL,
+      selectable INTEGER NOT NULL,
+      payload_ref TEXT NOT NULL,
+      frontier_message_id TEXT,
+      frontier_cursor_ts TEXT,
+      operation_id TEXT,
+      UNIQUE (chat_jid, source_kind, source_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_chat_accepted_sources_frontier
+      ON chat_accepted_sources(chat_jid, selectable, source_seq);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_accepted_sources_selectable_operation
+      ON chat_accepted_sources(operation_id) WHERE selectable = 1 AND operation_id IS NOT NULL;
+    CREATE TRIGGER IF NOT EXISTS chat_accepted_source_operation_immutable
+    BEFORE UPDATE OF operation_id ON chat_accepted_sources
+    WHEN old.operation_id IS NOT NULL
+      AND (new.operation_id IS NULL OR new.operation_id != old.operation_id)
+    BEGIN
+      SELECT RAISE(ABORT, 'accepted source operation_id is immutable');
+    END;
+    CREATE TRIGGER IF NOT EXISTS chat_accepted_source_identity_immutable
+    BEFORE UPDATE OF source_seq, source_class, source_kind, source_id, accepted_at, selectable,
+      payload_ref, frontier_message_id, frontier_cursor_ts ON chat_accepted_sources
+    BEGIN
+      SELECT RAISE(ABORT, 'accepted source identity is immutable');
+    END;
+
+    -- Immutable source-to-outcome ledger. It records history only and cannot
+    -- coordinate active work.
+    CREATE TABLE IF NOT EXISTS chat_operation_dispositions (
+      source_seq INTEGER PRIMARY KEY,
+      operation_id TEXT NOT NULL,
+      chat_jid TEXT NOT NULL,
+      source_class TEXT NOT NULL,
+      source_kind TEXT NOT NULL,
+      source_id TEXT NOT NULL,
+      outcome TEXT NOT NULL,
+      cause TEXT NOT NULL,
+      provenance TEXT NOT NULL,
+      terminal_message_chat_jid TEXT,
+      terminal_message_id TEXT,
+      created_at TEXT NOT NULL,
+      UNIQUE (chat_jid, source_kind, source_id),
+      UNIQUE (terminal_message_chat_jid, terminal_message_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_chat_operation_dispositions_operation
+      ON chat_operation_dispositions(operation_id, source_seq);
+    CREATE TRIGGER IF NOT EXISTS chat_operation_disposition_immutable
+    BEFORE UPDATE OF source_seq, operation_id, source_class, source_kind, source_id,
+      outcome, cause, provenance, terminal_message_id, created_at
+    ON chat_operation_dispositions
+    BEGIN
+      SELECT RAISE(ABORT, 'operation disposition is immutable');
+    END;
 
     CREATE TABLE IF NOT EXISTS token_usage (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -569,7 +638,42 @@ function ensureMessageColumns(database: Database): void {
   ensureColumn("thread_id", "INTEGER");
   ensureColumn("is_terminal_agent_reply", "INTEGER DEFAULT 0");
   ensureColumn("is_steering_message", "INTEGER DEFAULT 0");
+  ensureColumn("operation_id");
   ensureColumn("annotations");
+  database.exec(`
+    CREATE INDEX IF NOT EXISTS idx_messages_operation_id ON messages(operation_id);
+    CREATE TRIGGER IF NOT EXISTS messages_operation_id_immutable
+    BEFORE UPDATE OF operation_id ON messages
+    WHEN old.operation_id IS NOT NULL
+      AND (new.operation_id IS NULL OR new.operation_id != old.operation_id)
+    BEGIN
+      SELECT RAISE(ABORT, 'message operation_id is immutable');
+    END;
+    CREATE TRIGGER IF NOT EXISTS messages_pending_source_delete_exclusion
+    BEFORE DELETE ON messages
+    WHEN EXISTS (SELECT 1 FROM chat_accepted_sources s
+      LEFT JOIN chat_operation_dispositions d ON d.source_seq = s.source_seq
+      WHERE s.chat_jid = old.chat_jid AND s.frontier_message_id = old.id AND d.source_seq IS NULL)
+    BEGIN
+      SELECT RAISE(ABORT, 'accepted frontier message cannot be deleted');
+    END;
+    CREATE TRIGGER IF NOT EXISTS messages_pending_source_timestamp_immutable
+    BEFORE UPDATE OF timestamp ON messages
+    WHEN new.timestamp != old.timestamp AND EXISTS (SELECT 1 FROM chat_accepted_sources s
+      LEFT JOIN chat_operation_dispositions d ON d.source_seq = s.source_seq
+      WHERE s.chat_jid = old.chat_jid AND s.frontier_message_id = old.id AND d.source_seq IS NULL)
+    BEGIN
+      SELECT RAISE(ABORT, 'accepted frontier timestamp is immutable');
+    END;
+    CREATE TRIGGER IF NOT EXISTS messages_terminal_evidence_immutable
+    BEFORE UPDATE OF is_bot_message, is_terminal_agent_reply ON messages
+    WHEN EXISTS (SELECT 1 FROM chat_operation_dispositions d
+      WHERE d.terminal_message_chat_jid = old.chat_jid AND d.terminal_message_id = old.id)
+      AND (new.is_bot_message != 1 OR new.is_terminal_agent_reply != 1)
+    BEGIN
+      SELECT RAISE(ABORT, 'terminal operation evidence is immutable');
+    END;
+  `);
 }
 
 /**
@@ -714,12 +818,38 @@ function ensureChatBranchConstraints(database: Database): void {
  * repeatedly – SQLite ignores the statement if the column already exists
  * (we catch the error).
  */
+function ensureLegacyOperationExclusion(database: Database): void {
+  database.exec(`
+    CREATE TRIGGER IF NOT EXISTS chat_cursors_legacy_owner_exclusion
+    BEFORE UPDATE OF cursor_ts, preflight_prev_ts, preflight_message_id, preflight_started_at,
+      inflight_prev_ts, inflight_message_id, inflight_started_at,
+      failed_prev_ts, failed_ts, failed_message_id, failed_thread_root, failed_created_at,
+      compaction_active_started_at, compaction_active_reason
+    ON chat_cursors
+    WHEN old.operation_id IS NOT NULL AND new.operation_id IS NOT NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'active operation excludes legacy ownership mutation');
+    END;
+    CREATE TRIGGER IF NOT EXISTS chat_cursors_active_owner_delete_exclusion
+    BEFORE DELETE ON chat_cursors WHEN old.operation_id IS NOT NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'active operation excludes cursor deletion');
+    END;
+  `);
+}
+
 function ensureChatCursorColumns(database: Database): void {
   const cols = new Set(
     (database.prepare("PRAGMA table_info(chat_cursors)").all() as Array<{ name: string }>)
       .map((r) => r.name)
   );
   const toAdd: Array<[string, string]> = [
+    ["operation_id",                  "TEXT"],
+    ["operation_source_seq",          "INTEGER"],
+    ["operation_phase",               "TEXT"],
+    ["operation_generation",          "INTEGER"],
+    ["operation_cancel_cause",        "TEXT"],
+    ["operation_cancel_requested_at", "TEXT"],
     ["preflight_prev_ts",         "TEXT"],
     ["preflight_message_id",      "TEXT"],
     ["preflight_started_at",      "TEXT"],
@@ -896,6 +1026,7 @@ export function initDatabase(): void {
   ensureFts(db);
   ensureChatCursorColumns(db);
   migrateChatCursors(db);
+  ensureLegacyOperationExclusion(db);
   dropChatBranchDisplayName(db);
   dropObsoleteRemoteInteropSchema(db);
   ensureMediaCompression(db);

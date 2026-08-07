@@ -54,6 +54,8 @@ export interface NewMessage {
   is_terminal_agent_reply?: boolean;
   /** True for persisted steering-only user records that should not be reprocessed as turns. */
   is_steering_message?: boolean;
+  /** Durable operation identity for an operation-bound assistant artifact. */
+  operation_id?: string | null;
 }
 
 /**

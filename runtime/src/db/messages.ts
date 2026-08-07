@@ -175,13 +175,25 @@ export function storeMessage(msg: NewMessage): number {
   msg.timestamp = ensureMonotonicMessageTimestamp(msg.chat_jid, msg.timestamp);
   const contentBlocks = msg.content_blocks ? JSON.stringify(msg.content_blocks) : null;
   const linkPreviews = msg.link_previews ? JSON.stringify(msg.link_previews) : null;
+  const existingBinding = db.prepare(
+    "SELECT operation_id FROM messages WHERE id = ? AND chat_jid = ?",
+  ).get(msg.id, msg.chat_jid) as { operation_id: string | null } | undefined;
+  const suppliedBinding = Object.prototype.hasOwnProperty.call(msg, "operation_id") ? msg.operation_id : undefined;
+  if (existingBinding?.operation_id) {
+    if (suppliedBinding === null) throw new Error("Message operation_id cannot be cleared");
+    if (typeof suppliedBinding === "string" && suppliedBinding !== existingBinding.operation_id) {
+      throw new Error("Message operation_id cannot be rebound");
+    }
+  }
+  const operationId = existingBinding?.operation_id ?? suppliedBinding ?? null;
 
   db.prepare(
     `INSERT INTO messages (
       id, chat_jid, sender, sender_name, content, screen_hint, content_blocks, link_previews,
-      thread_id, timestamp, is_from_me, is_bot_message, is_terminal_agent_reply, is_steering_message
+      thread_id, timestamp, is_from_me, is_bot_message, is_terminal_agent_reply, is_steering_message,
+      operation_id
     )
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id, chat_jid) DO UPDATE SET
        sender = excluded.sender,
        sender_name = excluded.sender_name,
@@ -194,7 +206,8 @@ export function storeMessage(msg: NewMessage): number {
        is_from_me = excluded.is_from_me,
        is_bot_message = excluded.is_bot_message,
        is_terminal_agent_reply = excluded.is_terminal_agent_reply,
-       is_steering_message = excluded.is_steering_message`
+       is_steering_message = excluded.is_steering_message,
+       operation_id = excluded.operation_id`
   ).run(
     msg.id,
     msg.chat_jid,
@@ -209,7 +222,8 @@ export function storeMessage(msg: NewMessage): number {
     msg.is_from_me ? 1 : 0,
     msg.is_bot_message ? 1 : 0,
     msg.is_terminal_agent_reply ? 1 : 0,
-    msg.is_steering_message ? 1 : 0
+    msg.is_steering_message ? 1 : 0,
+    operationId
   );
 
   const row = db
@@ -481,6 +495,10 @@ export function replaceMessageContent(
  */
 export function deleteMessageByRowId(chatJid: string, rowId: number): boolean {
   const db = getDb();
+  const protectedEvidence = db.prepare(`SELECT 1 FROM messages m JOIN chat_operation_dispositions d
+    ON d.terminal_message_chat_jid = m.chat_jid AND d.terminal_message_id = m.id
+    WHERE m.chat_jid = ? AND m.rowid = ? LIMIT 1`).get(chatJid, rowId);
+  if (protectedEvidence) throw new Error("Terminal operation evidence cannot be deleted by timeline cleanup");
   const mediaIds = getMediaIdsForMessage(rowId);
   // Atomic cleanup: wrap the message_media + thinking_content + messages
   // DELETEs in a transaction. Otherwise a crash between any two leaves an
@@ -506,8 +524,11 @@ export function deleteThreadByRowId(chatJid: string, rowId: number): number[] {
   const db = getDb();
   // Find the parent message and all replies whose thread_id points to it.
   const rows = db
-    .prepare("SELECT rowid FROM messages WHERE chat_jid = ? AND (rowid = ? OR thread_id = ?)")
-    .all(chatJid, rowId, rowId) as Array<{ rowid: number }>;
+    .prepare("SELECT rowid, id FROM messages WHERE chat_jid = ? AND (rowid = ? OR thread_id = ?)")
+    .all(chatJid, rowId, rowId) as Array<{ rowid: number; id: string }>;
+  const protectedEvidence = rows.some((row) => db.prepare(`SELECT 1 FROM chat_operation_dispositions
+    WHERE terminal_message_chat_jid = ? AND terminal_message_id = ? LIMIT 1`).get(chatJid, row.id));
+  if (protectedEvidence) throw new Error("Terminal operation evidence cannot be deleted by timeline cleanup");
   const ids = Array.from(new Set(rows.map((row) => row.rowid)));
   if (ids.length === 0) return [];
 

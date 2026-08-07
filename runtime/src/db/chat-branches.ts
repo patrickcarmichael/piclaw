@@ -6,6 +6,7 @@
  */
 
 import { getDb } from "./connection.js";
+import { deleteChatOperationLifecycleState } from "./chat-operation-lifecycle.js";
 import { attachMediaToMessage, deleteUnreferencedMedia } from "./media.js";
 import { deleteThinkingContentByChatJid } from "./thinking-cleanup.js";
 import type { ChatBranchRecord } from "./types.js";
@@ -295,6 +296,8 @@ export interface ArchivedBranchPurgePreview {
     messages: number;
     message_media: number;
     chat_cursors: number;
+    accepted_sources: number;
+    operation_dispositions: number;
     token_usage: number;
     scheduled_tasks: number;
     task_run_logs: number;
@@ -321,6 +324,8 @@ export interface ArchivedBranchDownloadData {
   messages: Record<string, unknown>[];
   message_media: Record<string, unknown>[];
   chat_cursor: Record<string, unknown> | null;
+  accepted_sources: Record<string, unknown>[];
+  operation_dispositions: Record<string, unknown>[];
   token_usage: Record<string, unknown>[];
   scheduled_tasks: Record<string, unknown>[];
   task_run_logs: Record<string, unknown>[];
@@ -418,6 +423,8 @@ export function exportArchivedBranchDownloadData(chatJid: string): ArchivedBranc
     messages,
     message_media: messageMedia,
     chat_cursor: db.prepare(`SELECT * FROM chat_cursors WHERE chat_jid = ?`).get(branch.chat_jid) as Record<string, unknown> | null,
+    accepted_sources: db.prepare(`SELECT * FROM chat_accepted_sources WHERE chat_jid = ? ORDER BY source_seq ASC`).all(branch.chat_jid) as Record<string, unknown>[],
+    operation_dispositions: db.prepare(`SELECT * FROM chat_operation_dispositions WHERE chat_jid = ? ORDER BY source_seq ASC`).all(branch.chat_jid) as Record<string, unknown>[],
     token_usage: db.prepare(`SELECT * FROM token_usage WHERE chat_jid = ? ORDER BY run_at ASC, id ASC`).all(branch.chat_jid) as Record<string, unknown>[],
     scheduled_tasks: taskIds.length > 0
       ? db.prepare(`SELECT * FROM scheduled_tasks WHERE chat_jid = ? ORDER BY id ASC`).all(branch.chat_jid) as Record<string, unknown>[]
@@ -453,6 +460,8 @@ export function previewPermanentDeleteArchivedBranch(chatJid: string): ArchivedB
         branch.chat_jid,
       ),
       chat_cursors: countRows(`SELECT COUNT(*) AS count FROM chat_cursors WHERE chat_jid = ?`, branch.chat_jid),
+      accepted_sources: countRows(`SELECT COUNT(*) AS count FROM chat_accepted_sources WHERE chat_jid = ?`, branch.chat_jid),
+      operation_dispositions: countRows(`SELECT COUNT(*) AS count FROM chat_operation_dispositions WHERE chat_jid = ?`, branch.chat_jid),
       token_usage: countRows(`SELECT COUNT(*) AS count FROM token_usage WHERE chat_jid = ?`, branch.chat_jid),
       scheduled_tasks: taskIds.length,
       task_run_logs: taskIds.length > 0
@@ -630,6 +639,14 @@ export function mergeChatBranchIntoParent(chatJid: string): MergeChatBranchIntoP
     throw new Error(`Cannot merge a chat branch that still has child branches: ${normalizedChatJid}`);
   }
 
+  const activeOrUndisposedCount = countRows(`SELECT
+      (SELECT COUNT(*) FROM chat_cursors WHERE chat_jid = ? AND operation_id IS NOT NULL)
+      + (SELECT COUNT(*) FROM chat_accepted_sources s LEFT JOIN chat_operation_dispositions d ON d.source_seq = s.source_seq
+         WHERE s.chat_jid = ? AND d.source_seq IS NULL) AS count`, source.chat_jid, source.chat_jid);
+  if (activeOrUndisposedCount > 0) {
+    throw new Error(`Cannot merge a chat branch with active or undisposed accepted work: ${normalizedChatJid}`);
+  }
+
   const messageCollisionCount = countRows(
     `SELECT COUNT(*) AS count
        FROM messages source
@@ -663,6 +680,10 @@ export function mergeChatBranchIntoParent(chatJid: string): MergeChatBranchIntoP
     };
 
     db.prepare(`UPDATE messages SET chat_jid = ? WHERE chat_jid = ?`).run(parent.chat_jid, source.chat_jid);
+    db.prepare(`UPDATE chat_accepted_sources SET chat_jid = ? WHERE chat_jid = ?`).run(parent.chat_jid, source.chat_jid);
+    db.prepare(`UPDATE chat_operation_dispositions SET chat_jid = ?,
+      terminal_message_chat_jid = CASE WHEN terminal_message_chat_jid = ? THEN ? ELSE terminal_message_chat_jid END
+      WHERE chat_jid = ?`).run(parent.chat_jid, source.chat_jid, parent.chat_jid, source.chat_jid);
     db.prepare(`UPDATE token_usage SET chat_jid = ? WHERE chat_jid = ?`).run(parent.chat_jid, source.chat_jid);
     db.prepare(`UPDATE scheduled_tasks SET chat_jid = ? WHERE chat_jid = ?`).run(parent.chat_jid, source.chat_jid);
 
@@ -759,6 +780,7 @@ export function permanentDeleteArchivedBranch(chatJid: string): PermanentDeleteA
     // cascade is possible; see I2 in PR #655 issues tracker). Must run
     // BEFORE the messages DELETE so the subquery still resolves.
     deleteThinkingContentByChatJid(branch.chat_jid);
+    deleteChatOperationLifecycleState(branch.chat_jid);
     db.prepare(`DELETE FROM messages WHERE chat_jid = ?`).run(branch.chat_jid);
     db.prepare(`DELETE FROM chat_cursors WHERE chat_jid = ?`).run(branch.chat_jid);
     db.prepare(`DELETE FROM token_usage WHERE chat_jid = ?`).run(branch.chat_jid);
@@ -864,6 +886,19 @@ export function renameChatJid(oldJid: string, newJid: string): RenameChatJidResu
         WHERE substr(chat_jid, 1, ?) = ?`
     ).run(childNextPrefix, childPrefixLength + 1, childPrefixLength, childPrefix);
     if ((cursorRows as any)?.changes > 0) updated.push("chat_cursors");
+
+    // --- durable accepted-input identity and terminal history ----------
+    for (const tbl of ["chat_accepted_sources", "chat_operation_dispositions"]) {
+      db.prepare(`UPDATE ${tbl} SET chat_jid = ? WHERE chat_jid = ?`).run(next, old);
+      db.prepare(`UPDATE ${tbl} SET chat_jid = ? || substr(chat_jid, ?) WHERE substr(chat_jid, 1, ?) = ?`)
+        .run(childNextPrefix, childPrefixLength + 1, childPrefixLength, childPrefix);
+      updated.push(tbl);
+    }
+    db.prepare(`UPDATE chat_operation_dispositions SET terminal_message_chat_jid = ? WHERE terminal_message_chat_jid = ?`)
+      .run(next, old);
+    db.prepare(`UPDATE chat_operation_dispositions SET terminal_message_chat_jid = ? || substr(terminal_message_chat_jid, ?)
+      WHERE substr(terminal_message_chat_jid, 1, ?) = ?`)
+      .run(childNextPrefix, childPrefixLength + 1, childPrefixLength, childPrefix);
 
     // --- chat_branches (chat_jid + root_chat_jid) ----------------------
     db.prepare(
