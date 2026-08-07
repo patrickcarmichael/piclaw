@@ -4,8 +4,9 @@
  * Ensures only one task runs at a time per logical lane (for example one chat),
  * while allowing different lanes to make progress in parallel. Failed tasks are
  * retried with exponential back-off up to DEFAULT_MAX_RETRIES times.
- * Items can be deduplicated by an optional string `id` (useful for scheduled
- * tasks that shouldn't stack up).
+ * Pending and retrying items can be deduplicated by an optional string `id`.
+ * An executing item may enqueue one same-ID successor for lane continuation;
+ * that successor supersedes an automatic retry if the current item then fails.
  *
  * Consumers:
  *   - runtime.ts creates a single AgentQueue and passes it to the router
@@ -31,6 +32,8 @@ interface QueueItem {
   laneKey: string;
   /** Number of times this item has been retried after failure. */
   retries: number;
+  /** Whether the queued function has started for its current attempt. */
+  started: boolean;
 }
 
 interface LaneState {
@@ -88,19 +91,26 @@ export class AgentQueue {
     this.lanes.delete(laneKey);
   }
 
-  private hasQueuedId(id: string): boolean {
-    if (this.retryingIds.has(id)) return true;
+  private hasPendingId(id: string): boolean {
     for (const lane of this.lanes.values()) {
-      if (lane.current?.id === id) return true;
       if (lane.pending.some((item) => item.id === id)) return true;
     }
     return false;
   }
 
+  private hasQueuedId(id: string): boolean {
+    if (this.retryingIds.has(id)) return true;
+    for (const lane of this.lanes.values()) {
+      if (lane.current?.id === id && !lane.current.started) return true;
+    }
+    return this.hasPendingId(id);
+  }
+
   /**
    * Add a work item to the queue.
    * Items in the same lane run sequentially; items in different lanes may run
-   * concurrently. Items with the same `id` are deduplicated globally.
+   * concurrently. Pending and retrying items with the same `id` are
+   * deduplicated globally; an executing item may schedule one successor.
    */
   enqueue(fn: () => Promise<void>, id?: string, laneKey?: string): void {
     if (this.shuttingDown) return;
@@ -112,7 +122,7 @@ export class AgentQueue {
 
     const resolvedLaneKey = laneKey || DEFAULT_LANE_KEY;
     const lane = this.getLane(resolvedLaneKey);
-    const item: QueueItem = { id, fn, laneKey: resolvedLaneKey, retries: 0 };
+    const item: QueueItem = { id, fn, laneKey: resolvedLaneKey, retries: 0, started: false };
     this.metrics.enqueued += 1;
 
     if (lane.running) {
@@ -131,6 +141,7 @@ export class AgentQueue {
   /** Start executing an item inside a lane. */
   private runItem(lane: LaneState, item: QueueItem): void {
     if (item.id) this.retryingIds.delete(item.id);
+    item.started = false;
     lane.running = true;
     lane.current = item;
     this.metrics.started += 1;
@@ -149,6 +160,7 @@ export class AgentQueue {
 
   /** Run the item's function, handle errors with retry, and advance within the lane. */
   private async executeItem(lane: LaneState, item: QueueItem): Promise<void> {
+    item.started = true;
     try {
       await item.fn();
       this.metrics.succeeded += 1;
@@ -176,6 +188,7 @@ export class AgentQueue {
 
   /** Schedule an exponential-backoff retry for a failed item. */
   private scheduleRetry(item: QueueItem): void {
+    if (item.id && this.hasPendingId(item.id)) return;
     if (!shouldRetry(item.retries, DEFAULT_MAX_RETRIES, this.shuttingDown)) return;
     item.retries++;
     this.metrics.retriesScheduled += 1;

@@ -7,6 +7,7 @@ import {
   type ChatRunControlStore,
   type ResumeChatContext,
 } from "../../../../src/channels/web/runtime/chat-run-control.js";
+import { AgentQueue } from "../../../../src/queue.js";
 
 describe("web chat run control helpers", () => {
   test("getThreadRootId delegates to store", () => {
@@ -64,6 +65,33 @@ describe("web chat run control helpers", () => {
     resumeChat("web:1", null, ctx);
     expect(enqueued).toHaveLength(2);
     expect(enqueued[1].key).toBe("resume:web:1:wake");
+  });
+
+  test("resumeChat drains a same-ID wake enqueued by the executing chat lane", async () => {
+    const queue = new AgentQueue();
+    const processed: number[] = [];
+    let ctx!: ResumeChatContext;
+
+    ctx = {
+      defaultAgentId: "default",
+      enqueue: (task, key, laneKey) => queue.enqueue(task, key, laneKey),
+      processChat: async () => {
+        processed.push(processed.length + 1);
+        if (processed.length === 1) resumeChat("web:1", undefined, ctx);
+      },
+    };
+
+    resumeChat("web:1", undefined, ctx);
+    await Bun.sleep(80);
+
+    expect(processed).toEqual([1, 2]);
+    expect(queue.getMetrics()).toEqual(expect.objectContaining({
+      enqueued: 2,
+      deduplicated: 0,
+      succeeded: 2,
+    }));
+
+    await queue.shutdown(100);
   });
 
   test("skipFailedOnModelSwitch advances cursor only when needed and clears failure", () => {
