@@ -639,14 +639,6 @@ export function mergeChatBranchIntoParent(chatJid: string): MergeChatBranchIntoP
     throw new Error(`Cannot merge a chat branch that still has child branches: ${normalizedChatJid}`);
   }
 
-  const activeOrUndisposedCount = countRows(`SELECT
-      (SELECT COUNT(*) FROM chat_cursors WHERE chat_jid = ? AND operation_id IS NOT NULL)
-      + (SELECT COUNT(*) FROM chat_accepted_sources s LEFT JOIN chat_operation_dispositions d ON d.source_seq = s.source_seq
-         WHERE s.chat_jid = ? AND d.source_seq IS NULL) AS count`, source.chat_jid, source.chat_jid);
-  if (activeOrUndisposedCount > 0) {
-    throw new Error(`Cannot merge a chat branch with active or undisposed accepted work: ${normalizedChatJid}`);
-  }
-
   const messageCollisionCount = countRows(
     `SELECT COUNT(*) AS count
        FROM messages source
@@ -664,6 +656,14 @@ export function mergeChatBranchIntoParent(chatJid: string): MergeChatBranchIntoP
 
   db.exec("BEGIN IMMEDIATE");
   try {
+    const activeOrUndisposedCount = countRows(`SELECT
+      (SELECT COUNT(*) FROM chat_cursors WHERE chat_jid = ? AND operation_id IS NOT NULL)
+      + (SELECT COUNT(*) FROM chat_accepted_sources s LEFT JOIN chat_operation_dispositions d ON d.source_seq = s.source_seq
+         WHERE s.chat_jid = ? AND d.source_seq IS NULL) AS count`, source.chat_jid, source.chat_jid);
+    if (activeOrUndisposedCount > 0) {
+      throw new Error(`Cannot merge a chat branch with active or undisposed accepted work: ${normalizedChatJid}`);
+    }
+
     materializeQueuedFollowupsForTimelineMove(source.chat_jid);
 
     counts = {

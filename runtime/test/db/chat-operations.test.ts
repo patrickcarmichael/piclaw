@@ -71,6 +71,17 @@ describe("durable accepted-input operations", () => {
     expect(op.claimNextChatOperation(chatJid).source?.sourceSeq).toBe(second.sourceSeq);
   });
 
+  test("message acceptance is idempotent without rewriting the pending frontier timestamp", () => {
+    const chatJid = jid("accept-retry");
+    const message = { id: "retry-message", chat_jid: chatJid, sender: "user", sender_name: "User", content: "retry",
+      timestamp: "2026-08-07T22:00:00.000Z", is_from_me: false, is_bot_message: false };
+    const first = op.storeAcceptedChatMessageSource(message);
+    const second = op.storeAcceptedChatMessageSource(message);
+    expect(second).toEqual({ status: "existing", source: first.source });
+    expect(db.getDb().prepare("SELECT timestamp FROM messages WHERE chat_jid = ? AND id = ?")
+      .get(chatJid, message.id)).toEqual({ timestamp: first.source.frontierCursorTs });
+  });
+
   test("claim is idempotent and completion advances to the next canonical source", () => {
     const chatJid = jid("claim");
     const first = register(chatJid, "a");
@@ -79,8 +90,13 @@ describe("durable accepted-input operations", () => {
     expect(claimed.status).toBe("claimed");
     expect(register(chatJid, "a").operationId).toBe(claimed.operation?.operationId);
     expect(op.claimNextChatOperation(chatJid)).toEqual({ ...claimed, status: "existing" });
-    expect(complete(chatJid, claimed.operation! as ChatOperationState).status).toBe("completed");
-    expect(op.claimNextChatOperation(chatJid).source?.sourceSeq).toBe(second.sourceSeq);
+    const firstCompletion = complete(chatJid, claimed.operation! as ChatOperationState);
+    expect(firstCompletion.status).toBe("completed");
+    const next = op.claimNextChatOperation(chatJid);
+    expect(next.source?.sourceSeq).toBe(second.sourceSeq);
+    const repeated = complete(chatJid, claimed.operation! as ChatOperationState);
+    expect(repeated).toEqual({ status: "repeated", disposition: firstCompletion.status === "completed" ? firstCompletion.disposition : null });
+    expect(op.getChatOperation(chatJid)).toEqual(next.operation);
     expect(op.getChatOperationDisposition(first.sourceSeq)?.outcome).toBe("succeeded");
   });
 
@@ -230,6 +246,8 @@ describe("durable accepted-input operations", () => {
       .toThrow("terminal operation evidence is immutable");
     expect(() => db.deleteMessageByRowId(chatJid, row.rowid)).toThrow("Terminal operation evidence");
     expect(() => db.deleteThreadByRowId(chatJid, row.rowid)).toThrow("Terminal operation evidence");
+    expect(() => db.getDb().prepare("DELETE FROM messages WHERE chat_jid = ? AND rowid = ?")
+      .run(chatJid, row.rowid)).toThrow("terminal operation evidence cannot be deleted");
     expect(() => db.getDb().prepare("UPDATE chat_operation_dispositions SET outcome = 'failed' WHERE source_seq = ?")
       .run(source.sourceSeq)).toThrow("operation disposition is immutable");
     db.renameChatJid(chatJid, renamed);
@@ -242,6 +260,7 @@ describe("durable accepted-input operations", () => {
     db.permanentDeleteArchivedBranch(renamed);
     expect(op.getAcceptedChatSource(source.sourceSeq)).toBeNull();
     expect(op.getChatOperationDisposition(source.sourceSeq)).toBeNull();
+    expect(db.getDb().prepare("SELECT 1 FROM messages WHERE chat_jid = ?").get(renamed)).toBeNull();
   });
 
   test("branch merge rejects pending work and preserves completed operation history", () => {

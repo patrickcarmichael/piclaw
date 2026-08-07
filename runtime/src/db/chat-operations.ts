@@ -260,8 +260,24 @@ export function registerAcceptedChatSource(input: {
 export function storeAcceptedChatMessageSource(message: NewMessage, acceptedAt = message.timestamp): { status: "registered" | "existing"; source: AcceptedChatSource } {
   const db = getDb();
   return db.transaction(() => {
-    storeMessage(message);
-    const persisted = db.prepare("SELECT timestamp FROM messages WHERE chat_jid = ? AND id = ?")
+    const existingRow = db.prepare(`SELECT * FROM chat_accepted_sources
+      WHERE chat_jid = ? AND source_kind = 'message' AND source_id = ?`)
+      .get(message.chat_jid, message.id) as SourceRow | undefined;
+    if (existingRow) {
+      const source = sourceFromRow(existingRow);
+      const persisted = db.prepare("SELECT timestamp FROM messages WHERE chat_jid = ? AND id = ?")
+        .get(message.chat_jid, message.id) as { timestamp: string } | undefined;
+      if (!persisted || source.sourceClass !== "prompt" || source.acceptedAt !== acceptedAt
+        || source.payloadRef !== `message:${message.id}` || source.frontierMessageId !== message.id
+        || source.frontierCursorTs !== persisted.timestamp) {
+        throw new ChatOperationInvariantError("Accepted message source identity was reused with different immutable fields");
+      }
+      return { status: "existing", source } as const;
+    }
+    const alreadyStored = db.prepare("SELECT timestamp FROM messages WHERE chat_jid = ? AND id = ?")
+      .get(message.chat_jid, message.id) as { timestamp: string } | undefined;
+    if (!alreadyStored) storeMessage(message);
+    const persisted = alreadyStored ?? db.prepare("SELECT timestamp FROM messages WHERE chat_jid = ? AND id = ?")
       .get(message.chat_jid, message.id) as { timestamp: string };
     return registerAcceptedChatSource({ chatJid: message.chat_jid, sourceClass: "prompt", sourceKind: "message",
       sourceId: message.id, acceptedAt, payloadRef: `message:${message.id}`,
@@ -405,11 +421,27 @@ export function cancelChatOperation(chatJid: string, expected: ChatOperationOwne
   return { status: "applied", operation: getChatOperation(chatJid)! };
 }
 
-function sameDisposition(existing: ChatOperationDisposition, request: ChatOperationCompletion): boolean {
-  return existing.operationId === request.owner.operationId && existing.sourceSeq === request.owner.sourceSeq
-    && existing.outcome === request.outcome && existing.cause === request.cause
+function sameDisposition(
+  existing: ChatOperationDisposition,
+  source: AcceptedChatSource | null,
+  chatJid: string,
+  request: ChatOperationCompletion,
+): boolean {
+  const terminalMessageId = request.artifact?.messageId ?? request.artifact?.message?.id ?? null;
+  const terminalChatJid = terminalMessageId ? (request.artifact?.message?.chat_jid ?? chatJid) : null;
+  return source !== null
+    && existing.operationId === request.owner.operationId
+    && existing.sourceSeq === request.owner.sourceSeq
+    && existing.chatJid === chatJid
+    && existing.sourceClass === source.sourceClass
+    && existing.sourceKind === source.sourceKind
+    && existing.sourceId === source.sourceId
+    && source.operationId === existing.operationId
+    && existing.outcome === request.outcome
+    && existing.cause === request.cause
     && existing.provenance === request.provenance
-    && existing.terminalMessageId === (request.artifact?.messageId ?? request.artifact?.message?.id ?? null);
+    && existing.terminalMessageChatJid === terminalChatJid
+    && existing.terminalMessageId === terminalMessageId;
 }
 
 export interface ChatOperationCompletion {
@@ -439,13 +471,16 @@ export function completeChatOperation(
 ): ChatOperationCompletionResult {
   const db = getDb();
   return db.transaction(() => {
-    const active = getChatOperation(chatJid);
-    if (!active) {
-      const existing = getChatOperationDisposition(request.owner.sourceSeq);
-      if (!existing) return { status: "rejected", reason: "no_operation", operation: null } as const;
-      if (!sameDisposition(existing, request)) throw new ChatOperationInvariantError("Conflicting repeated completion");
+    const existing = getChatOperationDisposition(request.owner.sourceSeq);
+    if (existing) {
+      const source = getAcceptedChatSource(request.owner.sourceSeq);
+      if (!sameDisposition(existing, source, chatJid, request)) {
+        throw new ChatOperationInvariantError("Conflicting repeated completion");
+      }
       return { status: "repeated", disposition: existing } as const;
     }
+    const active = getChatOperation(chatJid);
+    if (!active) return { status: "rejected", reason: "no_operation", operation: null } as const;
     const comparison = compareChatOperationOwner(active, request.owner);
     if (!comparison.ok) return { status: "rejected", reason: comparison.reason, operation: active } as const;
     if (active.cancellation && request.outcome !== "cancelled") {

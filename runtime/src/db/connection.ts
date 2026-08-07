@@ -665,6 +665,13 @@ function ensureMessageColumns(database: Database): void {
     BEGIN
       SELECT RAISE(ABORT, 'accepted frontier timestamp is immutable');
     END;
+    CREATE TRIGGER IF NOT EXISTS messages_terminal_evidence_delete_exclusion
+    BEFORE DELETE ON messages
+    WHEN EXISTS (SELECT 1 FROM chat_operation_dispositions d
+      WHERE d.terminal_message_chat_jid = old.chat_jid AND d.terminal_message_id = old.id)
+    BEGIN
+      SELECT RAISE(ABORT, 'terminal operation evidence cannot be deleted');
+    END;
     CREATE TRIGGER IF NOT EXISTS messages_terminal_evidence_immutable
     BEFORE UPDATE OF is_bot_message, is_terminal_agent_reply ON messages
     WHEN EXISTS (SELECT 1 FROM chat_operation_dispositions d
