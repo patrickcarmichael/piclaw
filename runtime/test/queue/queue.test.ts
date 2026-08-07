@@ -44,7 +44,7 @@ describe("AgentQueue", () => {
     await queue.shutdown(100);
   });
 
-  test("deduplicates by id", async () => {
+  test("deduplicates by id before the current task starts", async () => {
     const queue = new AgentQueue();
     let count = 0;
 
@@ -53,7 +53,7 @@ describe("AgentQueue", () => {
       count++;
     }, "task-1");
 
-    // This should be ignored (same id, first is still running)
+    // This should be ignored before the first task starts executing.
     queue.enqueue(async () => {
       count++;
     }, "task-1");
@@ -66,6 +66,90 @@ describe("AgentQueue", () => {
     expect(metrics.deduplicated).toBe(1);
 
     await queue.shutdown(100);
+  });
+
+  test("allows an executing chat-lane item to enqueue its same-ID successor", async () => {
+    const queue = new AgentQueue();
+    const order: string[] = [];
+
+    queue.enqueue(async () => {
+      order.push("first");
+      queue.enqueue(async () => {
+        order.push("successor");
+      }, "web:chat:resume", "chat:web:chat:resume");
+    }, "web:chat:resume", "chat:web:chat:resume");
+
+    await Bun.sleep(80);
+
+    expect(order).toEqual(["first", "successor"]);
+    expect(queue.getMetrics()).toEqual(expect.objectContaining({
+      enqueued: 2,
+      deduplicated: 0,
+      succeeded: 2,
+    }));
+
+    await queue.shutdown(100);
+  });
+
+  test("collapses multiple same-ID enqueues from an executing item to one successor", async () => {
+    const queue = new AgentQueue();
+    const order: string[] = [];
+
+    queue.enqueue(async () => {
+      order.push("first");
+      queue.enqueue(async () => {
+        order.push("successor-1");
+      }, "resume:web:1:wake", "chat:web:1");
+      queue.enqueue(async () => {
+        order.push("successor-2");
+      }, "resume:web:1:wake", "chat:web:1");
+    }, "resume:web:1:wake", "chat:web:1");
+
+    await Bun.sleep(80);
+
+    expect(order).toEqual(["first", "successor-1"]);
+    expect(queue.getMetrics()).toEqual(expect.objectContaining({
+      enqueued: 2,
+      deduplicated: 1,
+      succeeded: 2,
+    }));
+
+    await queue.shutdown(100);
+  });
+
+  test("does not schedule a retry when a failing item already queued its same-ID successor", async () => {
+    const queue = new AgentQueue();
+    const order: string[] = [];
+    let attempts = 0;
+    const originalSetTimeout = globalThis.setTimeout;
+    globalThis.setTimeout = ((fn: (...args: any[]) => void, ms?: number, ...args: any[]) =>
+      originalSetTimeout(fn, Math.min(ms ?? 0, 20), ...args)) as typeof setTimeout;
+
+    try {
+      queue.enqueue(async () => {
+        attempts += 1;
+        order.push(attempts === 1 ? "first" : "retry");
+        if (attempts === 1) {
+          queue.enqueue(async () => {
+            order.push("successor");
+          }, "resume:web:1:wake", "chat:web:1");
+          throw new Error("fail after successor enqueue");
+        }
+      }, "resume:web:1:wake", "chat:web:1");
+
+      await new Promise((resolve) => originalSetTimeout(resolve, 100));
+
+      expect(order).toEqual(["first", "successor"]);
+      expect(queue.getMetrics()).toEqual(expect.objectContaining({
+        enqueued: 2,
+        failed: 1,
+        retriesScheduled: 0,
+        succeeded: 1,
+      }));
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+      await queue.shutdown(100);
+    }
   });
 
   test("enqueueTask prefixes id with task:", async () => {
