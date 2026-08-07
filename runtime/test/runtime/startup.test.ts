@@ -432,6 +432,27 @@ export {};
     expect(events[5]).toEqual({ kind: "resume" });
   });
 
+  test("runWebStartupRecoveryBootstrap is idempotent for one web channel", () => {
+    let recovered = 0;
+    let handoffs = 0;
+    let scans = 0;
+    const scheduled: Array<() => void> = [];
+    const web = {
+      updateAgentStatus: () => {},
+      recoverInflightRuns: () => { recovered += 1; },
+      resumePendingChats: () => { scans += 1; },
+    };
+
+    runWebStartupRecoveryBootstrap(web, () => { handoffs += 1; }, (resume) => { scheduled.push(resume); });
+    runWebStartupRecoveryBootstrap(web, () => { handoffs += 1; }, (resume) => { scheduled.push(resume); });
+
+    expect(recovered).toBe(1);
+    expect(handoffs).toBe(1);
+    expect(scheduled).toHaveLength(1);
+    scheduled[0]();
+    expect(scans).toBe(1);
+  });
+
   test("queueStartupSessionWarmup is disabled by default", () => {
     const scheduled: Array<{ chatJid: string; priority?: boolean }> = [];
     const recentCalls: Array<{ limit?: number; excludeChatJids?: string[] }> = [];

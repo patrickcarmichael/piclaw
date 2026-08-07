@@ -1,29 +1,23 @@
 /**
  * protected-recovery-handoff.ts – Bounded ordinary-turn handoff for protected recovery.
  *
- * A generic recovery that would require tool suppression is converted into a
- * typed handoff before another provider request is made. Non-web callers
- * consume the handoff here; web defers it so its handler can durably order the
- * continuation with cursor and terminal-message persistence.
+ * A generic recovery that would require tool suppression is converted into one
+ * internal ordinary continuation before the AgentPool call returns. The
+ * continuation is never materialized as a timeline or queued-followup message.
  */
 
 import { TOOL_ENABLED_RECOVERY_CONTINUATION_PROMPT } from "./context-pressure-retry.js";
 import type { AgentOutput, RunAgentOptions, TurnOutput } from "./contracts.js";
 
-export interface ProtectedRecoveryHandoffOptions {
-  /** Web persists the continuation itself before terminal run finalization. */
-  deferToolEnabledContinuation?: boolean;
-}
-
 /**
- * Run one prompt and, when required, exactly one ordinary tool-enabled turn.
+ * Run one prompt and, when required, exactly one internal tool-enabled turn.
  * The generated continuation never chains, even if its own recovery is also
  * protected. Caller-supplied run options (including intentional tool ceilings)
  * remain in force; only recovery's temporary all-tools suppression is absent.
  */
 export async function runWithProtectedRecoveryHandoff(
   prompt: string,
-  options: RunAgentOptions & ProtectedRecoveryHandoffOptions,
+  options: RunAgentOptions,
   run: (nextPrompt: string, nextOptions: RunAgentOptions) => Promise<AgentOutput>,
   onOutput?: (output: AgentOutput) => void,
 ): Promise<AgentOutput> {
@@ -52,7 +46,6 @@ export async function runWithProtectedRecoveryHandoff(
   for (const turn of bufferedTurns) {
     if (turn.followedByToolUse) originalOnTurnComplete?.(turn);
   }
-  if (options.deferToolEnabledContinuation) return initial;
   const continuation = await run(TOOL_ENABLED_RECOVERY_CONTINUATION_PROMPT, {
     ...options,
     protectedRecoveryContinuation: true,

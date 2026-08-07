@@ -18,11 +18,7 @@ import { isSlashCommandInvocation } from "../../../agent-pool/slash-command.js";
 import {
   RECOVERY_CONTINUATION_PROMPT,
 } from "../../../agent-pool/context-pressure-retry.js";
-import {
-  PROTECTED_RECOVERY_CONTROL_LABEL,
-  buildProtectedRecoveryControlIntentBlock,
-  resolveProtectedRecoveryPrompt,
-} from "../../../agent-pool/protected-recovery-control-intent.js";
+import { resolveProtectedRecoveryPrompt } from "../../../agent-pool/protected-recovery-control-intent.js";
 import { getExtensionKvStore } from "../../../extension-kv-registry.js";
 import {
   normalizeAgentMessagePayload,
@@ -34,11 +30,13 @@ import { handleUiMetersCommand } from "../ui-meters-commands.js";
 import { getServerUiMetersConfig, setServerUiMetersConfig, setServerUiThemeConfig } from "../ui-state.js";
 import {
   getChatCursor,
+  getChatPreflight,
   getInflightMessageId,
   getMessageRowIdById,
   getDb,
   rollbackChatRunWithError,
   rollbackInflightRun,
+  rollbackInflightRunForCompactionConflict,
   setChatCursor,
 } from "../../../db.js";
 import { detectChannel, formatMessages, formatOutbound } from "../../../router.js";
@@ -1369,6 +1367,17 @@ export async function processChat(
   threadRootId?: number,
   browserObservability?: BrowserObservabilityContext,
 ): Promise<void> {
+  const activePreflight = getChatPreflight(chatJid);
+  if (activePreflight) {
+    log.info("Deferring chat processor to active preflight owner", {
+      operation: "process_chat.preflight_owned",
+      chatJid,
+      messageId: activePreflight.messageId,
+      startedAt: activePreflight.startedAt,
+    });
+    return;
+  }
+
   const prevCursor = getChatCursor(chatJid);
   const selection = selectProcessChatMessage({
     chatJid,
@@ -1632,7 +1641,6 @@ export async function processChat(
     ...(browserObservability?.clientId ? { clientId: browserObservability.clientId } : {}),
     skipPrePromptCompaction: true,
     scheduleIdleAutoCompaction: true,
-    deferToolEnabledContinuation: true,
     protectedRecoveryContinuation: Boolean(protectedRecoveryPrompt),
     onEvent: trackedStreamingHandler,
     onTurnDiscard: () => {
@@ -1726,6 +1734,23 @@ export async function processChat(
     // Normal runtime outputs already carry this enum from attempt finalization.
     output.failureCategory ??= classifyOpaqueAgentFailure(output.error);
     if (output.toolBudgetExceeded) output.failureCategory = "tool_budget";
+    if (output.failureCategory === "compaction_in_progress") {
+      // This processor does not own the SDK's active physical compaction.
+      // Preserve that compaction marker and leave the message pending; the
+      // owning preflight completion queues the one authoritative resume.
+      rollbackInflightRunForCompactionConflict(chatJid, prevCursor, {
+        messageId: lastMessage.id,
+        startedAt: runStartedAt,
+      });
+      log.info("Deferred prompt while another physical compaction is active", {
+        operation: "process_chat.compaction_in_progress",
+        chatJid,
+        messageId: lastMessage.id,
+      });
+      endTrackedPhase(chatJid);
+      return;
+    }
+
     if (output.failureCategory === "already_processing") {
       // A concurrent run is already handling this chat. Roll back the cursor
       // we advanced so this message stays pending, then throw so the queue
@@ -1818,105 +1843,17 @@ export async function processChat(
         });
       }
     };
-    const queueProtectedRecoveryContinuation = (): { required: boolean; rowId: number | null; failed: boolean; created: boolean } => {
-      if (!output.requiresToolEnabledContinuation) return { required: false, rowId: null, failed: false, created: false };
-      // The generated ordinary continuation is the one bounded handoff. If it
-      // also fails, persist that terminal result instead of creating a chain.
-      if (protectedRecoveryPrompt) {
-        return { required: false, rowId: null, failed: false, created: false };
-      }
-      const continuationThreadId = resolveContinuationThreadId();
-      if (!continuationThreadId) {
-        log.warn("Could not resolve thread lineage for protected-recovery continuation", {
-          operation: "process_chat.protected_recovery_auto_continue_missing_lineage",
-          chatJid,
-          messageId: lastMessage.id ?? null,
-        });
-        return { required: true, rowId: null, failed: true, created: false };
-      }
-      const sourceMessageId = String(lastMessage.id || "").trim();
-      const sourceRowId = getMessageRowIdById(chatJid, sourceMessageId) ?? continuationThreadId;
-      const existing = channel.getQueuedFollowupItems(chatJid).find((item) => (
-        item.source === "auto-protected-recovery-continuation"
-        && item.queuedBy?.sourceMessageId === sourceMessageId
-      ));
-      if (existing) return { required: true, rowId: existing.rowId, failed: false, created: false };
-      try {
-        const queuedAt = new Date().toISOString();
-        const controlIntent = buildProtectedRecoveryControlIntentBlock({
-          sourceMessageId,
-          sourceRowId,
-          threadId: continuationThreadId,
-        });
-        const queuedRowId = channel.enqueueQueuedFollowupItem(
-          chatJid,
-          0,
-          PROTECTED_RECOVERY_CONTROL_LABEL,
-          continuationThreadId,
-          queuedAt,
-          {
-            contentBlocks: [controlIntent],
-            source: "auto-protected-recovery-continuation",
-            queuedBy: { source: "runtime", sourceMessageId },
-          },
-        );
-        channel.broadcastEvent("agent_followup_queued", {
-          chat_jid: chatJid,
-          thread_id: continuationThreadId,
-          row_id: queuedRowId,
-          content: PROTECTED_RECOVERY_CONTROL_LABEL,
-          content_blocks: [controlIntent],
-          timestamp: queuedAt,
-          source: "auto-protected-recovery-continuation",
-        });
-        log.info("Queued one ordinary continuation after protected recovery", {
-          operation: "process_chat.protected_recovery_auto_continue",
-          chatJid,
-          sourceMessageId,
-          sourceRowId,
-          threadId: continuationThreadId,
-          queuedRowId,
-        });
-        return { required: true, rowId: queuedRowId, failed: false, created: true };
-      } catch (error) {
-        log.warn("Failed to queue ordinary continuation after protected recovery", {
-          operation: "process_chat.protected_recovery_auto_continue_failed",
-          chatJid,
-          sourceMessageId,
-          sourceRowId,
-          threadId: continuationThreadId,
-          err: error,
-        });
-        return { required: true, rowId: null, failed: true, created: false };
-      }
-    };
-    // Persist the handoff intent before terminal/cursor finalization. A crash
-    // after this point leaves a durable, source-tagged item that replay detects
-    // instead of losing or duplicating the ordinary continuation.
-    const protectedContinuation = queueProtectedRecoveryContinuation();
-    if (protectedContinuation.failed) {
-      rollbackInflightRun(chatJid, prevCursor);
-      trackedEmitter.status(buildRetryStatusPayload({
-        threadId,
-        agentId,
-        turnId,
-        title: "Could not persist tool-enabled continuation — retrying",
-        detail: "The protected recovery handoff was not committed; the source turn remains pending.",
-      }));
-      throw new Error("Protected recovery handoff persistence failed; retry the source turn.");
-    }
-    if (protectedContinuation.required) {
-      // A protected attempt intentionally has no execution tools. Its streamed
-      // draft is not a terminal answer and may falsely claim tools are missing.
-      // Replace that transient prose with a deterministic recovery marker while
-      // the durable typed continuation resumes the work with tools restored.
+    if (output.requiresToolEnabledContinuation) {
+      // AgentPool owns protected recovery end-to-end and must consume its one
+      // internal continuation before returning. Never materialize an escaped
+      // handoff flag as a synthetic user or queued-followup message.
       clearCommittedDraft();
       const marker = buildTurnOutcomeMarker({
         kind: "recovery",
         label: "recovery",
-        title: PROTECTED_RECOVERY_CONTROL_LABEL,
-        detail: "Continuing in an ordinary turn with execution tools restored.",
-        severity: "info",
+        title: "Internal recovery continuation failed",
+        detail: "The runtime did not complete its internal tool-restored continuation.",
+        severity: "error",
         attemptsUsed: output.recovery?.attemptsUsed,
         classifier: output.recovery?.lastClassifier ?? null,
       });
@@ -1941,8 +1878,7 @@ export async function processChat(
         : publishDraftFallback("error", errorText, { markerOptions });
 
     if (fallbackPublished) {
-      // Tool-budget reservations remain after terminal persistence. Protected
-      // handoff intent was already persisted above for crash safety.
+      // Tool-budget reservations remain after terminal persistence.
       queueToolBudgetContinuation();
       await finalizeSuccessfulRun();
       return;
@@ -1959,10 +1895,6 @@ export async function processChat(
       queueToolBudgetContinuation();
       await finalizeSuccessfulRun();
     } else {
-      // Retain the durable handoff intent on terminal persistence failure.
-      // rollbackChatRunWithError makes the source retryable; replay dedupes by
-      // sourceMessageId and normal successful terminal persistence removes the
-      // stale intent atomically with the terminal row insert.
       rollbackChatRunWithError(chatJid, {
         prevTs: prevCursor,
         failedTs: lastMessage.timestamp,

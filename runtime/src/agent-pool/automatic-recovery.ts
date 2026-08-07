@@ -33,6 +33,7 @@ export type RecoveryClassifier =
   | "auth_config"
   | "recovery_suppressed"
   | "stale_progress_watchdog"
+  | "compaction_in_progress"
   | "session_corruption"
   | "non_recoverable"
   | "tool_activity"
@@ -172,6 +173,7 @@ export function classifyOpaqueAgentFailure(errorText: string | null | undefined)
   const value = String(errorText || "").trim();
   if (!value) return "unknown";
   if (/stale-progress watchdog/i.test(value)) return "stalled_work";
+  if (/cannot submit a prompt while compaction is in progress|compaction_in_progress/i.test(value)) return "compaction_in_progress";
   if (isOrphanFunctionCallOutputError(value)) return "session_corruption";
   if (isProviderAuthConfigFailure(value)) return "auth_config";
   if (isContextPressureFailure(value)) return "context_pressure";
@@ -231,6 +233,15 @@ export function decideAutomaticRecovery(input: RecoveryDecisionInput): RecoveryD
       classifier: "stale_progress_watchdog",
       strategy: null,
       reason: "Stale-progress watchdog already interrupted the active run; do not retry automatically.",
+    };
+  }
+
+  if (failureCategory === "compaction_in_progress") {
+    return {
+      recover: false,
+      classifier: "compaction_in_progress",
+      strategy: null,
+      reason: "Another physical processor owns active compaction; defer to its completion resume.",
     };
   }
 

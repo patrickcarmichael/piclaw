@@ -595,9 +595,39 @@ describe("web recovery helpers", () => {
 
     resumePendingChats(ctx, undefined, store);
 
-    expect(enqueued.map((item) => item.key)).toEqual(["resume:web:2"]);
+    expect(enqueued.map((item) => item.key)).toEqual(["resume:web:2:wake"]);
     await enqueued[0].task();
     expect(processed).toEqual([{ chatJid: "web:2", agentId: "default" }]);
+  });
+
+  test("resumePendingChats defers a pending chat to its persisted preflight owner", () => {
+    const enqueued: string[] = [];
+    const ctx: WebRecoveryContext = {
+      assistantName: "Pi",
+      defaultAgentId: "default",
+      enqueue: (_task, key) => { enqueued.push(key); },
+      processChat: async () => {},
+    };
+    const store: WebRecoveryStore = {
+      getPreflightRuns: () => [{
+        chatJid: "web:owned",
+        prevTs: "t0",
+        messageId: "m-owned",
+        startedAt: "2026-01-01T00:00:00.000Z",
+      }],
+      getInflightRuns: () => [],
+      transaction: (run) => run(),
+      getAgentReplyStateAfter: () => "none",
+      clearInflightMarker: () => {},
+      rollbackInflightRun: () => {},
+      getAllChatCursors: () => ({ "web:owned": "t0" }),
+      getKnownChatJids: () => ["web:owned"],
+      getDeferredQueuedFollowups: () => [],
+      getMessagesSince: () => [{ id: "m-owned" }],
+    };
+
+    resumePendingChats(ctx, undefined, store);
+    expect(enqueued).toEqual([]);
   });
 
   test("resumePendingChats scans known chats even when a cursor row is missing", async () => {
@@ -631,7 +661,7 @@ describe("web recovery helpers", () => {
     resumePendingChats(ctx, undefined, store);
 
     expect(calls).toContainEqual({ chatJid: "web:new", since: "" });
-    expect(enqueued.map((item) => item.key)).toEqual(["resume:web:new"]);
+    expect(enqueued.map((item) => item.key)).toEqual(["resume:web:new:wake"]);
   });
 
   test("resumePendingChats isolates an explicit chat branch from sibling pending chats", async () => {
@@ -671,7 +701,7 @@ describe("web recovery helpers", () => {
     resumePendingChats(ctx, "web:default:branch:research", store);
 
     expect(calls).toEqual([{ chatJid: "web:default:branch:research", since: "t-branch" }]);
-    expect(enqueued.map((item) => item.key)).toEqual(["resume:web:default:branch:research"]);
+    expect(enqueued.map((item) => item.key)).toEqual(["resume:web:default:branch:research:wake"]);
   });
 
   test("resumePendingChats enqueues deferred-only queued followups", async () => {
@@ -700,7 +730,7 @@ describe("web recovery helpers", () => {
 
     resumePendingChats(ctx, undefined, store);
 
-    expect(enqueued.map((item) => item.key)).toEqual(["resume:web:queue-only"]);
+    expect(enqueued.map((item) => item.key)).toEqual(["resume:web:queue-only:wake"]);
   });
 
   test("inflight recovery and resume_pending collapse to one queued replay per chat", async () => {

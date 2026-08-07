@@ -73,26 +73,27 @@ test("initial turns flush normally when no handoff is required", async () => {
   expect(delivered).toEqual(["normal result"]);
 });
 
-test("web defers protected recovery without publishing its tool-free terminal prose", async () => {
+test("protected recovery cannot be deferred into a caller-owned follow-up", async () => {
   const prompts: string[] = [];
   const delivered: string[] = [];
   const final = await runWithProtectedRecoveryHandoff(
     "finish the task",
-    {
-      deferToolEnabledContinuation: true,
-      onTurnComplete: (turn) => delivered.push(turn.text),
-    },
+    { onTurnComplete: (turn) => delivered.push(turn.text) },
     async (prompt, options) => {
       prompts.push(prompt);
-      options.onTurnComplete?.({ text: "committed tool progress", attachments: [], followedByToolUse: true });
-      options.onTurnComplete?.({ text: "tools are unavailable in this recovered turn", attachments: [] });
-      return protectedOutput();
+      if (prompts.length === 1) {
+        options.onTurnComplete?.({ text: "committed tool progress", attachments: [], followedByToolUse: true });
+        options.onTurnComplete?.({ text: "tools are unavailable in this recovered turn", attachments: [] });
+        return protectedOutput();
+      }
+      options.onTurnComplete?.({ text: "finished internally with tools", attachments: [] });
+      return { status: "success", result: "finished internally with tools" };
     },
   );
 
-  expect(prompts).toEqual(["finish the task"]);
-  expect(delivered).toEqual(["committed tool progress"]);
-  expect(final.requiresToolEnabledContinuation).toBe(true);
+  expect(prompts).toEqual(["finish the task", TOOL_ENABLED_RECOVERY_CONTINUATION_PROMPT]);
+  expect(delivered).toEqual(["committed tool progress", "finished internally with tools"]);
+  expect(final).toMatchObject({ status: "success", result: "finished internally with tools" });
 });
 
 test("the generated ordinary continuation cannot chain another continuation", async () => {

@@ -2667,21 +2667,20 @@ test("processChat queues at most one automatic tool-budget continuation per thre
   `).get("web:test-tool-budget-lineage-once", RECOVERY_CONTINUATION_PROMPT) as any).toMatchObject({ count: 1 });
 });
 
-test("processChat durably hands protected recovery to one ordinary tool-enabled continuation", async () => {
+test("processChat completes protected recovery internally without a synthetic user message", async () => {
   const ws = createTempWorkspace("piclaw-web-channel-");
   cleanupWorkspace = ws.cleanup;
   restoreEnv = setEnv({ PICLAW_WORKSPACE: ws.workspace, PICLAW_STORE: ws.store, PICLAW_DATA: ws.data });
 
   const db = await import("../../../src/db.js");
   const { TOOL_ENABLED_RECOVERY_CONTINUATION_PROMPT } = await import("../../../src/agent-pool/context-pressure-retry.js");
-  const { PROTECTED_RECOVERY_CONTROL_LABEL } = await import("../../../src/agent-pool/protected-recovery-control-intent.js");
+  const { runWithProtectedRecoveryHandoff } = await import("../../../src/agent-pool/protected-recovery-handoff.js");
   db.initDatabase();
   db.getDb().exec("DELETE FROM message_media; DELETE FROM messages; DELETE FROM chats; DELETE FROM chat_cursors;");
   db.storeChatMetadata("web:default", new Date().toISOString(), "Web");
 
-  const rootMessageId = `msg-${Math.random()}`;
-  const rootRowId = db.storeMessage({
-    id: rootMessageId,
+  db.storeMessage({
+    id: `msg-${Math.random()}`,
     chat_jid: "web:default",
     sender: "user",
     sender_name: "User",
@@ -2690,7 +2689,6 @@ test("processChat durably hands protected recovery to one ordinary tool-enabled 
     is_from_me: false,
     is_bot_message: false,
   });
-  db.getDb().prepare("UPDATE messages SET thread_id = ? WHERE rowid = ?").run(rootRowId, rootRowId);
 
   const prompts: string[] = [];
   const protectedDraft = "I cannot continue because workspace tools are unavailable.";
@@ -2699,55 +2697,42 @@ test("processChat durably hands protected recovery to one ordinary tool-enabled 
     queue: { enqueue: () => {} },
     agentPool: {
       setSessionBinder: () => {},
-      runAgent: async (prompt: string, _chatJid: string, options: any) => {
-        prompts.push(prompt);
-        if (prompts.length === 1) {
-          options.onEvent?.({ type: "message_update", assistantMessageEvent: { type: "text_start" } });
-          options.onEvent?.({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: protectedDraft } });
-          return {
-            status: "error",
-            error: "Protected recovery completed without execution tools; continuing once in an ordinary tool-enabled turn.",
-            result: null,
-            attachments: [],
-            requiresToolEnabledContinuation: true,
-            nextAction: "Continue automatically in one ordinary turn with the restored tool baseline.",
-            recovery: { attemptsUsed: 1, totalElapsedMs: 1000, recovered: false, exhausted: true, lastClassifier: "tool_activity", strategyHistory: ["retry"], diagnostics: [] },
-          };
-        }
-        return { status: "success", result: "Release completed with tools.", attachments: [] };
-      },
+      runAgent: async (prompt: string, _chatJid: string, options: any) => runWithProtectedRecoveryHandoff(
+        prompt,
+        options,
+        async (nextPrompt: string, nextOptions: any) => {
+          prompts.push(nextPrompt);
+          if (prompts.length === 1) {
+            nextOptions.onEvent?.({ type: "message_update", assistantMessageEvent: { type: "text_start" } });
+            nextOptions.onEvent?.({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: protectedDraft } });
+            return {
+              status: "error",
+              error: "Protected recovery requires its internal tool-restored continuation.",
+              result: null,
+              attachments: [],
+              requiresToolEnabledContinuation: true,
+              recovery: { attemptsUsed: 1, totalElapsedMs: 1000, recovered: false, exhausted: true, lastClassifier: "tool_activity", strategyHistory: ["retry"], diagnostics: [] },
+            };
+          }
+          return { status: "success", result: "Release completed with tools.", attachments: [] };
+        },
+      ),
       getContextUsageForChat: async () => null,
     },
   });
 
   await web.processChat("web:default", "default");
-  const continuation = db.getDb().prepare(`
-    SELECT content, content_blocks, thread_id
-    FROM messages
-    WHERE chat_jid = ? AND is_bot_message = 0 AND content = ?
-  `).get("web:default", PROTECTED_RECOVERY_CONTROL_LABEL) as any;
-  expect(continuation).toMatchObject({ content: PROTECTED_RECOVERY_CONTROL_LABEL, thread_id: rootRowId });
-  expect(JSON.parse(continuation.content_blocks)).toEqual([
-    expect.objectContaining({
-      type: "control_intent",
-      intent: "protected_recovery_continuation",
-      source_message_id: rootMessageId,
-      source_row_id: rootRowId,
-      thread_id: rootRowId,
-    }),
-  ]);
-  expect(db.getDb().prepare(`SELECT COUNT(*) AS count FROM messages WHERE chat_jid = ? AND content = ?`).get("web:default", TOOL_ENABLED_RECOVERY_CONTINUATION_PROMPT) as any).toMatchObject({ count: 0 });
-  expect(db.getDb().prepare(`SELECT COUNT(*) AS count FROM messages WHERE chat_jid = ? AND is_bot_message = 1 AND content = ?`).get("web:default", protectedDraft) as any).toMatchObject({ count: 0 });
-  expect(db.getDb().prepare(`SELECT COUNT(*) AS count FROM messages WHERE chat_jid = ? AND is_bot_message = 1 AND content LIKE ?`).get("web:default", "%Protected recovery completed without execution tools%") as any).toMatchObject({ count: 0 });
-  await web.processChat("web:default", "default", rootRowId);
 
-  expect(prompts[1]).toContain(TOOL_ENABLED_RECOVERY_CONTINUATION_PROMPT);
+  expect(prompts).toEqual([expect.any(String), TOOL_ENABLED_RECOVERY_CONTINUATION_PROMPT]);
+  expect(db.getDb().prepare(`SELECT COUNT(*) AS count FROM messages WHERE chat_jid = ? AND is_bot_message = 0`).get("web:default") as any).toMatchObject({ count: 1 });
+  expect(db.getDb().prepare(`SELECT COUNT(*) AS count FROM messages WHERE chat_jid = ? AND is_bot_message = 0 AND content = ?`).get("web:default", TOOL_ENABLED_RECOVERY_CONTINUATION_PROMPT) as any).toMatchObject({ count: 0 });
+  expect(db.getDb().prepare(`SELECT COUNT(*) AS count FROM messages WHERE chat_jid = ? AND is_bot_message = 1 AND content = ?`).get("web:default", protectedDraft) as any).toMatchObject({ count: 0 });
   const timeline = db.getTimeline("web:default", 20);
   expect(timeline.filter((item: any) => item.data.type === "agent_response").some((item: any) => String(item.data.content).includes("Release completed with tools"))).toBe(true);
   expect(web.getQueuedFollowupItems("web:default")).toHaveLength(0);
 });
 
-test("processChat keeps the source pending when protected-recovery handoff persistence fails", async () => {
+test("processChat never enqueues when an internal handoff invariant escapes AgentPool", async () => {
   const ws = createTempWorkspace("piclaw-web-channel-");
   cleanupWorkspace = ws.cleanup;
   restoreEnv = setEnv({ PICLAW_WORKSPACE: ws.workspace, PICLAW_STORE: ws.store, PICLAW_DATA: ws.data });
@@ -2786,13 +2771,14 @@ test("processChat keeps the source pending when protected-recovery handoff persi
   });
   web.enqueueQueuedFollowupItem = () => { throw new Error("simulated durable queue failure"); };
 
-  await expect(web.processChat("web:default", "default")).rejects.toThrow("handoff persistence failed");
-  expect(db.getChatCursor("web:default")).toBe("");
-  expect(db.getMessagesSince("web:default", "", "Smith").some((message: any) => message.timestamp === sourceTimestamp)).toBe(true);
+  await web.processChat("web:default", "default");
+  expect(db.getChatCursor("web:default")).toBe(sourceTimestamp);
+  expect(db.getMessagesSince("web:default", "", "Smith").filter((message: any) => !message.is_from_me)).toHaveLength(1);
+  expect(db.getDb().prepare(`SELECT COUNT(*) AS count FROM messages WHERE chat_jid = ? AND is_bot_message = 1 AND content_blocks LIKE ?`).get("web:default", "%Internal recovery continuation failed%") as any).toMatchObject({ count: 1 });
   expect(web.getQueuedFollowupItems("web:default")).toHaveLength(0);
 });
 
-test("processChat retains protected-recovery handoff intent when terminal persistence fails", async () => {
+test("processChat rolls back an escaped internal handoff when terminal persistence fails", async () => {
   const ws = createTempWorkspace("piclaw-web-channel-");
   cleanupWorkspace = ws.cleanup;
   restoreEnv = setEnv({ PICLAW_WORKSPACE: ws.workspace, PICLAW_STORE: ws.store, PICLAW_DATA: ws.data });
@@ -2835,9 +2821,7 @@ test("processChat retains protected-recovery handoff intent when terminal persis
   };
 
   await web.processChat("web:default", "default");
-  expect(web.getQueuedFollowupItems("web:default")).toEqual([
-    expect.objectContaining({ source: "auto-protected-recovery-continuation" }),
-  ]);
+  expect(web.getQueuedFollowupItems("web:default")).toHaveLength(0);
   expect(db.getFailedRun("web:default")).toBeTruthy();
 });
 

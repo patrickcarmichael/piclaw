@@ -122,6 +122,27 @@ test("classifies context-limit failures as compact-then-retry", () => {
   expect(decision.strategy).toBe("compact_then_retry");
 });
 
+test("classifies the SDK compaction lock as non-retrying compaction ownership", () => {
+  const errorText = "Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.";
+  const decision = decideAutomaticRecovery({
+    config: DEFAULT_AUTOMATIC_RECOVERY_CONFIG,
+    errorText,
+    recoveryAttemptsUsed: 0,
+    elapsedMs: 1000,
+    snapshot: {
+      hadToolActivity: false,
+      hadPartialOutput: false,
+    },
+  });
+
+  expect(classifyOpaqueAgentFailure(errorText)).toBe("compaction_in_progress");
+  expect(decision).toMatchObject({
+    recover: false,
+    classifier: "compaction_in_progress",
+    strategy: null,
+  });
+});
+
 test("treats timeout-before-finalization during compaction intent as compact-then-retry", () => {
   const decision = decideAutomaticRecovery({
     config: DEFAULT_AUTOMATIC_RECOVERY_CONFIG,

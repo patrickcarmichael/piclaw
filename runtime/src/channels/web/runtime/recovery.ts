@@ -587,11 +587,23 @@ export function resumePendingChats(
   store: WebRecoveryStore = defaultStore
 ): void {
   const cursors = store.getAllChatCursors();
+  const preflightOwners = new Map((store.getPreflightRuns?.() ?? []).map((owner) => [owner.chatJid, owner]));
   const resolvedJids = chatJid && chatJid !== "all"
     ? [chatJid]
     : Array.from(new Set([...Object.keys(cursors), ...store.getKnownChatJids()]));
 
   for (const jid of resolvedJids) {
+    const owner = preflightOwners.get(jid);
+    if (owner) {
+      log.info("Pending scan deferred to active preflight owner", {
+        operation: "resume_pending_chats.preflight_owned",
+        chatJid: jid,
+        messageId: owner.messageId,
+        startedAt: owner.startedAt,
+      });
+      continue;
+    }
+
     const since = Object.prototype.hasOwnProperty.call(cursors, jid) ? cursors[jid] : "";
     const messages = store.getMessagesSince(jid, since, ctx.assistantName);
     const deferred = store.getDeferredQueuedFollowups(jid);
@@ -609,6 +621,6 @@ export function resumePendingChats(
         await (ctx.sleep ? ctx.sleep(ctx.recoveryDelayMs!) : Bun.sleep(ctx.recoveryDelayMs!));
       }
       await ctx.processChat(jid, ctx.defaultAgentId);
-    }, `resume:${jid}`, recoveryLaneKey(jid));
+    }, `resume:${jid}:wake`, recoveryLaneKey(jid));
   }
 }

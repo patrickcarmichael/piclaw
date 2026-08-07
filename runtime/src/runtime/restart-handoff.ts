@@ -277,6 +277,7 @@ function storeResumeMessage(
 
 export function recoverPendingRestartHandoffs(
   web: RestartHandoffRecoveryWebChannel,
+  options: { resumeTurns?: boolean } = {},
 ): RestartHandoffRecoverySummary {
   const summary: RestartHandoffRecoverySummary = {
     discovered: 0,
@@ -379,8 +380,10 @@ export function recoverPendingRestartHandoffs(
           state: "resume_posted",
           resumeMessageRowId: resume.rowId,
         });
-        web.resumeChat(current.chatJid, resume.rowId);
-        summary.turnsResumed += 1;
+        if (options.resumeTurns !== false) {
+          web.resumeChat(current.chatJid, resume.rowId);
+          summary.turnsResumed += 1;
+        }
       }
 
       deleteRestartHandoff(current.restartId);

@@ -27,6 +27,7 @@ export type AgentFailureCategory =
   | "session_corruption"
   | "non_recoverable"
   | "already_processing"
+  | "compaction_in_progress"
   | "provider_unavailable"
   | "unknown";
 
@@ -155,13 +156,7 @@ export interface RunAgentOptions {
    * LLM-driven self-escalation beyond the ceiling.
    */
   toolCeilingFilter?: (toolName: string) => boolean;
-  /**
-   * Let the caller durably persist a protected-recovery continuation instead
-   * of running it inline. Web uses this to order queue intent before terminal
-   * message and cursor finalization.
-   */
-  deferToolEnabledContinuation?: boolean;
-  /** This run is the typed, one-shot ordinary continuation after protected recovery. */
+  /** This run is the internal, one-shot ordinary continuation after protected recovery. */
   protectedRecoveryContinuation?: boolean;
 }
 

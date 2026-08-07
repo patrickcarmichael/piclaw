@@ -307,6 +307,50 @@ describe("chat preflight lifecycle", () => {
 
     db.endChatRun(chatJid);
   });
+
+  test("keeps the first owner and compare-clears only that ownership tuple", () => {
+    const chatJid = jid("preflight-exclusive-owner");
+    const first = {
+      prevTs: "2024-03-22T00:00:00.000Z",
+      messageId: "msg-first-owner",
+      startedAt: "2024-03-22T00:00:00.001Z",
+    };
+    const second = {
+      prevTs: first.prevTs,
+      messageId: "msg-second-owner",
+      startedAt: "2024-03-22T00:00:00.002Z",
+    };
+
+    expect(db.beginChatPreflight(chatJid, first)).toBe(true);
+    expect(db.beginChatPreflight(chatJid, second)).toBe(false);
+    expect(db.getChatPreflight(chatJid)).toEqual({ chatJid, ...first });
+    expect(db.clearChatPreflight(chatJid, second)).toBe(false);
+    expect(db.getChatPreflight(chatJid)).toEqual({ chatJid, ...first });
+    expect(db.clearChatPreflight(chatJid, first)).toBe(true);
+    expect(db.getChatPreflight(chatJid)).toBeNull();
+  });
+
+  test("promotes only the processor that still owns preflight", () => {
+    const chatJid = jid("preflight-compare-promote");
+    const owner = {
+      prevTs: "2024-03-23T00:00:00.000Z",
+      messageId: "msg-promote-owner",
+      startedAt: "2024-03-23T00:00:00.001Z",
+    };
+    db.setChatCursor(chatJid, owner.prevTs);
+    expect(db.beginChatPreflight(chatJid, owner)).toBe(true);
+
+    expect(db.promoteChatPreflightToInflight(chatJid, "2024-03-23T00:01:00.000Z", {
+      ...owner,
+      startedAt: "2024-03-23T00:00:00.999Z",
+    })).toBe(false);
+    expect(db.getChatCursor(chatJid)).toBe(owner.prevTs);
+    expect(db.getChatPreflight(chatJid)).toEqual({ chatJid, ...owner });
+
+    expect(db.promoteChatPreflightToInflight(chatJid, "2024-03-23T00:01:00.000Z", owner)).toBe(true);
+    expect(db.getChatCursor(chatJid)).toBe("2024-03-23T00:01:00.000Z");
+    db.endChatRun(chatJid);
+  });
 });
 
 // ---------------------------------------------------------------------------

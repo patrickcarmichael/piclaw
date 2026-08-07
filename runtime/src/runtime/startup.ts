@@ -291,6 +291,8 @@ interface StartupRecoveryWebChannel {
   resumePendingChats(chatJid?: string): void;
 }
 
+const bootstrappedRecoveryChannels = new WeakSet<object>();
+
 function parseModelLabel(label: string): { provider?: string; modelId: string } {
   const trimmed = label.trim();
   const slash = trimmed.indexOf("/");
@@ -498,6 +500,14 @@ export function runWebStartupRecoveryBootstrap(
   recoverRestartHandoffs?: () => void,
   scheduleResumePending: (resume: () => void) => void = (resume) => { setTimeout(resume, 0); },
 ): void {
+  if (bootstrappedRecoveryChannels.has(web)) {
+    log.info("Startup recovery bootstrap already completed for web channel", {
+      operation: "startup.recovery_bootstrap_deduplicated",
+    });
+    return;
+  }
+  bootstrappedRecoveryChannels.add(web);
+
   const startedAt = new Date().toISOString();
   web.updateAgentStatus(STARTUP_STATUS_CHAT_JID, buildStartupAgentStatus({
     phase: "recovering_inflight",
@@ -578,7 +588,9 @@ export async function startWebChannel(queue: AgentQueue, agentPool: AgentPool): 
   captureStartupMemorySnapshot(agentPool, { label: "post-web-start" });
   queueStartupSessionWarmup(agentPool, resolveStartupSessionWarmupOptions());
   runWebStartupRecoveryBootstrap(web, () => {
-    recoverPendingRestartHandoffs(web);
+    // Startup pending scanning is the single queue owner. Handoff recovery only
+    // materializes durable continuation rows; the scan below queues each chat.
+    recoverPendingRestartHandoffs(web, { resumeTurns: false });
   });
 
   // Wire session_control separately from chat relay. This tool controls target

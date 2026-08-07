@@ -483,9 +483,9 @@ export function setChatCursor(chatJid: string, ts: string): void {
 export function beginChatPreflight(
   chatJid: string,
   preflight: { prevTs: string; messageId: string; startedAt: string }
-): void {
+): boolean {
   const db = getDb();
-  db.prepare(`
+  const result = db.prepare(`
     INSERT INTO chat_cursors
       (chat_jid, cursor_ts, preflight_prev_ts, preflight_message_id, preflight_started_at)
     VALUES (?, ?, ?, ?, ?)
@@ -493,56 +493,95 @@ export function beginChatPreflight(
       preflight_prev_ts    = excluded.preflight_prev_ts,
       preflight_message_id = excluded.preflight_message_id,
       preflight_started_at = excluded.preflight_started_at
+    WHERE chat_cursors.preflight_message_id IS NULL
   `).run(chatJid, preflight.prevTs, preflight.prevTs, preflight.messageId, preflight.startedAt);
+  return result.changes > 0;
+}
+
+/** Return the active preflight owner for one chat, if present. */
+export function getChatPreflight(chatJid: string): PreflightRun | null {
+  const db = getDb();
+  const row = db.prepare(`
+    SELECT preflight_prev_ts, preflight_message_id, preflight_started_at
+    FROM chat_cursors
+    WHERE chat_jid = ? AND preflight_message_id IS NOT NULL
+  `).get(chatJid) as {
+    preflight_prev_ts: string;
+    preflight_message_id: string;
+    preflight_started_at: string;
+  } | undefined;
+  return row ? {
+    chatJid,
+    prevTs: row.preflight_prev_ts,
+    messageId: row.preflight_message_id,
+    startedAt: row.preflight_started_at,
+  } : null;
 }
 
 /**
  * Clear the preflight marker without consuming or rolling back the cursor.
+ * When an owner is supplied, compare all ownership fields so stale completion
+ * callbacks cannot clear a newer preflight.
  */
-export function clearChatPreflight(chatJid: string): void {
+export function clearChatPreflight(chatJid: string, owner?: Omit<PreflightRun, "chatJid">): boolean {
   const db = getDb();
-  db.prepare(`
-    UPDATE chat_cursors
-    SET preflight_prev_ts    = NULL,
-        preflight_message_id = NULL,
-        preflight_started_at = NULL
-    WHERE chat_jid = ?
-  `).run(chatJid);
+  const result = owner
+    ? db.prepare(`
+      UPDATE chat_cursors
+      SET preflight_prev_ts    = NULL,
+          preflight_message_id = NULL,
+          preflight_started_at = NULL
+      WHERE chat_jid = ?
+        AND preflight_prev_ts = ?
+        AND preflight_message_id = ?
+        AND preflight_started_at = ?
+    `).run(chatJid, owner.prevTs, owner.messageId, owner.startedAt)
+    : db.prepare(`
+      UPDATE chat_cursors
+      SET preflight_prev_ts    = NULL,
+          preflight_message_id = NULL,
+          preflight_started_at = NULL
+      WHERE chat_jid = ?
+    `).run(chatJid);
+  return result.changes > 0;
 }
 
 /**
  * Promote a chat from preflight into normal inflight run state.
  *
- * Single UPDATE that consumes the user message into cursor_ts, clears the
- * preflight marker, and records the inflight marker together.
+ * The ownership comparison prevents a stale physical processor from consuming
+ * a message after another processor has acquired the chat preflight.
  */
 export function promoteChatPreflightToInflight(
   chatJid: string,
   newCursorTs: string,
   inflight: { prevTs: string; messageId: string; startedAt: string }
-): void {
+): boolean {
   const db = getDb();
-  db.prepare(`
-    INSERT INTO chat_cursors (
-      chat_jid,
-      cursor_ts,
-      preflight_prev_ts,
-      preflight_message_id,
-      preflight_started_at,
-      inflight_prev_ts,
-      inflight_message_id,
-      inflight_started_at
-    )
-    VALUES (?, ?, NULL, NULL, NULL, ?, ?, ?)
-    ON CONFLICT(chat_jid) DO UPDATE SET
-      cursor_ts            = excluded.cursor_ts,
-      preflight_prev_ts    = NULL,
-      preflight_message_id = NULL,
-      preflight_started_at = NULL,
-      inflight_prev_ts     = excluded.inflight_prev_ts,
-      inflight_message_id  = excluded.inflight_message_id,
-      inflight_started_at  = excluded.inflight_started_at
-  `).run(chatJid, newCursorTs, inflight.prevTs, inflight.messageId, inflight.startedAt);
+  const result = db.prepare(`
+    UPDATE chat_cursors
+    SET cursor_ts            = ?,
+        preflight_prev_ts    = NULL,
+        preflight_message_id = NULL,
+        preflight_started_at = NULL,
+        inflight_prev_ts     = ?,
+        inflight_message_id  = ?,
+        inflight_started_at  = ?
+    WHERE chat_jid = ?
+      AND preflight_prev_ts = ?
+      AND preflight_message_id = ?
+      AND preflight_started_at = ?
+  `).run(
+    newCursorTs,
+    inflight.prevTs,
+    inflight.messageId,
+    inflight.startedAt,
+    chatJid,
+    inflight.prevTs,
+    inflight.messageId,
+    inflight.startedAt,
+  );
+  return result.changes > 0;
 }
 
 /**
@@ -1020,6 +1059,30 @@ export function rollbackInflightRun(chatJid: string, prevTs: string): void {
         compaction_active_reason     = NULL
     WHERE chat_jid = ?
   `).run(prevTs, chatJid);
+}
+
+/**
+ * Roll back only the inflight run that encountered an SDK compaction lock.
+ * The active compaction marker belongs to a different physical processor and
+ * must remain intact until that owner completes it.
+ */
+export function rollbackInflightRunForCompactionConflict(
+  chatJid: string,
+  prevTs: string,
+  owner: { messageId: string; startedAt: string },
+): boolean {
+  const db = getDb();
+  const result = db.prepare(`
+    UPDATE chat_cursors
+    SET cursor_ts           = ?,
+        inflight_prev_ts    = NULL,
+        inflight_message_id = NULL,
+        inflight_started_at = NULL
+    WHERE chat_jid = ?
+      AND inflight_message_id = ?
+      AND inflight_started_at = ?
+  `).run(prevTs, chatJid, owner.messageId, owner.startedAt);
+  return result.changes > 0;
 }
 
 /**
