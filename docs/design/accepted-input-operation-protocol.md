@@ -1,6 +1,6 @@
 # Accepted-input operation protocol
 
-Piclaw must keep one durable operation for every accepted input until that input has one durable terminal disposition. Queue entries and timers are wake-up hints; they do not own accepted work.
+Piclaw must keep one durable owner for every accepted input until that input has one durable terminal disposition. Queue entries and timers are wake-up hints; they do not own accepted work.
 
 This protocol defines the target contract for the audit remediation. It extends the existing durable chat state and does not introduce an independent recovery coordinator.
 
@@ -46,19 +46,13 @@ The audit also rejected broad claims that all thread identity, callback capture,
 
 ## Durable operation
 
-Each accepted source gets one generated `operation_id`. The ID is written in the same transaction that accepts the source and is never regenerated during retry, recovery, rotation or restart.
+Acceptance appends one `chat_accepted_sources` row with a database-assigned monotonic `source_seq`, chat, immutable class/kind/ID, acceptance time, fixed selectability, durable payload reference and source-kind-specific compatibility frontier reference. Persisted messages bind their stable message ID and timestamp; queued follow-ups and commands do not advance the legacy message cursor. `source_seq`, not a timestamp, SQLite rowid or recycled follow-up ID, is canonical order. User messages and user-accepted queued follow-ups are independently prompt-bearing sources. Prompting commands are sources according to their command semantics.
 
-An operation records at least:
+A steer accepted against an active operation is an operation-bound, non-selectable intent with its own disposition. Protected and automatic continuations are operation-owned intents or phases, never new top-level sources. Maintenance is not accepted work.
 
-- `chat_jid`;
-- `operation_id`;
-- source kind and stable source identity;
-- source order at the chat frontier;
-- phase and phase epoch;
-- cancellation state and cause;
-- terminal disposition and terminal row reference, when present.
+When the earliest selectable undisposed source reaches the frontier, one immediate transaction verifies legacy and operation ownership, generates `operation_id`, binds it once to the accepted source and installs the active projection in `chat_cursors`. Repeating the claim returns the same ID. A disposed source cannot be reclaimed.
 
-The source can be a user message, queued follow-up, steer, slash/control command or protected internal continuation. Runtime control does not require a synthetic user message. A protected continuation remains a phase of its source operation and cannot become a second source.
+The active projection stores only `chat_jid`, `operation_id`, `source_seq`, phase, one monotonic generation and optional first-cause cancellation metadata. It stores no terminal phase, outcome or artifact reference. Terminal truth exists only in the immutable disposition ledger.
 
 `operation_id` is the owner token for session and chat-state mutation. Every mutating transition compares the expected token with the durable current owner. A stale owner receives an explicit no-op or conflict result.
 
@@ -68,14 +62,13 @@ The durable phase uses this small set:
 
 | State | Meaning |
 |---|---|
-| `pending` | The source is durable and waits at or behind the frontier. |
+| `pending` | The frontier source has been bound to one active `operation_id` and awaits preflight. Sources behind the frontier remain owned by their stable source records. |
 | `preflight` | The operation owns selection, introspection and bounded pre-prompt work. |
 | `running` | The operation owns prompt, tool and stream effects. |
 | `waiting` | The operation owns a durable retry, compaction, rotation or protected-continuation wait. |
 | `blocked` | Automatic progress stopped. The source retains ownership until explicit retry or skip. |
-| `terminal` | One durable disposition exists. The operation cannot change again. |
 
-`phase_epoch` increments before an asynchronous phase effect starts. Completion callbacks must compare both `operation_id` and `phase_epoch`. Late callbacks from retries, compaction, rotation, watchdogs or remote control cannot mutate a successor.
+There is no parked terminal phase. Completion appends the disposition and clears the active projection atomically. `generation` increments before each new asynchronous phase/effect and on first-cause cancellation. Callbacks compare `(operation_id, phase, generation)`; cancellation therefore fences stale success.
 
 ## Frontier
 
@@ -91,17 +84,18 @@ All transitions run through one `chat:<jid>` gateway, except the compare-and-act
 
 | From | To | Condition |
 |---|---|---|
-| source absent | `pending` | Accept the source and operation atomically. |
+| accepted frontier source, no active operation | `pending` | Generate one `operation_id` and bind it to the stable source by compare-and-set. |
 | `pending` | `preflight` | Claim the frontier with an owner compare-and-set. |
 | `preflight` | `running` | Promote the same owner after preflight settles. |
 | `preflight` or `running` | `waiting` | Persist the next retry, compaction, rotation or continuation phase before releasing execution. |
-| `waiting` | `running` | Resume only when owner and phase epoch still match. |
-| any non-terminal state | `blocked` | Persist a deterministic failure or exhausted policy while retaining the source. |
-| `blocked` | `pending` | Explicit retry creates a new phase epoch for the same operation. |
-| `blocked` | `terminal` | Explicit visible skip/discard writes a terminal disposition. |
-| any non-terminal state | `terminal` | Atomic completion writes one disposition and commits the frontier. |
+| `waiting` | `running` | Resume only when owner and generation still match. |
+| any active state | `blocked` | Persist a deterministic failure or exhausted policy while retaining the source. |
+| `blocked` | `pending` | Explicit retry increments generation for the same operation. |
+| any active state | disposition + release | Atomic completion writes one outcome and clears ownership. |
 
-There is no transition out of `terminal`. Repeating a completed transition returns the stored result. A later source never clears or replaces the frontier operation.
+Repeating completion returns the exact stored disposition. A later source never clears or replaces the frontier operation. After cancellation, shared transitions reject promotions, resumes and new effects; only a fresh owner snapshot can complete the `cancelled` disposition.
+
+`runtime/src/db/chat-operations.ts` is the executable transition contract. Invalid transitions return typed no-write results. Completion compares `operation_id`, source, phase and generation before artifact validation.
 
 ## Terminal invariant
 
@@ -115,16 +109,18 @@ A consumed source has exactly one terminal disposition:
 - `skipped`;
 - `dead_lettered`.
 
+`chat_operation_dispositions` is an immutable terminal ledger keyed by stable source sequence and bound operation identity. It records typed cause/provenance and the stable terminal message identity `(chat_jid, message id)`, never SQLite rowid. It records no active phase and cannot coordinate work.
+
 Terminal completion is one idempotent transaction. It:
 
-1. verifies `chat_jid`, `operation_id`, phase and expected version;
-2. stores or promotes exactly one terminal output row when the disposition requires visible output;
-3. disposes of source-bound steer, command, follow-up and continuation intent;
-4. stores the terminal disposition and row reference;
-5. advances the frontier;
-6. releases durable ownership.
+1. compares `chat_jid`, `operation_id`, source, phase and generation before validating or writing artifacts;
+2. stores or promotes exactly one terminal output row when the source kind and disposition require visible output;
+3. binds any terminal message row to the same `operation_id`;
+4. disposes of source-bound steer, command, follow-up and continuation intent;
+5. inserts the source-bound terminal ledger entry;
+6. applies only the compatibility cursor value stored on the claimed source, when present, then advances that cursor and releases active ownership in the same owner-checked update.
 
-The transaction can return the existing terminal result after a retry. A terminal output write failure leaves the operation non-terminal and recoverable. An intermediate row alone is not a terminal disposition; completion must promote the last eligible row or append one closure.
+The transaction returns the existing ledger result after a retry. A uniqueness conflict with a different operation or disposition is an invariant failure. `skipped`, `dead_lettered`, cancelled work and non-output control outcomes can use a null terminal row. A terminal output write failure leaves the operation non-terminal and recoverable. An intermediate row alone is not a terminal disposition; completion must promote the last eligible row or append one closure.
 
 ## Cancellation
 
@@ -136,9 +132,27 @@ The gateway checks cancellation before preflight promotion, retry, rotation, pro
 
 ## Session mutation gateway
 
-Prompt, compact, retry, model/session changes, prompting slash commands, rotation and maintenance execute through the per-chat gateway. Each command carries `operation_id` and phase epoch.
+Prompt, compact, retry, model/session changes, prompting slash commands, rotation and maintenance execute through the per-chat gateway. Each accepted-work command carries `operation_id` and generation.
 
-Maintenance starts only after terminal output commits and no accepted user work is pending. It uses an internal operation identity and cannot occupy or advance a user frontier.
+Maintenance starts only after terminal output commits and no accepted user work is pending. It uses an internal gateway lease identity, not an accepted-source `operation_id`, and cannot occupy or advance a user frontier.
+
+## Legacy authority bridge
+
+The additive migration leaves operation columns null for existing databases. A null `operation_id` means the legacy preflight/inflight/failed state still owns that chat. Operation claim must refuse a row with any active legacy marker; the two coordinators cannot own the same chat.
+
+As each runtime path migrates, one transaction writes operation state and any legacy projection still needed by old readers. The operation columns are authoritative for migrated paths. The compatibility projection has a named deletion point:
+
+| Legacy authority or mutator | Compatibility use | Deletion point |
+|---|---|---|
+| `beginChatPreflight()`, `clearChatPreflight()`, `promoteChatPreflightToInflight()` | Existing preflight readers during the preflight migration | Remove after startup and foreground preflight read operation phase/epoch. |
+| `beginChatRun()`, `endChatRun()`, `endChatRunWithError()` | Existing normal-run completion until common terminalisation is wired | Remove after normal success and failure use the common terminal transaction. |
+| `getFailedRun()`, `clearFailedRun()`, `rollbackChatRunWithError()` | Failed-frontier compatibility | Remove after blocked operations, CAS retry and atomic skip replace failed markers. |
+| `getInflightRuns()`, `rollbackInflightRun()`, `clearInflightMarker()` and compaction variants | Startup recovery compatibility | Remove after recovery resumes or terminalises operation-owned phases. |
+| Unchecked `setChatCursor()` calls | Cursor compatibility for skip, branch and maintenance paths | Narrow to branch administration after frontier commit and explicit skip use owner-checked transactions. |
+
+The ownership drift test inventories every `chat_cursors` update, delete and rename, snapshots named legacy mutators, and permits operation-column writes only in the shared CAS module. Database triggers reject cursor movement, legacy-owner mutation and whole-row deletion while an active projection exists. Explicit branch or Dream destruction first uses the named operation-lifecycle cleanup, which intentionally removes source/disposition state and clears ownership before deleting the cursor. Adding another direct mutator requires an explicit inventory change and review.
+
+Disposition outcome/source/provenance/artifact fields and message operation bindings are immutable. Timeline edits cannot demote or delete a ledger-referenced bot terminal artifact; archive export retains source and disposition history, rename moves chat identity transactionally, and explicit permanent deletion removes all related state by policy.
 
 ## Crash recovery
 

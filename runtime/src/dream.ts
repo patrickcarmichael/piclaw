@@ -11,7 +11,7 @@ import { inspectDailyNoteSummaryBacklog, refreshDailyNotesFromMessages } from ".
 import { refreshAgentMemoryFromDailyNotes, type RefreshAgentMemoryResult } from "./agent-memory/refresh.js";
 import { AUTO_DREAM_DEFAULT_DAYS, MANUAL_DREAM_DEFAULT_DAYS } from "./dream-defaults.js";
 import { DATA_DIR, SESSIONS_DIR, WORKSPACE_DIR, getDreamConfig } from "./core/config.js";
-import { getTaskById, createTask, getDb, updateTask } from "./db.js";
+import { getTaskById, createTask, deleteChatOperationLifecycleState, getDb, updateTask } from "./db.js";
 import { deleteThinkingContentByChatJid, deleteThinkingContentByChatJidPattern } from "./db/thinking-cleanup.js";
 import { refreshWorkspaceIndex } from "./workspace-search.js";
 import { computeNextRun } from "./task-scheduler-utils.js";
@@ -230,6 +230,13 @@ function buildDreamChatJid(chatJid: string, mode: "manual" | "auto"): string {
  * cleanupDreamChat. Optionally excludes a single dream chat JID (the current
  * active one).
  */
+function clearDreamOperationLifecycleState(excludeDreamChatJid?: string | null): void {
+  const db = getDb();
+  const rows = db.prepare(`SELECT chat_jid FROM chat_cursors WHERE chat_jid LIKE 'dream:%'
+    UNION SELECT chat_jid FROM chat_accepted_sources WHERE chat_jid LIKE 'dream:%'`).all() as Array<{ chat_jid: string }>;
+  for (const row of rows) if (row.chat_jid !== excludeDreamChatJid) deleteChatOperationLifecycleState(row.chat_jid);
+}
+
 function reapDreamArtifacts(excludeDreamChatJid?: string | null): void {
   const excluded = new Set<string>();
   if (excludeDreamChatJid) {
@@ -240,6 +247,7 @@ function reapDreamArtifacts(excludeDreamChatJid?: string | null): void {
 
   try {
     const db = getDb();
+    clearDreamOperationLifecycleState(excludeDreamChatJid);
     if (excludeDreamChatJid) {
       db.prepare("DELETE FROM message_media WHERE message_rowid IN (SELECT rowid FROM messages WHERE chat_jid LIKE 'dream:%' AND chat_jid != ?)").run(excludeDreamChatJid);
       // Purge thinking_content for messages we're about to delete. Defensive:
@@ -285,6 +293,7 @@ async function cleanupDreamChat(agentPool: AgentPool, dreamChatJid: string): Pro
 
   try {
     const db = getDb();
+    deleteChatOperationLifecycleState(dreamChatJid);
     db.prepare("DELETE FROM message_media WHERE message_rowid IN (SELECT rowid FROM messages WHERE chat_jid = ?)").run(dreamChatJid);
     deleteThinkingContentByChatJid(dreamChatJid);
     db.prepare("DELETE FROM messages WHERE chat_jid = ?").run(dreamChatJid);

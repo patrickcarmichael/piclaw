@@ -151,6 +151,41 @@ export type {
   StalePreflightRecoveryRecord,
 } from "./db/chat-cursors.js";
 export {
+  registerAcceptedChatSource,
+  storeAcceptedChatMessageSource,
+  registerChatOperationIntent,
+  getAcceptedChatSource,
+  getChatOperation,
+  claimNextChatOperation,
+  promoteChatOperation,
+  waitChatOperation,
+  resumeChatOperation,
+  blockChatOperation,
+  retryBlockedChatOperation,
+  cancelChatOperation,
+  completeChatOperation,
+  getChatOperationDisposition,
+  chatOperationTerminalArtifactPolicy,
+} from "./db/chat-operations.js";
+export { deleteChatOperationLifecycleState } from "./db/chat-operation-lifecycle.js";
+export type {
+  AcceptedChatSource,
+  ChatSourceClass,
+  ChatSourceKind,
+  ChatOperationPhase,
+  ChatOperationOutcome,
+  ChatOperationCancellation,
+  ChatOperationState,
+  ChatOperationOwner,
+  ChatOperationClaimResult,
+  ChatOperationCancelResult,
+  ChatOperationTransitionResult,
+  ChatOperationDisposition,
+  ChatOperationCompletion,
+  ChatOperationCompletionResult,
+  TerminalArtifactPolicy,
+} from "./db/chat-operations.js";
+export {
   storeTokenUsage,
   getTokenUsageTotals,
   getTokenUsageByProvider,
