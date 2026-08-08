@@ -600,6 +600,32 @@ describe("web recovery helpers", () => {
     expect(processed).toEqual([{ chatJid: "web:2", agentId: "default" }]);
   });
 
+  test("resumePendingChats wakes durable-only work and holds blocked durable ownership", () => {
+    const enqueued: string[] = [];
+    const ctx: WebRecoveryContext = {
+      assistantName: "Pi",
+      defaultAgentId: "default",
+      enqueue: (_task, key) => { enqueued.push(key); },
+      processChat: async () => {},
+    };
+    const store: WebRecoveryStore = {
+      getInflightRuns: () => [],
+      transaction: (run) => run(),
+      getAgentReplyStateAfter: () => "none",
+      clearInflightMarker: () => {},
+      rollbackInflightRun: () => {},
+      getAllChatCursors: () => ({ "web:blocked": "after-both" }),
+      getKnownChatJids: () => ["web:blocked"],
+      getResumableDurableChatJids: () => ["web:durable-only"],
+      getBlockedDurableChatJids: () => ["web:blocked"],
+      getDeferredQueuedFollowups: () => [],
+      getMessagesSince: () => [],
+    };
+
+    resumePendingChats(ctx, undefined, store);
+    expect(enqueued).toEqual(["resume:web:durable-only:wake"]);
+  });
+
   test("resumePendingChats defers a pending chat to its persisted preflight owner", () => {
     const enqueued: string[] = [];
     const ctx: WebRecoveryContext = {

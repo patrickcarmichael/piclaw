@@ -157,6 +157,8 @@ export {
   registerChatOperationIntent,
   getAcceptedChatSource,
   getChatOperation,
+  getResumableDurableChatJids,
+  getBlockedDurableChatJids,
   peekNextAcceptedChatSource,
   claimNextChatOperation,
   promoteChatOperation,

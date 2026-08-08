@@ -331,6 +331,32 @@ export function getAcceptedChatSource(sourceSeq: number): AcceptedChatSource | n
   return row ? sourceFromRow(row) : null;
 }
 
+export function getResumableDurableChatJids(): string[] {
+  const rows = getDb().prepare(`
+    SELECT cursor.chat_jid FROM chat_cursors cursor
+    JOIN chat_accepted_sources source ON source.source_seq = cursor.operation_source_seq
+    WHERE cursor.operation_id IS NOT NULL AND cursor.operation_phase IN ('pending', 'preflight', 'running', 'waiting')
+      AND source.source_kind = 'message'
+    UNION
+    SELECT source.chat_jid
+    FROM chat_accepted_sources source
+    LEFT JOIN chat_operation_dispositions disposition ON disposition.source_seq = source.source_seq
+    LEFT JOIN chat_cursors cursor ON cursor.chat_jid = source.chat_jid
+    WHERE source.source_kind = 'message' AND disposition.source_seq IS NULL AND cursor.operation_id IS NULL
+    ORDER BY 1
+  `).all() as Array<{ chat_jid: string }>;
+  return rows.map((row) => row.chat_jid);
+}
+
+export function getBlockedDurableChatJids(): string[] {
+  const rows = getDb().prepare(`SELECT cursor.chat_jid FROM chat_cursors cursor
+    JOIN chat_accepted_sources source ON source.source_seq = cursor.operation_source_seq
+    WHERE cursor.operation_id IS NOT NULL AND cursor.operation_phase = 'blocked'
+      AND source.source_kind = 'message' ORDER BY cursor.chat_jid`)
+    .all() as Array<{ chat_jid: string }>;
+  return rows.map((row) => row.chat_jid);
+}
+
 export function getChatOperation(chatJid: string): ChatOperationState | null {
   const row = getDb().prepare(`SELECT chat_jid, operation_id, operation_source_seq, operation_phase,
     operation_generation, operation_cancel_cause, operation_cancel_requested_at FROM chat_cursors WHERE chat_jid = ?`)
@@ -570,12 +596,14 @@ export function completeChatOperation(
       request.provenance, request.createdAt, artifact);
     hooks.afterWrite?.("disposition");
 
-    db.prepare(`UPDATE chat_cursors SET cursor_ts = COALESCE(?, cursor_ts),
+    db.prepare(`UPDATE chat_cursors SET cursor_ts = CASE
+        WHEN ? IS NULL OR cursor_ts > ? THEN cursor_ts ELSE ? END,
       operation_id = NULL, operation_source_seq = NULL,
       operation_phase = NULL, operation_generation = NULL, operation_cancel_cause = NULL,
       operation_cancel_requested_at = NULL WHERE chat_jid = ? AND operation_id = ? AND operation_source_seq = ?
       AND operation_phase = ? AND operation_generation = ?`)
-      .run(source.frontierCursorTs, chatJid, active.operationId, active.sourceSeq, active.phase, active.generation);
+      .run(source.frontierCursorTs, source.frontierCursorTs, source.frontierCursorTs,
+        chatJid, active.operationId, active.sourceSeq, active.phase, active.generation);
     const released = db.prepare("SELECT changes() AS changes").get() as { changes: number };
     if (released.changes !== 1) throw new ChatOperationInvariantError("Active release lost owner comparison");
     hooks.afterWrite?.("cursor");

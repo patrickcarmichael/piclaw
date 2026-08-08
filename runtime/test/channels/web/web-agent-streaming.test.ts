@@ -18,6 +18,8 @@ import {
   getDb,
   promoteChatOperation,
   registerAcceptedChatSource,
+  setChatCursor,
+  storeAcceptedChatMessageSource,
 } from "../../../src/db.js";
 import { waitFor } from "../../helpers.js";
 import { createWebChannelTestFixture } from "./helpers/web-channel-fixture.js";
@@ -472,6 +474,65 @@ describe("web agent streaming", () => {
       expect(runs).toBe(2);
       expect(getChatOperation("web:waiting")).toBeNull();
       expect(getChatOperationDisposition(accepted.source.sourceSeq)).toMatchObject({ outcome: "succeeded" });
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  test("startup pending recovery gives durable owned work hidden from legacy selectors one terminal completion", async () => {
+    const chatJid = "web:durable-startup-recovery";
+    const prompts: string[] = [];
+    const fixture = await createWebChannelTestFixture({
+      queue: new AgentQueue(),
+      agentPool: {
+        setSessionBinder: () => {},
+        isStreaming: () => false,
+        isActive: () => false,
+        runAgent: async (prompt: string) => {
+          prompts.push(prompt);
+          return { status: "success", result: "recovered once", attachments: [] };
+        },
+        getContextUsageForChat: async () => null,
+      } as any,
+    });
+
+    try {
+      const accepted = storeAcceptedChatMessageSource({
+        id: "durable-restart-hidden",
+        chat_jid: chatJid,
+        sender: "user",
+        sender_name: "User",
+        content: `${getIdentityConfig().assistantName}: hidden durable restart prompt`,
+        timestamp: "2026-01-01T00:00:01.000Z",
+      });
+      setChatCursor(chatJid, "2026-01-01T00:00:02.000Z");
+      const claim = claimNextChatOperation(chatJid);
+      if (claim.status !== "claimed") throw new Error("expected durable claim");
+      const preflight = promoteChatOperation(chatJid, {
+        operationId: claim.operation.operationId,
+        sourceSeq: claim.operation.sourceSeq,
+        phase: claim.operation.phase,
+        generation: claim.operation.generation,
+      }, "preflight");
+      if (preflight.status !== "applied") throw new Error("expected preflight promotion");
+      const running = promoteChatOperation(chatJid, {
+        operationId: preflight.operation.operationId,
+        sourceSeq: preflight.operation.sourceSeq,
+        phase: preflight.operation.phase,
+        generation: preflight.operation.generation,
+      }, "running");
+      if (running.status !== "applied") throw new Error("expected running promotion");
+
+      fixture.channel.resumePendingChats();
+
+      await waitFor(() => Boolean(getChatOperationDisposition(accepted.source.sourceSeq)), 5_000, 5);
+      await Bun.sleep(25);
+      expect(prompts.some((prompt) => prompt.includes("hidden durable restart prompt"))).toBe(true);
+      expect(getChatOperationDisposition(accepted.source.sourceSeq)?.outcome).toBe("succeeded");
+      expect(getChatOperation(chatJid)).toBeNull();
+      expect(getChatCursor(chatJid)).toBe("2026-01-01T00:00:02.000Z");
+      expect(getDb().prepare("SELECT COUNT(*) AS count FROM messages WHERE chat_jid = ? AND is_bot_message = 1")
+        .get(chatJid)).toEqual({ count: 1 });
     } finally {
       fixture.cleanup();
     }

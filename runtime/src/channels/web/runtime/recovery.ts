@@ -9,6 +9,7 @@ import {
   getActiveChatCompactions,
   getAgentReplyStateAfter,
   getAllChatCursors,
+  getBlockedDurableChatJids,
   getChatCompactionBackoff,
   getDb,
   getDeferredQueuedFollowups,
@@ -16,6 +17,7 @@ import {
   getMessageThreadRootIdById,
   getMessagesSince,
   getPreflightRuns,
+  getResumableDurableChatJids,
   quarantinePendingManualCompactCommands,
   quarantineStalePreflightRun,
   rollbackInflightRun,
@@ -159,6 +161,8 @@ export interface WebRecoveryStore {
   rollbackInflightRun(chatJid: string, prevTs: string): void;
   getAllChatCursors(): Record<string, string>;
   getKnownChatJids(): string[];
+  getResumableDurableChatJids?(): string[];
+  getBlockedDurableChatJids?(): string[];
   getDeferredQueuedFollowups(chatJid: string): DeferredQueuedFollowupRecord[];
   getMessagesSince(chatJid: string, since: string, assistantName: string): unknown[];
 }
@@ -195,6 +199,8 @@ const defaultStore: WebRecoveryStore = {
   rollbackInflightRun,
   getAllChatCursors,
   getKnownChatJids,
+  getResumableDurableChatJids,
+  getBlockedDurableChatJids,
   getDeferredQueuedFollowups,
   getMessagesSince,
 };
@@ -588,11 +594,20 @@ export function resumePendingChats(
 ): void {
   const cursors = store.getAllChatCursors();
   const preflightOwners = new Map((store.getPreflightRuns?.() ?? []).map((owner) => [owner.chatJid, owner]));
+  const resumableDurableJids = new Set(store.getResumableDurableChatJids?.() ?? []);
+  const blockedDurableJids = new Set(store.getBlockedDurableChatJids?.() ?? []);
   const resolvedJids = chatJid && chatJid !== "all"
     ? [chatJid]
-    : Array.from(new Set([...Object.keys(cursors), ...store.getKnownChatJids()]));
+    : Array.from(new Set([...Object.keys(cursors), ...store.getKnownChatJids(), ...resumableDurableJids]));
 
   for (const jid of resolvedJids) {
+    if (blockedDurableJids.has(jid)) {
+      log.info("Pending scan held by blocked durable operation", {
+        operation: "resume_pending_chats.durable_blocked",
+        chatJid: jid,
+      });
+      continue;
+    }
     const owner = preflightOwners.get(jid);
     if (owner) {
       log.info("Pending scan deferred to active preflight owner", {
@@ -608,7 +623,7 @@ export function resumePendingChats(
     const messages = store.getMessagesSince(jid, since, ctx.assistantName);
     const deferred = store.getDeferredQueuedFollowups(jid);
     const hasDeferredQueued = deferred.some((item) => typeof item.queuedContent === "string" && item.queuedContent.trim().length > 0);
-    if (messages.length === 0 && !hasDeferredQueued) continue;
+    if (messages.length === 0 && !hasDeferredQueued && !resumableDurableJids.has(jid)) continue;
     // Use a stable per-chat key so repeated resume_pending triggers (for
     // example, reload IPC plus startup self-queued IPC) collapse to one queued
     // recovery task instead of duplicating the same chat turn.
