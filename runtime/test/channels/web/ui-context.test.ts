@@ -24,6 +24,10 @@ function makeChannel(options: { waitForIdleTimeoutMs?: number; chatStateTtlMs?: 
   return { channel, events, uiBridge };
 }
 
+function directMutationRunner(runtime: AgentSessionRuntime) {
+  return async (_mutation: string, action: (current: AgentSessionRuntime) => unknown) => action(runtime);
+}
+
 function createRuntime(session: any): AgentSessionRuntime {
   return {
     session,
@@ -166,7 +170,7 @@ describe("ui-context", () => {
       return { cancelled: true };
     };
 
-    await bindSessionUiContext(channel as any, runtime, "web:default");
+    await bindSessionUiContext(channel as any, runtime, "web:default", directMutationRunner(runtime) as any);
     expect(boundArgs).toBeDefined();
 
     const actions = boundArgs.commandContextActions;
@@ -224,7 +228,7 @@ describe("ui-context", () => {
       dispose: async () => {},
     } as any;
 
-    await bindSessionUiContext(channel as any, runtime, "web:default");
+    await bindSessionUiContext(channel as any, runtime, "web:default", directMutationRunner(runtime) as any);
 
     expect(events.some((event) => event.type === "extension_ui_error")).toBe(false);
   });
@@ -246,7 +250,7 @@ describe("ui-context", () => {
       reload: async () => {},
     } as any;
 
-    await bindSessionUiContext(channel as any, createRuntime(session), "web:default");
+    await bindSessionUiContext(channel as any, createRuntime(session), "web:default", directMutationRunner(createRuntime(session)) as any);
     await boundArgs.commandContextActions.waitForIdle();
     expect(unsubscribeCalled).toBe(true);
   });
@@ -272,7 +276,7 @@ describe("ui-context", () => {
       reload: async () => {},
     } as any;
 
-    await bindSessionUiContext(channel as any, createRuntime(session), "web:default");
+    await bindSessionUiContext(channel as any, createRuntime(session), "web:default", directMutationRunner(createRuntime(session)) as any);
     const waitForIdle = boundArgs.commandContextActions.waitForIdle();
     session.isStreaming = false;
     listener?.({ type: "message_end" });
@@ -290,7 +294,7 @@ describe("ui-context", () => {
       },
     } as any;
 
-    await bindSessionUiContext(channel as any, createRuntime(session), "whatsapp:123");
+    await bindSessionUiContext(channel as any, createRuntime(session), "whatsapp:123", directMutationRunner(createRuntime(session)) as any);
     expect(bindCalled).toBe(false);
   });
 

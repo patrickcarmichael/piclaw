@@ -9,6 +9,7 @@
 
 import type { AgentSessionRuntime, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 
+import type { BoundSessionMutationRunner } from "../../agent-pool.js";
 import type { WebChannelLike } from "./core/web-channel-contracts.js";
 import { UiBridge, type UiBridgeChannel } from "./theming/ui-bridge.js";
 
@@ -23,9 +24,10 @@ function getBridge(channel: UiContextChannel): UiBridge {
 export async function bindSessionUiContext(
   channel: WebChannelLike | UiContextChannel,
   runtime: AgentSessionRuntime,
-  chatJid: string
+  chatJid: string,
+  mutate: BoundSessionMutationRunner,
 ): Promise<void> {
-  return getBridge(channel).bindSession(runtime, chatJid);
+  return getBridge(channel).bindSession(runtime, chatJid, mutate);
 }
 
 /** Create an ExtensionUIContext backed by the given UiBridge. */

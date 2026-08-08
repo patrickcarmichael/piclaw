@@ -11,6 +11,7 @@
 
 import type { AgentSessionRuntime, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 
+import type { BoundSessionMutationRunner } from "../../../agent-pool.js";
 import { createLogger, debugSuppressedError } from "../../../utils/logger.js";
 import { setServerUiThemeConfig } from "../ui-state.js";
 import { createFallbackTheme } from "./theme.js";
@@ -86,7 +87,11 @@ export class UiBridge {
     private readonly options: UiBridgeOptions = {},
   ) {}
 
-  async bindSession(runtime: AgentSessionRuntime, chatJid: string): Promise<void> {
+  async bindSession(
+    runtime: AgentSessionRuntime,
+    chatJid: string,
+    mutate: BoundSessionMutationRunner,
+  ): Promise<void> {
     if (!chatJid.startsWith("web:")) return;
     this.touchChat(chatJid);
 
@@ -147,14 +152,14 @@ export class UiBridge {
       uiContext,
       commandContextActions: {
         waitForIdle,
-        newSession: async (options) => runtime.newSession(options),
-        fork: async (entryId, options) => runtime.fork(entryId, options),
-        navigateTree: async (targetId, options) => {
-          const result = await runtime.session.navigateTree(targetId, options);
+        newSession: async (options) => mutate("session", () => runtime.newSession(options)),
+        fork: async (entryId, options) => mutate("session_tree", () => runtime.fork(entryId, options)),
+        navigateTree: async (targetId, options) => mutate("session_tree", async (currentRuntime) => {
+          const result = await currentRuntime.session.navigateTree(targetId, options);
           return { cancelled: result.cancelled };
-        },
-        switchSession: async (sessionPath, options) => runtime.switchSession(sessionPath, options),
-        reload: () => runtime.session.reload(),
+        }),
+        switchSession: async (sessionPath, options) => mutate("session", () => runtime.switchSession(sessionPath, options)),
+        reload: () => mutate("session", (currentRuntime) => currentRuntime.session.reload()),
       },
       onError: (error) => {
         const message = typeof error?.error === "string" ? error.error : String(error?.error ?? error);

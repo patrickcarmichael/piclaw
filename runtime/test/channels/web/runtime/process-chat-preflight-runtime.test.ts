@@ -34,7 +34,7 @@ describe("process chat preflight runtime", () => {
       const result = await runProcessChatPreflight({
         channel: {
           agentPool: {
-            getSessionForIntrospection: async () => ({}),
+            runSessionMutation: async (_chatJid: string, _mutation: string, _request: unknown, action: (session: object) => unknown) => action({}),
             emergencyRotateSession: async () => {
               rotations += 1;
               return { status: "success", message: "rotated" };
@@ -78,7 +78,7 @@ describe("process chat preflight runtime", () => {
       let resumes = 0;
       const channel = {
         agentPool: {
-          getSessionForIntrospection: async () => ({}),
+          runSessionMutation: async (_chatJid: string, _mutation: string, _request: unknown, action: (session: object) => unknown) => action({}),
           emergencyRotateSession: async () => ({ status: "success", message: "rotated" }),
         },
       } as any;
@@ -185,7 +185,7 @@ describe("process chat preflight runtime", () => {
       const base = {
         channel: {
           agentPool: {
-            getSessionForIntrospection: async () => ({}),
+            runSessionMutation: async (_chatJid: string, _mutation: string, _request: unknown, action: (session: object) => unknown) => action({}),
             emergencyRotateSession: async () => ({ status: "success", message: "rotated" }),
           },
         } as any,

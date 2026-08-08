@@ -522,7 +522,7 @@ export async function handleAbort(session: AgentSession, _command: AbortCommand)
     }
     const chatJid = getChatJid("control:/abort");
     recordAgentAbortCause(chatJid, "user_command", "agent_control.abort");
-    const abortPromise = Promise.resolve().then(() => session.abort());
+    const abortPromise = session.abort();
     const sshAborted = abortLiveSshCommand(chatJid);
     const killed = killTrackedProcesses();
     const abortState = await waitForAbortToSettle(abortPromise);

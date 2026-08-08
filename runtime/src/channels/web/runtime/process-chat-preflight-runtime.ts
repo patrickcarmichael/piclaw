@@ -79,7 +79,7 @@ export async function runProcessChatPreflight(options: {
     return released;
   };
 
-  if (typeof channel.agentPool.getSessionForIntrospection !== "function") {
+  if (typeof channel.agentPool.runSessionMutation !== "function") {
     const promoted = deps.promoteChatPreflightToInflight(chatJid, options.message.timestamp, owner);
     if (!promoted) {
       log.info("Preflight ownership changed before inflight promotion", withMetadata({
@@ -100,19 +100,13 @@ export async function runProcessChatPreflight(options: {
     return result.status === "success";
   };
 
-  let session;
-  try {
-    session = await channel.agentPool.getSessionForIntrospection(chatJid);
-  } catch (error) {
-    releaseOwner();
-    throw error;
-  }
-
   beginTrackedPhase(chatJid, "preprompt_compaction", { source: "web.process_chat.preflight", messageId: options.message.id });
-  const compactionPromise = deps.maybeAutoCompactSessionBeforePrompt(session, chatJid, {
-    onInfo: (message, details) => log.info(message, withMetadata(details || {}, options.turnId, options.browserObservability)),
-    onWarn: (message, details) => log.warn(message, withMetadata(details || {}, options.turnId, options.browserObservability)),
-  }, options.streamingHandler);
+  const compactionPromise = channel.agentPool.runSessionMutation(chatJid, "compaction", {}, (session) => (
+    deps.maybeAutoCompactSessionBeforePrompt(session, chatJid, {
+      onInfo: (message, details) => log.info(message, withMetadata(details || {}, options.turnId, options.browserObservability)),
+      onWarn: (message, details) => log.warn(message, withMetadata(details || {}, options.turnId, options.browserObservability)),
+    }, options.streamingHandler)
+  ));
 
   try {
     const outcome = await Promise.race([
@@ -210,7 +204,7 @@ export async function runDurableOperationPreflight(options: {
     return promoted.status === "applied" ? promoted.operation : null;
   };
 
-  if (typeof options.channel.agentPool.getSessionForIntrospection !== "function") {
+  if (typeof options.channel.agentPool.runSessionMutation !== "function") {
     const running = promoteRunning();
     return running ? { status: "continue", operation: running } : { status: "deferred" };
   }
@@ -224,7 +218,9 @@ export async function runDurableOperationPreflight(options: {
   const rotateIfNeeded = async (source: "foreground" | "background"): Promise<boolean> => {
     const detail = options.compactionState.lastCompactionErrorMessage?.trim();
     if (!detail || isCompactionCancellationError(detail)) return false;
-    const result = await options.channel.agentPool.emergencyRotateSession(options.chatJid, detail);
+    const result = await options.channel.agentPool.emergencyRotateSession(options.chatJid, detail, {
+      operationOwner: operationOwner(operation),
+    });
     log[result.status === "success" ? "info" : "warn"]("Emergency rotation after durable pre-prompt compaction", withMetadata({
       operation: result.status === "success"
         ? "process_chat.operation_preflight_emergency_rotate_success"
@@ -236,22 +232,19 @@ export async function runDurableOperationPreflight(options: {
     return result.status === "success";
   };
 
-  let session;
-  try {
-    session = await options.channel.agentPool.getSessionForIntrospection(options.chatJid);
-  } catch (error) {
-    block();
-    throw error;
-  }
-
   beginTrackedPhase(options.chatJid, "preprompt_compaction", {
     source: "web.process_chat.durable_operation_preflight",
     messageId: options.message.id,
   });
-  const compactionPromise = deps.maybeAutoCompactSessionBeforePrompt(session, options.chatJid, {
-    onInfo: (message, details) => log.info(message, withMetadata(details || {}, options.turnId, options.browserObservability)),
-    onWarn: (message, details) => log.warn(message, withMetadata(details || {}, options.turnId, options.browserObservability)),
-  }, options.streamingHandler);
+  const compactionPromise = options.channel.agentPool.runSessionMutation(
+    options.chatJid,
+    "compaction",
+    { operationOwner: operationOwner(operation) },
+    (session) => deps.maybeAutoCompactSessionBeforePrompt(session, options.chatJid, {
+      onInfo: (message, details) => log.info(message, withMetadata(details || {}, options.turnId, options.browserObservability)),
+      onWarn: (message, details) => log.warn(message, withMetadata(details || {}, options.turnId, options.browserObservability)),
+    }, options.streamingHandler),
+  );
 
   try {
     const outcome = await Promise.race([

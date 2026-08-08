@@ -86,6 +86,13 @@ import { applyLiveSshConfig, clearLiveSshConfig, hasLiveChatSshConnection, hasLi
 import { getKeychainEntry } from "./secure/keychain.js";
 import { addLogSink, createLogger, debugSuppressedError, removeLogSink } from "./utils/logger.js";
 import { startAgentLogCleanup } from "./agent-pool/logging.js";
+import {
+  SessionMutationGateway,
+  SessionMutationRejectedError,
+  sessionMutationAccess,
+  type SessionMutationClass,
+  type SessionMutationRequest,
+} from "./agent-pool/session-mutation-gateway.js";
 
 const log = createLogger("agent-pool");
 
@@ -97,6 +104,12 @@ export type {
   SidePromptResult,
   TurnOutput,
 } from "./agent-pool/contracts.js";
+export type { SessionMutationClass, SessionMutationRequest } from "./agent-pool/session-mutation-gateway.js";
+
+export type BoundSessionMutationRunner = <T>(
+  mutation: Exclude<SessionMutationClass, "abort">,
+  action: (runtime: AgentSessionRuntime) => Promise<T> | T,
+) => Promise<T>;
 
 export interface AgentPoolRecoveryInstrumentationSnapshot {
   attemptsTotal: number;
@@ -216,6 +229,7 @@ export class AgentPool {
   private runtimeFacade: AgentPoolServices["runtimeFacade"];
   private sideStreamSimple?: NonNullable<AgentPoolOptions["sideStreamSimple"]>;
   private readonly config = getSessionPoolConfig();
+  private readonly mutationGateway = new SessionMutationGateway();
 
   constructor(options: AgentPoolOptions) {
     this.createSession = options.createSession;
@@ -319,12 +333,24 @@ export class AgentPool {
     };
   }
 
-  setSessionBinder(binder?: (runtime: AgentSessionRuntime, chatJid: string) => Promise<void> | void): void {
-    this.sessionBinder.setBinder(binder);
+  setSessionBinder(
+    binder?: (runtime: AgentSessionRuntime, chatJid: string, mutate: BoundSessionMutationRunner) => Promise<void> | void,
+  ): void {
+    this.sessionBinder.setBinder(binder
+      ? (runtime, chatJid) => binder(runtime, chatJid, (mutation, action) => (
+          this.runSessionMutation(chatJid, mutation, {}, (_session, currentRuntime) => action(currentRuntime))
+        ))
+      : undefined);
   }
 
   /** Run a prompt against the persistent session for `chatJid`. */
   async runAgent(prompt: string, chatJid: string, options: RunAgentOptions = {}): Promise<AgentOutput> {
+    return this.mutationGateway.run(chatJid, "prompt", sessionMutationAccess(options), () => (
+      this.runAgentOwned(prompt, chatJid, options)
+    ));
+  }
+
+  private async runAgentOwned(prompt: string, chatJid: string, options: RunAgentOptions): Promise<AgentOutput> {
     // Acquire before session lookup: the cleanup timer can run after getOrCreate
     // returns but before AgentSession flips isStreaming at prompt start.
     const releaseEvictionProtection = this.sessionManager.acquireEvictionProtection(chatJid);
@@ -366,7 +392,32 @@ export class AgentPool {
     }
   }
 
-  async applyControlCommand(chatJid: string, command: AgentControlCommand): Promise<AgentControlResult> {
+  async applyControlCommand(
+    chatJid: string,
+    command: AgentControlCommand,
+    request: SessionMutationRequest = {},
+  ): Promise<AgentControlResult> {
+    const access = sessionMutationAccess(request);
+    try {
+      if (command.type === "abort") {
+        return await this.mutationGateway.compareAndActAbort(chatJid, access, () => {
+          const runtime = this.pool.get(chatJid)?.runtime;
+          if (!runtime) return { status: "error", message: "No active session to abort." };
+          return this.runtimeFacade.applyControlCommandToRuntime(chatJid, runtime, command);
+        });
+      }
+      return await this.mutationGateway.run(chatJid, "control", access, () => (
+        this.applyControlCommandOwned(chatJid, command)
+      ));
+    } catch (error) {
+      if (error instanceof SessionMutationRejectedError) {
+        return { status: "error", message: error.message };
+      }
+      throw error;
+    }
+  }
+
+  private async applyControlCommandOwned(chatJid: string, command: AgentControlCommand): Promise<AgentControlResult> {
     if (command.type === "rollup") {
       try {
         const result = await this.mergeChatBranchIntoParent(chatJid);
@@ -514,14 +565,50 @@ export class AgentPool {
    * Navigates back to the saved leaf, leaving the task's output in a side branch.
    */
   async restoreSessionPosition(chatJid: string, leafId: string | null): Promise<void> {
-    return this.runtimeFacade.restoreSessionPosition(chatJid, leafId);
+    return this.mutationGateway.runInheritedOrLegacy(chatJid, "session_tree", () => (
+      this.runtimeFacade.restoreSessionPosition(chatJid, leafId)
+    ));
   }
 
   async disposeChatSession(chatJid: string): Promise<void> {
-    await this.sessionManager.recreate(chatJid);
+    await this.mutationGateway.runInheritedOrLegacy(chatJid, "lifecycle", () => (
+      this.sessionManager.recreate(chatJid)
+    ));
   }
 
-  async emergencyRotateSession(chatJid: string, emergencyReason: string): Promise<SessionRotationResult> {
+  async runSessionMutation<T>(
+    chatJid: string,
+    mutation: Exclude<SessionMutationClass, "abort">,
+    request: SessionMutationRequest,
+    action: (session: AgentSession, runtime: AgentSessionRuntime) => Promise<T> | T,
+  ): Promise<T> {
+    const access = request.operationOwner
+      ? sessionMutationAccess(request)
+      : this.mutationGateway.currentAccess(chatJid) ?? sessionMutationAccess(request);
+    return this.mutationGateway.run(chatJid, mutation, access, async () => {
+      const runtime = await this.getOrCreateRuntime(chatJid);
+      return await action(runtime.session, runtime);
+    });
+  }
+
+  async emergencyRotateSession(
+    chatJid: string,
+    emergencyReason: string,
+    request: SessionMutationRequest = {},
+  ): Promise<SessionRotationResult> {
+    try {
+      return await this.mutationGateway.run(chatJid, "rotation", sessionMutationAccess(request), () => (
+        this.emergencyRotateSessionOwned(chatJid, emergencyReason)
+      ));
+    } catch (error) {
+      if (error instanceof SessionMutationRejectedError) {
+        return { status: "error", reason: "automatic", compacted: false, message: error.message };
+      }
+      throw error;
+    }
+  }
+
+  private async emergencyRotateSessionOwned(chatJid: string, emergencyReason: string): Promise<SessionRotationResult> {
     const runtime = await this.getOrCreateRuntime(chatJid);
     const result = await rotateSession(runtime.session, runtime, {
       reason: "automatic",
@@ -576,35 +663,47 @@ export class AgentPool {
     chatJid: string,
     options: { agentName?: string | null } = {},
   ): Promise<ChatBranchRecord> {
-    return this.branchManager.renameChatBranch(chatJid, options);
+    return this.mutationGateway.runInheritedOrLegacy(chatJid, "lifecycle", () => (
+      this.branchManager.renameChatBranch(chatJid, options)
+    ));
   }
 
   async pruneChatBranch(chatJid: string): Promise<ChatBranchRecord> {
-    return this.branchManager.pruneChatBranch(chatJid);
+    return this.mutationGateway.runInheritedOrLegacy(chatJid, "lifecycle", () => (
+      this.branchManager.pruneChatBranch(chatJid)
+    ));
   }
 
   async mergeChatBranchIntoParent(chatJid: string): Promise<MergeChatBranchIntoParentResult> {
-    return this.branchManager.mergeChatBranchIntoParent(chatJid);
+    return this.mutationGateway.runInheritedOrLegacy(chatJid, "lifecycle", () => (
+      this.branchManager.mergeChatBranchIntoParent(chatJid)
+    ));
   }
 
   async renameChatJid(
     oldJid: string,
     newJid: string,
   ): Promise<{ oldJid: string; newJid: string; branch: ChatBranchRecord }> {
-    return this.branchManager.renameChatJid(oldJid, newJid);
+    return this.mutationGateway.runInheritedOrLegacy(oldJid, "lifecycle", () => (
+      this.branchManager.renameChatJid(oldJid, newJid)
+    ));
   }
 
   async restoreChatBranch(
     chatJid: string,
     options: { agentName?: string | null } = {},
   ): Promise<ChatBranchRecord> {
-    return this.branchManager.restoreChatBranch(chatJid, options);
+    return this.mutationGateway.runInheritedOrLegacy(chatJid, "lifecycle", () => (
+      this.branchManager.restoreChatBranch(chatJid, options)
+    ));
   }
 
   async permanentPurgeChatBranch(
     chatJid: string,
   ): Promise<{ branch: ChatBranchRecord; removedSessionArtifacts: string[] }> {
-    return this.branchManager.permanentPurgeChatBranch(chatJid);
+    return this.mutationGateway.runInheritedOrLegacy(chatJid, "lifecycle", () => (
+      this.branchManager.permanentPurgeChatBranch(chatJid)
+    ));
   }
 
   async createForkedChatBranch(
@@ -660,19 +759,49 @@ export class AgentPool {
   async queueStreamingMessage(
     chatJid: string,
     text: string,
-    behavior: "steer" | "followUp"
+    behavior: "steer" | "followUp",
+    request: SessionMutationRequest = {},
   ): Promise<{ queued: boolean; error?: string }> {
-    return this.runtimeFacade.queueStreamingMessage(chatJid, text, behavior);
+    try {
+      return await this.mutationGateway.run(chatJid, "queue", sessionMutationAccess(request), () => (
+        this.runtimeFacade.queueStreamingMessage(chatJid, text, behavior)
+      ));
+    } catch (error) {
+      if (error instanceof SessionMutationRejectedError) return { queued: false, error: error.message };
+      throw error;
+    }
   }
 
   /** Remove one queued follow-up message (first content match) from an active session queue. */
-  async removeQueuedFollowupMessage(chatJid: string, queuedContent?: string): Promise<boolean> {
-    return this.runtimeFacade.removeQueuedFollowupMessage(chatJid, queuedContent);
+  async removeQueuedFollowupMessage(
+    chatJid: string,
+    queuedContent?: string,
+    request: SessionMutationRequest = {},
+  ): Promise<boolean> {
+    try {
+      return await this.mutationGateway.run(chatJid, "queue", sessionMutationAccess(request), () => (
+        this.runtimeFacade.removeQueuedFollowupMessage(chatJid, queuedContent)
+      ));
+    } catch (error) {
+      if (error instanceof SessionMutationRejectedError) return false;
+      throw error;
+    }
   }
 
   /** Execute a raw slash command in the AgentSession (extension commands). */
-  async applySlashCommand(chatJid: string, rawText: string): Promise<AgentControlResult> {
-    return this.runtimeFacade.applySlashCommand(chatJid, rawText);
+  async applySlashCommand(
+    chatJid: string,
+    rawText: string,
+    request: SessionMutationRequest = {},
+  ): Promise<AgentControlResult> {
+    try {
+      return await this.mutationGateway.run(chatJid, "control", sessionMutationAccess(request), () => (
+        this.runtimeFacade.applySlashCommand(chatJid, rawText)
+      ));
+    } catch (error) {
+      if (error instanceof SessionMutationRejectedError) return { status: "error", message: error.message };
+      throw error;
+    }
   }
 
   getSshConfig(chatJid: string): SshConfig | null {
@@ -710,9 +839,9 @@ export class AgentPool {
     await this.sessionManager.shutdown();
   }
 
-  /** Return an existing session for read-only introspection, or create one if needed. */
+  /** Return a session for read-only introspection; cold hydration is legacy-fenced. */
   async getSessionForIntrospection(chatJid: string): Promise<AgentSession> {
-    return this.getOrCreate(chatJid);
+    return this.mutationGateway.runInheritedOrLegacy(chatJid, "lifecycle", () => this.getOrCreate(chatJid));
   }
 
   // ── internal ────────────────────────────────────────────

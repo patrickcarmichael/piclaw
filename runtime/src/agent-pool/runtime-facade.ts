@@ -624,6 +624,14 @@ export class AgentRuntimeFacade {
 
   async applyControlCommand(chatJid: string, command: AgentControlCommand): Promise<AgentControlResult> {
     const runtime = await this.options.getOrCreateRuntime(chatJid);
+    return this.applyControlCommandToRuntime(chatJid, runtime, command);
+  }
+
+  async applyControlCommandToRuntime(
+    chatJid: string,
+    runtime: AgentSessionRuntime,
+    command: AgentControlCommand,
+  ): Promise<AgentControlResult> {
     const session = runtime.session;
     const channel = detectChannel(chatJid);
     const apply = this.options.applyControlCommandFn ?? applyControlCommand;

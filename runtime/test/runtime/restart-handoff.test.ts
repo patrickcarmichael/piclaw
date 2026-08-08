@@ -241,7 +241,7 @@ describe("restart handoff recovery", () => {
     const processCalls: string[] = [];
     const preflightChannel = {
       agentPool: {
-        getSessionForIntrospection: async () => ({}),
+        runSessionMutation: async (_chatJid: string, _mutation: string, _request: unknown, action: (session: object) => unknown) => action({}),
         emergencyRotateSession: async () => ({ status: "success", message: "rotated" }),
       },
     } as any;

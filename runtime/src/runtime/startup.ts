@@ -20,7 +20,7 @@ import {
   getToolOutputConfig,
   getProgressWatchdogSafetyWarning,
 } from "../core/config.js";
-import { getChatBranchByAgentName, getChatBranchByChatJid, getChatCursor, getDb, getFailedRun, initDatabase } from "../db.js";
+import { getChatBranchByAgentName, getChatBranchByChatJid, getChatCursor, getChatOperation, getDb, getFailedRun, initDatabase } from "../db.js";
 import type { AgentQueue } from "../queue.js";
 import { startToolOutputCleanup } from "../tool-output.js";
 import { createUuid } from "../utils/ids.js";
@@ -392,6 +392,18 @@ function resolveSessionControlTarget(agentPool: AgentPool, request: SessionContr
   return { chatJid: found.chat_jid, agentName: found.agent_name || agentName, sessionTree: buildSessionControlTreeDescriptor(known) };
 }
 
+function currentOperationMutationRequest(chatJid: string) {
+  const operation = getChatOperation(chatJid);
+  return operation
+    ? { operationOwner: {
+        operationId: operation.operationId,
+        sourceSeq: operation.sourceSeq,
+        phase: operation.phase,
+        generation: operation.generation,
+      } }
+    : {};
+}
+
 function registerSessionControlHandler(agentPool: AgentPool, web: WebChannel): void {
   setSessionControlHandler(async (request): Promise<SessionControlResult> => {
     if (getSessionIsolationLevel() === "full") throw new Error("Session isolation is full; session_control is disabled.");
@@ -420,7 +432,11 @@ function registerSessionControlHandler(agentPool: AgentPool, web: WebChannel): v
       message = result.message || `Compaction ${result.status}.`;
       extra = { control_status: result.status };
     } else if (request.action === "abort") {
-      const result = await agentPool.applyControlCommand(target.chatJid, { type: "abort", raw: "/abort" });
+      const result = await agentPool.applyControlCommand(
+        target.chatJid,
+        { type: "abort", raw: "/abort" },
+        currentOperationMutationRequest(target.chatJid),
+      );
       message = result.message || `Abort ${result.status}.`;
       extra = { control_status: result.status };
     } else if (request.action === "switch_model") {
@@ -475,7 +491,11 @@ function registerSessionControlHandler(agentPool: AgentPool, web: WebChannel): v
         steps.push({ action: "wake", resumed: true });
         message = "Failed run marked for retry and chat resumed.";
       } else if (before.streaming || before.compacting || before.active || (Array.isArray(before.active_tools) && before.active_tools.length > 0)) {
-        const result = await agentPool.applyControlCommand(target.chatJid, { type: "abort", raw: "/abort" });
+        const result = await agentPool.applyControlCommand(
+          target.chatJid,
+          { type: "abort", raw: "/abort" },
+          currentOperationMutationRequest(target.chatJid),
+        );
         steps.push({ action: "abort", status: result.status });
         web.resumeChat(target.chatJid);
         steps.push({ action: "wake", resumed: true });

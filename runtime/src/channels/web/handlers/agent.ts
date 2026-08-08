@@ -906,7 +906,10 @@ export async function handleAgentMessage(
   }
 
   if (command?.type === "abort" && !hasAttachments) {
-    const result = await channel.agentPool.applyControlCommand(chatJid, command);
+    const activeOperation = getChatOperation(chatJid);
+    const result = await channel.agentPool.applyControlCommand(chatJid, command, activeOperation
+      ? { operationOwner: durableOperationOwner(activeOperation) }
+      : {});
     return channel.json(
       {
         thread_id: null,
@@ -1875,6 +1878,7 @@ export async function processChat(
   };
 
   const output = await channel.agentPool.runAgent(prompt, chatJid, {
+    ...(durableOperation ? { operationOwner: durableOperationOwner(durableOperation) } : {}),
     timeoutMs,
     turnId,
     ...(browserObservability?.userId ? { userId: browserObservability.userId } : {}),
