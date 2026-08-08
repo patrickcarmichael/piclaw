@@ -4,13 +4,77 @@ import { relative, resolve } from "node:path";
 import * as ts from "typescript";
 
 const sourceRoot = resolve(import.meta.dir, "../../src");
-const directMethodNames = new Set([
-  "prompt", "compact", "abortCompaction", "setModel", "setThinkingLevel", "newSession",
-  "switchSession", "fork", "navigateTree", "reload", "setSessionName",
-  "setAutoCompactionEnabled", "setAutoRetryEnabled", "abortRetry", "clearQueue", "bindExtensions",
-]);
+const upstreamCoreRoot = resolve(
+  sourceRoot,
+  "../../node_modules/@earendil-works/pi-coding-agent/dist/core",
+);
+
+type UpstreamMethodClass = "read_only" | "observer" | "external_export" | "persistent_mutation" | "runtime_mutation";
+
+const upstreamMethodClass: Record<string, UpstreamMethodClass> = {
+  "AgentSession.abort": "runtime_mutation",
+  "AgentSession.abortBash": "runtime_mutation",
+  "AgentSession.abortBranchSummary": "runtime_mutation",
+  "AgentSession.abortCompaction": "runtime_mutation",
+  "AgentSession.abortRetry": "runtime_mutation",
+  "AgentSession.bindExtensions": "runtime_mutation",
+  "AgentSession.clearQueue": "runtime_mutation",
+  "AgentSession.compact": "persistent_mutation",
+  "AgentSession.createReplacedSessionContext": "read_only",
+  "AgentSession.cycleModel": "persistent_mutation",
+  "AgentSession.cycleThinkingLevel": "persistent_mutation",
+  "AgentSession.dispose": "runtime_mutation",
+  "AgentSession.executeBash": "persistent_mutation",
+  "AgentSession.exportToHtml": "external_export",
+  "AgentSession.exportToJsonl": "external_export",
+  "AgentSession.followUp": "runtime_mutation",
+  "AgentSession.getActiveToolNames": "read_only",
+  "AgentSession.getAllTools": "read_only",
+  "AgentSession.getAvailableThinkingLevels": "read_only",
+  "AgentSession.getContextUsage": "read_only",
+  "AgentSession.getFollowUpMessages": "read_only",
+  "AgentSession.getLastAssistantText": "read_only",
+  "AgentSession.getSessionStats": "read_only",
+  "AgentSession.getSteeringMessages": "read_only",
+  "AgentSession.getToolDefinition": "read_only",
+  "AgentSession.getUserMessagesForForking": "read_only",
+  "AgentSession.hasExtensionHandlers": "read_only",
+  "AgentSession.navigateTree": "persistent_mutation",
+  "AgentSession.prompt": "persistent_mutation",
+  "AgentSession.recordBashResult": "persistent_mutation",
+  "AgentSession.reload": "runtime_mutation",
+  "AgentSession.sendCustomMessage": "persistent_mutation",
+  "AgentSession.sendUserMessage": "persistent_mutation",
+  "AgentSession.setActiveToolsByName": "runtime_mutation",
+  "AgentSession.setAutoCompactionEnabled": "persistent_mutation",
+  "AgentSession.setAutoRetryEnabled": "persistent_mutation",
+  "AgentSession.setFollowUpMode": "persistent_mutation",
+  "AgentSession.setModel": "persistent_mutation",
+  "AgentSession.setScopedModels": "runtime_mutation",
+  "AgentSession.setSessionName": "persistent_mutation",
+  "AgentSession.setSteeringMode": "persistent_mutation",
+  "AgentSession.setThinkingLevel": "persistent_mutation",
+  "AgentSession.steer": "runtime_mutation",
+  "AgentSession.subscribe": "observer",
+  "AgentSession.supportsThinking": "read_only",
+  "AgentSession.waitForIdle": "observer",
+  "AgentSessionRuntime.dispose": "runtime_mutation",
+  "AgentSessionRuntime.fork": "persistent_mutation",
+  "AgentSessionRuntime.importFromJsonl": "persistent_mutation",
+  "AgentSessionRuntime.newSession": "persistent_mutation",
+  "AgentSessionRuntime.setBeforeSessionInvalidate": "runtime_mutation",
+  "AgentSessionRuntime.setRebindSession": "runtime_mutation",
+  "AgentSessionRuntime.switchSession": "persistent_mutation",
+};
+
+const directMethodNames = new Set(
+  Object.entries(upstreamMethodClass)
+    .filter(([, classification]) => classification === "persistent_mutation" || classification === "runtime_mutation")
+    .map(([key]) => key.slice(key.indexOf(".") + 1))
+    .filter((method) => method !== "abort" && method !== "dispose"),
+);
 const directFunctionNames = new Set(["rotateSession", "maybeAutoCompactSessionBeforePrompt"]);
-const gatewayMethodNames = new Set([
+const expectedGatewayMethodNames = new Set([
   "runAgent", "applyControlCommand", "emergencyRotateSession", "runSessionMutation",
   "restoreSessionPosition", "disposeChatSession", "getSessionForIntrospection", "renameChatBranch",
   "pruneChatBranch", "mergeChatBranchIntoParent", "renameChatJid", "restoreChatBranch",
@@ -32,6 +96,48 @@ function sortInventory(inventory: Inventory): Inventory {
     ]),
   );
 }
+
+function sourceFile(path: string): ts.SourceFile {
+  return ts.createSourceFile(path, readFileSync(path, "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+}
+
+function collectUpstreamPublicMethods(fileName: string, className: string): string[] {
+  const methods: string[] = [];
+  sourceFile(resolve(upstreamCoreRoot, fileName)).forEachChild((node) => {
+    if (!ts.isClassDeclaration(node) || node.name?.text !== className) return;
+    for (const member of node.members) {
+      if (!ts.isMethodDeclaration(member) || !member.name || !ts.isIdentifier(member.name)) continue;
+      if (member.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.PrivateKeyword)) continue;
+      methods.push(`${className}.${member.name.text}`);
+    }
+  });
+  return methods.sort();
+}
+
+function collectAgentPoolGatewayMethods(): Set<string> {
+  const methods = new Set<string>();
+  const agentPool = sourceFile(resolve(sourceRoot, "agent-pool.ts"));
+  agentPool.forEachChild((node) => {
+    if (!ts.isClassDeclaration(node) || node.name?.text !== "AgentPool") return;
+    for (const member of node.members) {
+      if (!ts.isMethodDeclaration(member) || !member.body || !member.name || !ts.isIdentifier(member.name)) continue;
+      if (member.modifiers?.some((modifier) => (
+        modifier.kind === ts.SyntaxKind.PrivateKeyword || modifier.kind === ts.SyntaxKind.ProtectedKeyword
+      ))) continue;
+      let invokesGateway = false;
+      const visit = (child: ts.Node): void => {
+        if (ts.isPropertyAccessExpression(child)
+          && child.expression.getText(agentPool) === "this.mutationGateway") invokesGateway = true;
+        ts.forEachChild(child, visit);
+      };
+      visit(member.body);
+      if (invokesGateway) methods.add(member.name.text);
+    }
+  });
+  return methods;
+}
+
+const gatewayMethodNames = collectAgentPoolGatewayMethods();
 
 function collectInventory(): { direct: Inventory; callers: Inventory } {
   const direct: Inventory = {};
@@ -65,6 +171,7 @@ const directOwnershipClass: Record<string, string> = {
   "agent-control/agent-control-helpers.ts": "control-or-recovery-beneath-gateway",
   "agent-control/handlers/control.ts": "legacy-control-beneath-gateway",
   "agent-control/handlers/model.ts": "legacy-control-beneath-gateway",
+  "agent-control/handlers/operations.ts": "legacy-control-beneath-gateway",
   "agent-control/handlers/queue.ts": "legacy-control-beneath-gateway",
   "agent-control/handlers/session.ts": "legacy-control-beneath-gateway",
   "agent-control/handlers/tree.ts": "legacy-control-beneath-gateway",
@@ -72,6 +179,7 @@ const directOwnershipClass: Record<string, string> = {
   "agent-pool/branch-manager.ts": "legacy-lifecycle-beneath-gateway",
   "agent-pool/compaction.ts": "operation-or-legacy-beneath-gateway",
   "agent-pool/context-pressure-retry.ts": "operation-or-legacy-beneath-gateway",
+  "agent-pool/run-agent-attempt-budget.ts": "operation-owned-beneath-gateway",
   "agent-pool/run-agent-attempt-context.ts": "operation-owned-beneath-gateway",
   "agent-pool/run-agent-orchestrator.ts": "operation-or-legacy-beneath-gateway",
   "agent-pool/run-agent-recovery-phase.ts": "operation-or-legacy-beneath-gateway",
@@ -88,20 +196,22 @@ const directOwnershipClass: Record<string, string> = {
 
 const expectedDirect: Inventory = {
   "agent-control/agent-control-helpers.ts": { compact: 1, prompt: 1, setThinkingLevel: 1 },
-  "agent-control/handlers/control.ts": { abort: 3, abortCompaction: 1, abortRetry: 1, compact: 1, reload: 1, setAutoCompactionEnabled: 1, setAutoRetryEnabled: 1 },
-  "agent-control/handlers/model.ts": { compact: 1, setModel: 2 },
-  "agent-control/handlers/queue.ts": { prompt: 1 },
+  "agent-control/handlers/control.ts": { abort: 3, abortBash: 1, abortCompaction: 1, abortRetry: 1, compact: 1, reload: 1, setAutoCompactionEnabled: 1, setAutoRetryEnabled: 1 },
+  "agent-control/handlers/model.ts": { compact: 1, cycleModel: 1, cycleThinkingLevel: 1, setModel: 2 },
+  "agent-control/handlers/operations.ts": { executeBash: 1 },
+  "agent-control/handlers/queue.ts": { prompt: 1, setFollowUpMode: 2, setSteeringMode: 1 },
   "agent-control/handlers/session.ts": { fork: 2, newSession: 1, rotateSession: 1, setSessionName: 2, switchSession: 2 },
   "agent-control/handlers/tree.ts": { navigateTree: 1 },
   "agent-pool.ts": { rotateSession: 1 },
   "agent-pool/branch-manager.ts": { dispose: 10, setSessionName: 1 },
   "agent-pool/compaction.ts": { abort: 1, abortCompaction: 1, compact: 1 },
   "agent-pool/context-pressure-retry.ts": { compact: 1, prompt: 1 },
+  "agent-pool/run-agent-attempt-budget.ts": { setActiveToolsByName: 3 },
   "agent-pool/run-agent-attempt-context.ts": { abort: 2 },
-  "agent-pool/run-agent-orchestrator.ts": { abort: 3, maybeAutoCompactSessionBeforePrompt: 1, prompt: 1, rotateSession: 4 },
+  "agent-pool/run-agent-orchestrator.ts": { abort: 3, maybeAutoCompactSessionBeforePrompt: 1, prompt: 1, rotateSession: 4, setActiveToolsByName: 1 },
   "agent-pool/run-agent-recovery-phase.ts": { compact: 1 },
   "agent-pool/runtime-facade.ts": { clearQueue: 2, navigateTree: 1, prompt: 2 },
-  "agent-pool/session-manager.ts": { dispose: 1, newSession: 2, setModel: 1, setSessionName: 1, setThinkingLevel: 2, switchSession: 1 },
+  "agent-pool/session-manager.ts": { dispose: 1, newSession: 2, setActiveToolsByName: 1, setModel: 1, setSessionName: 1, setThinkingLevel: 2, switchSession: 1 },
   "agent-pool/session.ts": { reload: 1, setAutoCompactionEnabled: 1 },
   "agent-pool/side-prompt-runner.ts": { abort: 2, prompt: 1 },
   "agent-pool/slash-command.ts": { abort: 1 },
@@ -131,6 +241,18 @@ const expectedCallers: Inventory = {
 const mutationInventory = collectInventory();
 
 describe("persistent session mutation drift", () => {
+  test("classifies every upstream public session method", () => {
+    const declared = [
+      ...collectUpstreamPublicMethods("agent-session.d.ts", "AgentSession"),
+      ...collectUpstreamPublicMethods("agent-session-runtime.d.ts", "AgentSessionRuntime"),
+    ].sort();
+    expect(Object.keys(upstreamMethodClass).sort()).toEqual(declared);
+  });
+
+  test("derives every public AgentPool entry that invokes the mutation gateway", () => {
+    expect([...gatewayMethodNames].sort()).toEqual([...expectedGatewayMethodNames].sort());
+  });
+
   test("snapshots every direct runtime mutator and assigns one ownership class", () => {
     expect(mutationInventory.direct).toEqual(expectedDirect);
     expect(Object.keys(directOwnershipClass).sort()).toEqual(Object.keys(mutationInventory.direct).sort());

@@ -89,17 +89,30 @@ describe("SessionMutationGateway", () => {
     expect(staleEffect).toBe(false);
   });
 
-  test("inherits the exact owner for nested extension and recovery mutations", async () => {
+  test("inherits the exact owner for nested in-run recovery", async () => {
     const active = operation();
     const gateway = new SessionMutationGateway({ getOperation: () => active });
     const effects: string[] = [];
 
     await gateway.run("web:test", "prompt", { scope: "operation", owner: owner(active) }, async () => {
       effects.push("prompt");
-      await gateway.runInheritedOrLegacy("web:test", "session_tree", () => { effects.push("nested"); });
+      await gateway.runInheritedOrLegacy("web:test", "recovery", () => { effects.push("recovery"); });
     });
 
-    expect(effects).toEqual(["prompt", "nested"]);
+    expect(effects).toEqual(["prompt", "recovery"]);
+  });
+
+  test("keeps legacy-only mutation classes closed to operation owners", async () => {
+    const active = operation();
+    const gateway = new SessionMutationGateway({ getOperation: () => active });
+    let effects = 0;
+
+    for (const mutation of ["control", "model", "thinking", "session", "session_tree", "queue", "lifecycle"] as const) {
+      await expect(gateway.run("web:test", mutation, { scope: "operation", owner: owner(active) }, () => {
+        effects += 1;
+      })).rejects.toMatchObject({ reason: "operation_mutation_forbidden" });
+    }
+    expect(effects).toBe(0);
   });
 
   test("does not let a newly claimed operation abort an earlier legacy lane occupant", async () => {
@@ -121,6 +134,28 @@ describe("SessionMutationGateway", () => {
 
     release.resolve();
     await legacy;
+  });
+
+  test("rejects an operation abort when no matching lane occupant exists", async () => {
+    const active = operation();
+    const gateway = new SessionMutationGateway({ getOperation: () => active });
+    let aborted = false;
+
+    await expect(gateway.compareAndActAbort("web:test", {
+      scope: "operation",
+      owner: owner(active),
+    }, () => { aborted = true; })).rejects.toMatchObject({ reason: "active_mutation_mismatch" });
+    expect(aborted).toBe(false);
+  });
+
+  test("rejects a legacy abort when no legacy lane occupant exists", async () => {
+    const gateway = new SessionMutationGateway({ getOperation: () => null });
+    let aborted = false;
+
+    await expect(gateway.compareAndActAbort("web:test", { scope: "legacy" }, () => {
+      aborted = true;
+    })).rejects.toMatchObject({ reason: "active_mutation_mismatch" });
+    expect(aborted).toBe(false);
   });
 
   test("allows only exact compare-and-act abort to bypass an occupied lane", async () => {

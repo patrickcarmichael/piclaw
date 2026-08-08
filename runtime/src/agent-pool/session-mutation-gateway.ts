@@ -42,7 +42,10 @@ export interface SessionMutationRequest {
   operationOwner?: ChatOperationOwner;
 }
 
-export type SessionMutationRejectionReason = ChatOperationMismatch | "legacy_conflict" | "active_mutation_mismatch";
+export type SessionMutationRejectionReason = ChatOperationMismatch
+  | "legacy_conflict"
+  | "operation_mutation_forbidden"
+  | "active_mutation_mismatch";
 
 export class SessionMutationRejectedError extends Error {
   readonly name = "SessionMutationRejectedError";
@@ -70,6 +73,14 @@ export function sessionMutationAccess(request: SessionMutationRequest = {}): Ses
     ? { scope: "operation", owner: request.operationOwner }
     : { scope: "legacy" };
 }
+
+const OPERATION_MUTATION_CLASSES = new Set<SessionMutationClass>([
+  "prompt",
+  "compaction",
+  "rotation",
+  "recovery",
+  "abort",
+]);
 
 function sameOwner(left: ChatOperationOwner, right: ChatOperationOwner): boolean {
   return left.operationId === right.operationId
@@ -153,7 +164,7 @@ export class SessionMutationGateway {
   ): Promise<T> {
     this.assertAccess(chatJid, "abort", access);
     const activeAccess = this.activeAccessByChat.get(chatJid);
-    if (activeAccess && !this.isSameAccess(activeAccess, access)) {
+    if (!activeAccess || !this.isSameAccess(activeAccess, access)) {
       throw new SessionMutationRejectedError(chatJid, "abort", "active_mutation_mismatch");
     }
     return await this.context.run({ chatJid, access }, action);
@@ -173,6 +184,9 @@ export class SessionMutationGateway {
     if (access.scope === "legacy") {
       if (active) throw new SessionMutationRejectedError(chatJid, mutation, "legacy_conflict");
       return;
+    }
+    if (!OPERATION_MUTATION_CLASSES.has(mutation)) {
+      throw new SessionMutationRejectedError(chatJid, mutation, "operation_mutation_forbidden");
     }
     const comparison = compareChatOperationOwner(active, access.owner);
     if (!comparison.ok) throw new SessionMutationRejectedError(chatJid, mutation, comparison.reason);
