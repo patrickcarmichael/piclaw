@@ -157,6 +157,7 @@ export {
   registerChatOperationIntent,
   getAcceptedChatSource,
   getChatOperation,
+  peekNextAcceptedChatSource,
   claimNextChatOperation,
   promoteChatOperation,
   waitChatOperation,

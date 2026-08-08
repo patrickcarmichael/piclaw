@@ -19,6 +19,7 @@ import { beginTrackedPhase, endTrackedPhase, heartbeatTrackedPhase } from "../..
 import { createLogger } from "../../../utils/logger.js";
 
 const log = createLogger("web.runtime.process-chat-preflight");
+const durablePreflightAttempts = new Set<string>();
 
 function withMetadata(details: Record<string, unknown>, turnId: string, browser?: BrowserObservabilityContext): Record<string, unknown> {
   return { ...details, turnId, ...(browser?.userId ? { userId: browser.userId } : {}), ...(browser?.sessionId ? { sessionId: browser.sessionId } : {}), ...(browser?.clientId ? { clientId: browser.clientId } : {}) };
@@ -214,6 +215,12 @@ export async function runDurableOperationPreflight(options: {
     return running ? { status: "continue", operation: running } : { status: "deferred" };
   }
 
+  const attemptKey = `${operation.operationId}:${operation.generation}`;
+  if (durablePreflightAttempts.has(attemptKey)) return { status: "deferred" };
+  durablePreflightAttempts.add(attemptKey);
+  let backgroundOwnsAttempt = false;
+
+  try {
   const rotateIfNeeded = async (source: "foreground" | "background"): Promise<boolean> => {
     const detail = options.compactionState.lastCompactionErrorMessage?.trim();
     if (!detail || isCompactionCancellationError(detail)) return false;
@@ -252,6 +259,7 @@ export async function runDurableOperationPreflight(options: {
       Bun.sleep(deps.getForegroundMs()).then(() => "defer" as const),
     ]);
     if (outcome === "defer") {
+      backgroundOwnsAttempt = true;
       void compactionPromise
         .then(() => rotateIfNeeded("background"))
         .then(() => {
@@ -266,7 +274,8 @@ export async function runDurableOperationPreflight(options: {
             err: error,
           }, options.turnId, options.browserObservability));
           block();
-        });
+        })
+        .finally(() => durablePreflightAttempts.delete(attemptKey));
       return { status: "deferred" };
     }
   } catch (error) {
@@ -284,4 +293,7 @@ export async function runDurableOperationPreflight(options: {
   if (!running) return { status: "deferred" };
   heartbeatTrackedPhase(options.chatJid, "prompt", { eventType: "operation_preflight_promoted" });
   return { status: "continue", operation: running };
+  } finally {
+    if (!backgroundOwnsAttempt) durablePreflightAttempts.delete(attemptKey);
+  }
 }

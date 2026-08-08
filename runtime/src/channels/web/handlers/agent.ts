@@ -42,6 +42,7 @@ import {
   rollbackChatRunWithError,
   rollbackInflightRun,
   rollbackInflightRunForCompactionConflict,
+  peekNextAcceptedChatSource,
   resumeChatOperation,
   setChatCursor,
   waitChatOperation,
@@ -73,6 +74,7 @@ import "../../../extensions/generic-tool-status-hints.js";
 import { createUuid } from "../../../utils/ids.js";
 import { createLogger, debugSuppressedError } from "../../../utils/logger.js";
 import type { AttachmentInfo } from "../../../agent-pool/attachments.js";
+import type { NewMessage } from "../../../types.js";
 import type { AgentFailureCategory } from "../../../agent-pool/contracts.js";
 import { classifyOpaqueAgentFailure } from "../../../agent-pool/automatic-recovery.js";
 import { cancelScheduledIdleAutoCompaction } from "../../../agent-pool/compaction.js";
@@ -82,6 +84,57 @@ import { endTrackedPhase } from "../../../runtime/progress-watchdog.js";
 
 const log = createLogger("web.handlers.agent");
 const TOOL_BUDGET_CONTINUATION_EXTENSION_ID = "piclaw.tool-budget-continuation";
+
+function loadDurableSourceMessage(chatJid: string, messageId: string): NewMessage | null {
+  const row = getDb().prepare(`SELECT rowid, id, chat_jid, sender, sender_name, content, screen_hint,
+    content_blocks, link_previews, thread_id, timestamp, is_from_me, is_bot_message
+    FROM messages WHERE chat_jid = ? AND id = ?`).get(chatJid, messageId) as {
+      rowid: number;
+      id: string;
+      chat_jid: string;
+      sender: string;
+      sender_name: string;
+      content: string;
+      screen_hint: string | null;
+      content_blocks: string | null;
+      link_previews: string | null;
+      thread_id: number | null;
+      timestamp: string;
+      is_from_me: number;
+      is_bot_message: number;
+    } | undefined;
+  if (!row) return null;
+  const parseArray = (value: string | null): unknown[] | undefined => {
+    if (!value) return undefined;
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  return {
+    id: row.id,
+    chat_jid: row.chat_jid,
+    sender: row.sender,
+    sender_name: row.sender_name,
+    content: row.content,
+    screen_hint: row.screen_hint,
+    content_blocks: parseArray(row.content_blocks),
+    link_previews: parseArray(row.link_previews),
+    thread_id: row.thread_id,
+    timestamp: row.timestamp,
+    is_from_me: row.is_from_me === 1,
+    is_bot_message: row.is_bot_message === 1,
+  };
+}
+
+function messagePrecedes(left: NewMessage, right: NewMessage): boolean {
+  if (left.timestamp !== right.timestamp) return left.timestamp < right.timestamp;
+  const leftRowId = getMessageRowIdById(left.chat_jid, left.id) ?? Number.MAX_SAFE_INTEGER;
+  const rightRowId = getMessageRowIdById(right.chat_jid, right.id) ?? Number.MAX_SAFE_INTEGER;
+  return leftRowId < rightRowId;
+}
 
 function durableOperationOwner(operation: ChatOperationState): ChatOperationOwner {
   return {
@@ -953,14 +1006,50 @@ export async function handleAgentMessage(
     return response;
   }
 
-  const interaction = storeAgentUserMessage(channel, chatJid, {
-    content,
-    mediaIds: normalized.mediaIds,
-    contentBlocks: normalized.contentBlocks,
-    linkPreviews: normalized.linkPreviews,
-    threadId: normalized.threadId,
-    screenHint: normalized.screenHint,
-  });
+  const durableDirectNormal = new URL(req.url).hostname !== "internal"
+    && !command
+    && !themeCommand
+    && !metersCommand
+    && !isSettingsCommand
+    && !isSlashCommandInvocation(trimmed)
+    && requestMode !== "steer"
+    && !isActive
+    && !hasQueuedBacklog;
+  let interaction: ReturnType<typeof storeAgentUserMessage> = null;
+  try {
+    if (durableDirectNormal) {
+      interaction = getDb().transaction(() => {
+        const stored = storeAgentUserMessage(channel, chatJid, {
+          content,
+          mediaIds: normalized.mediaIds,
+          contentBlocks: normalized.contentBlocks,
+          linkPreviews: normalized.linkPreviews,
+          threadId: normalized.threadId,
+          screenHint: normalized.screenHint,
+        });
+        if (!stored) throw new Error("Failed to store durable web message");
+        acceptStoredChatMessageSource(chatJid, stored.id);
+        return stored;
+      }).immediate();
+    } else {
+      interaction = storeAgentUserMessage(channel, chatJid, {
+        content,
+        mediaIds: normalized.mediaIds,
+        contentBlocks: normalized.contentBlocks,
+        linkPreviews: normalized.linkPreviews,
+        threadId: normalized.threadId,
+        screenHint: normalized.screenHint,
+      });
+    }
+  } catch (error) {
+    log.error("Failed to persist accepted web message", {
+      operation: "handle_agent_message.accept_failed",
+      chatJid,
+      durableDirectNormal,
+      err: error,
+    });
+    return channel.json({ error: "Failed to store message" }, 500);
+  }
 
   if (!interaction) return channel.json({ error: "Failed to store message" }, 500);
 
@@ -1354,13 +1443,6 @@ export async function handleAgentMessage(
     }
   }
 
-  // Only the direct browser/API normal-message producer migrates in this PR.
-  // Internal adaptive-card, mention-forward, runtime, command, steer, and queued
-  // follow-up producers remain on their legacy paths.
-  if (new URL(req.url).hostname !== "internal") {
-    acceptStoredChatMessageSource(chatJid, interaction.id);
-  }
-
   // Normal (non-queued) message processing — broadcast to timeline now
   broadcastNewPost();
 
@@ -1393,15 +1475,29 @@ export async function processChat(
   threadRootId?: number,
   browserObservability?: BrowserObservabilityContext,
 ): Promise<void> {
-  const operationClaim = claimNextChatOperation(chatJid);
-  let durableOperation = operationClaim.status === "claimed" || operationClaim.status === "existing"
+  const prevCursor = getChatCursor(chatJid);
+  const selection = selectProcessChatMessage({ chatJid, prevCursor, threadRootId });
+  const existingOperation = getChatOperation(chatJid);
+  const nextAcceptedSource = existingOperation ? null : peekNextAcceptedChatSource(chatJid);
+  const nextAcceptedMessage = nextAcceptedSource?.sourceKind === "message"
+    ? loadDurableSourceMessage(chatJid, nextAcceptedSource.sourceId)
+    : null;
+  const earlierLegacyMessage = !existingOperation
+    && nextAcceptedMessage
+    && selection.kind === "message"
+    && selection.currentMessage.id !== nextAcceptedMessage.id
+    && messagePrecedes(selection.currentMessage, nextAcceptedMessage);
+  const shouldClaimDurableMessage = Boolean(existingOperation)
+    || Boolean(nextAcceptedSource?.sourceKind === "message" && !earlierLegacyMessage);
+  const operationClaim = shouldClaimDurableMessage ? claimNextChatOperation(chatJid) : null;
+  let durableOperation = operationClaim?.status === "claimed" || operationClaim?.status === "existing"
     ? operationClaim.operation
     : null;
-  const durableSource = operationClaim.status === "claimed" || operationClaim.status === "existing"
+  const durableSource = operationClaim?.status === "claimed" || operationClaim?.status === "existing"
     ? operationClaim.source
     : null;
   if (durableOperation && durableSource?.sourceKind !== "message") {
-    log.warn("Durable operation consumer refused a non-message source", {
+    log.warn("Durable web-message consumer refused a non-message source", {
       operation: "process_chat.operation_source_not_supported",
       chatJid,
       sourceKind: durableSource?.sourceKind ?? null,
@@ -1427,30 +1523,18 @@ export async function processChat(
     return;
   }
 
-  const prevCursor = getChatCursor(chatJid);
-  const selection = selectProcessChatMessage({
-    chatJid,
-    prevCursor,
-    threadRootId,
-  });
-
-  if (selection.kind === "no_messages") {
-    if (durableOperation) blockChatOperation(chatJid, durableOperationOwner(durableOperation));
+  if (!durableOperation && selection.kind === "no_messages") {
     log.info("processChat found no pending messages", {
       operation: "process_chat.no_pending_messages",
       chatJid,
       cursor: prevCursor,
       threadRootId: threadRootId ?? null,
     });
-    await materializeDeferredFollowups({
-      channel,
-      chatJid,
-      agentId,
-    });
+    await materializeDeferredFollowups({ channel, chatJid, agentId });
     return;
   }
 
-  if (selection.kind === "stale_failed_run_cleared") {
+  if (!durableOperation && selection.kind === "stale_failed_run_cleared") {
     log.info("processChat clearing stale failed-run marker without replay", {
       operation: "process_chat.clear_failed_run_without_replay",
       chatJid,
@@ -1460,38 +1544,29 @@ export async function processChat(
       failedMessageId: selection.failedRun.messageId,
       pendingMessageCount: selection.pendingMessages.length,
     });
-    if (selection.shouldResume) {
-      channel.resumeChat(chatJid);
-    } else {
-      await materializeDeferredFollowups({
-        channel,
-        chatJid,
-        agentId,
-      });
-    }
+    if (selection.shouldResume) channel.resumeChat(chatJid);
+    else await materializeDeferredFollowups({ channel, chatJid, agentId });
     return;
   }
 
-  const messages = selection.pendingMessages;
-  let currentMessage = selection.currentMessage;
-  let messageThreadId = selection.messageThreadId;
-  let effectiveThreadRootId = selection.effectiveThreadRootId;
-  if (durableSource && currentMessage.id !== durableSource.sourceId) {
-    const claimedMessage = messages.find((message) => message.id === durableSource.sourceId);
-    if (!claimedMessage) {
-      blockChatOperation(chatJid, durableOperationOwner(durableOperation!));
-      log.error("Claimed durable source is not selectable from persisted messages", {
-        operation: "process_chat.operation_source_missing",
-        chatJid,
-        sourceSeq: durableSource.sourceSeq,
-        sourceId: durableSource.sourceId,
-      });
-      return;
-    }
-    currentMessage = claimedMessage;
-    messageThreadId = currentMessage.thread_id ?? null;
-    effectiveThreadRootId = messageThreadId ?? threadRootId ?? null;
+  const claimedMessage = durableSource ? loadDurableSourceMessage(chatJid, durableSource.sourceId) : null;
+  if (durableOperation && !claimedMessage) {
+    blockChatOperation(chatJid, durableOperationOwner(durableOperation));
+    log.error("Claimed durable source message is missing", {
+      operation: "process_chat.operation_source_missing",
+      chatJid,
+      sourceSeq: durableSource?.sourceSeq ?? null,
+      sourceId: durableSource?.sourceId ?? null,
+    });
+    return;
   }
+  if (!durableOperation && selection.kind !== "message") return;
+
+  const messages = selection.pendingMessages;
+  const currentMessage = claimedMessage ?? (selection.kind === "message" ? selection.currentMessage : null);
+  if (!currentMessage) return;
+  const messageThreadId = currentMessage.thread_id ?? null;
+  const effectiveThreadRootId = messageThreadId ?? threadRootId ?? null;
 
   log.info("processChat selected next pending message", {
     operation: "process_chat.select_message",

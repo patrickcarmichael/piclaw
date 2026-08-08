@@ -1,7 +1,21 @@
-import { describe, expect, test } from "bun:test";
+import { beforeEach, describe, expect, test } from "bun:test";
 import { storeAgentTurn } from "../../../../src/channels/web/messaging/agent-message-store.js";
 import type { WebChannel } from "../../../../src/channels/web.js";
 import type { AgentEventEmitter } from "../../../../src/channels/web/sse/agent-events.js";
+import {
+  claimNextChatOperation,
+  completeChatOperation,
+  deleteChatOperationLifecycleState,
+  getChatCursor,
+  getChatOperation,
+  getChatOperationDisposition,
+  getDb,
+  getMessageByRowId,
+  initDatabase,
+  promoteChatOperation,
+  storeAcceptedChatMessageSource,
+  storeMessage as storeDbMessage,
+} from "../../../../src/db.js";
 
 /** Minimal mock of WebChannel that tracks placeholder and store calls. */
 function createMockChannel(placeholderIds: number[] = []) {
@@ -24,13 +38,18 @@ function createMockChannel(placeholderIds: number[] = []) {
         threadId: number | undefined,
         isTerminalAgentReply?: boolean,
         beforeBroadcast?: (interaction: any) => boolean,
+        deferBroadcast?: boolean,
       ) => {
         calls.push(
           `replace:${chatJid}:${rowId}:thread=${threadId ?? "undefined"}:terminal=${isTerminalAgentReply ? 1 : 0}`
         );
         const interaction = { id: rowId, timestamp: "t", data: {} };
         beforeBroadcast?.(interaction);
+        void deferBroadcast;
         return interaction;
+      },
+      broadcastQueuedFollowupPlaceholderUpdate: (interaction: { id: number }) => {
+        calls.push(`updated:${interaction.id}`);
       },
       storeMessage: (
         chatJid: string,
@@ -59,6 +78,10 @@ function createMockEmitter() {
 }
 
 describe("storeAgentTurn", () => {
+  beforeEach(() => {
+    process.env.PICLAW_DB_IN_MEMORY = "1";
+    initDatabase();
+  });
   test("consumes placeholder when skipPlaceholder is false (default)", () => {
     const { channel, calls } = createMockChannel([50]);
     const { emitter } = createMockEmitter();
@@ -280,7 +303,97 @@ describe("storeAgentTurn", () => {
       "consume:web:default:50",
       "replace:web:default:50:thread=undefined:terminal=0",
       "complete:50",
+      "updated:50",
     ]);
+  });
+
+  test("rolls back terminal rows with disposition, cursor, and release on completion faults", () => {
+    for (const faultPoint of ["artifact", "disposition"] as const) {
+      const chatJid = `web:terminal-fault-${faultPoint}`;
+      const accepted = storeAcceptedChatMessageSource({
+        id: `source-${faultPoint}`,
+        chat_jid: chatJid,
+        sender: "user",
+        sender_name: "User",
+        content: "prompt",
+        timestamp: "2026-01-01T00:00:01.000Z",
+      });
+      const claim = claimNextChatOperation(chatJid);
+      if (claim.status !== "claimed") throw new Error("expected claim");
+      const preflight = promoteChatOperation(chatJid, {
+        operationId: claim.operation.operationId,
+        sourceSeq: claim.operation.sourceSeq,
+        phase: claim.operation.phase,
+        generation: claim.operation.generation,
+      }, "preflight");
+      if (preflight.status !== "applied") throw new Error("expected preflight");
+      const running = promoteChatOperation(chatJid, {
+        operationId: preflight.operation.operationId,
+        sourceSeq: preflight.operation.sourceSeq,
+        phase: preflight.operation.phase,
+        generation: preflight.operation.generation,
+      }, "running");
+      if (running.status !== "applied") throw new Error("expected running");
+
+      const channel = {
+        consumeQueuedFollowupPlaceholder: () => null,
+        storeMessage: (targetChatJid: string, content: string) => {
+          const messageId = `terminal-${faultPoint}`;
+          const rowId = storeDbMessage({
+            id: messageId,
+            chat_jid: targetChatJid,
+            sender: "agent",
+            sender_name: "Agent",
+            content,
+            timestamp: "2026-01-01T00:00:02.000Z",
+            is_bot_message: true,
+          });
+          return getMessageByRowId(targetChatJid, rowId)!;
+        },
+      } as unknown as WebChannel;
+      const emitter = { response: () => { throw new Error("must not broadcast"); } } as unknown as AgentEventEmitter;
+
+      expect(() => storeAgentTurn(channel, emitter, {
+        chatJid,
+        text: "terminal",
+        attachments: [],
+        channelName: "web",
+        threadId: null,
+        isTerminalAgentReply: true,
+        commitTerminal: (rowId) => {
+          const row = getDb().prepare("SELECT id FROM messages WHERE chat_jid = ? AND rowid = ?")
+            .get(chatJid, rowId) as { id: string };
+          completeChatOperation(chatJid, {
+            owner: {
+              operationId: running.operation.operationId,
+              sourceSeq: running.operation.sourceSeq,
+              phase: running.operation.phase,
+              generation: running.operation.generation,
+            },
+            outcome: "succeeded",
+            cause: "test",
+            provenance: "test",
+            createdAt: "2026-01-01T00:00:03.000Z",
+            artifact: { messageId: row.id },
+          }, {
+            afterWrite: (point) => {
+              if (point === faultPoint) throw new Error(`fault-after-${faultPoint}`);
+            },
+          });
+          return true;
+        },
+      })).toThrow(`fault-after-${faultPoint}`);
+
+      expect(getDb().prepare("SELECT COUNT(*) AS count FROM messages WHERE chat_jid = ? AND is_bot_message = 1")
+        .get(chatJid)).toEqual({ count: 0 });
+      expect(getChatOperationDisposition(accepted.source.sourceSeq)).toBeNull();
+      expect(getChatCursor(chatJid)).toBe("");
+      expect(getChatOperation(chatJid)).toEqual(running.operation);
+
+      deleteChatOperationLifecycleState(chatJid);
+      getDb().prepare("DELETE FROM messages WHERE chat_jid = ?").run(chatJid);
+      getDb().prepare("DELETE FROM chat_cursors WHERE chat_jid = ?").run(chatJid);
+    }
   });
 
   test("marks terminal assistant replies when requested", () => {

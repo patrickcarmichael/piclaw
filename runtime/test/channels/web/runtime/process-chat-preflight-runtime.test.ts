@@ -181,8 +181,8 @@ describe("process chat preflight runtime", () => {
       let release!: () => void;
       const gate = new Promise<void>((resolve) => { release = resolve; });
       let resumes = 0;
-
-      const result = await runDurableOperationPreflight({
+      let physicalCompactions = 0;
+      const base = {
         channel: {
           agentPool: {
             getSessionForIntrospection: async () => ({}),
@@ -192,23 +192,39 @@ describe("process chat preflight runtime", () => {
         chatJid,
         agentId: "default",
         message: { id: "m-deferred", timestamp: "2026-01-01T00:00:01.000Z" },
-        operation: claim.operation,
         effectiveThreadRootId: 42,
-        turnId: "turn-deferred",
         streamingHandler() {},
         compactionState: { lastCompactionErrorMessage: null, lastCompactionSuppressed: false },
-        enqueueResume(root) {
+        enqueueResume(root: number | undefined) {
           expect(root).toBe(42);
           resumes += 1;
         },
         deps: {
           getForegroundMs: () => 0,
-          maybeAutoCompactSessionBeforePrompt: async () => { await gate; },
+          maybeAutoCompactSessionBeforePrompt: async () => {
+            physicalCompactions += 1;
+            await gate;
+          },
         },
-      });
+      };
 
+      const result = await runDurableOperationPreflight({
+        ...base,
+        operation: claim.operation,
+        turnId: "turn-deferred",
+      });
       expect(result.status).toBe("deferred");
-      expect(getChatOperation(chatJid)?.phase).toBe("preflight");
+      const ownedPreflight = getChatOperation(chatJid)!;
+      expect(ownedPreflight.phase).toBe("preflight");
+
+      const duplicate = await runDurableOperationPreflight({
+        ...base,
+        operation: ownedPreflight,
+        turnId: "turn-duplicate",
+      });
+      expect(duplicate.status).toBe("deferred");
+      expect(physicalCompactions).toBe(1);
+      expect(resumes).toBe(0);
       release();
       await waitFor(() => resumes === 1, 250, 1);
       expect(getChatOperation(chatJid)).toMatchObject({ phase: "running", generation: 2 });

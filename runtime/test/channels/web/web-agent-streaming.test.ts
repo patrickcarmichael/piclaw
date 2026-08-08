@@ -7,6 +7,7 @@
 
 import { describe, test, expect } from "bun:test";
 import { AgentQueue } from "../../../src/queue.js";
+import { getIdentityConfig } from "../../../src/core/config.js";
 import { buildAgentStatusPhaseKey, handleAgentMessage } from "../../../src/channels/web/handlers/agent.js";
 import {
   acceptStoredChatMessageSource,
@@ -16,6 +17,7 @@ import {
   getChatOperationDisposition,
   getDb,
   promoteChatOperation,
+  registerAcceptedChatSource,
 } from "../../../src/db.js";
 import { waitFor } from "../../helpers.js";
 import { createWebChannelTestFixture } from "./helpers/web-channel-fixture.js";
@@ -211,7 +213,7 @@ describe("web agent streaming", () => {
       const request = new Request("https://example.com/agent/default/message", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ content: "durable prompt" }),
+        body: JSON.stringify({ content: `${getIdentityConfig().assistantName}: durable prompt` }),
       });
       const response = await handleAgentMessage(
         fixture.channel,
@@ -257,6 +259,60 @@ describe("web agent streaming", () => {
     }
   });
 
+  test("rolls back browser message storage when durable acceptance fails", async () => {
+    let enqueues = 0;
+    const fixture = await createWebChannelTestFixture({
+      queue: { enqueue: () => { enqueues += 1; } } as any,
+      agentPool: {
+        setSessionBinder: () => {},
+        isStreaming: () => false,
+        isActive: () => false,
+      } as any,
+    });
+
+    try {
+      const originalStoreMessage = fixture.channel.storeMessage.bind(fixture.channel);
+      fixture.channel.storeMessage = ((chatJid: string, content: string, isBot: boolean, mediaIds: number[], options?: any) => {
+        const interaction = originalStoreMessage(chatJid, content, isBot, mediaIds, options);
+        if (interaction && !isBot) {
+          const message = getDb().prepare("SELECT id, timestamp FROM messages WHERE chat_jid = ? AND rowid = ?")
+            .get(chatJid, interaction.id) as { id: string; timestamp: string };
+          registerAcceptedChatSource({
+            chatJid,
+            sourceClass: "prompt",
+            sourceKind: "message",
+            sourceId: message.id,
+            acceptedAt: "2020-01-01T00:00:00.000Z",
+            payloadRef: `message:${message.id}`,
+            frontier: { messageId: message.id, cursorTs: message.timestamp },
+          });
+        }
+        return interaction;
+      }) as typeof fixture.channel.storeMessage;
+
+      const response = await handleAgentMessage(
+        fixture.channel,
+        new Request("https://example.com/agent/default/message", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content: "must roll back" }),
+        }),
+        "/agent/default/message",
+        "web:atomic-acceptance",
+        "default",
+      );
+      expect(response.status).toBe(500);
+      expect(getDb().prepare("SELECT COUNT(*) AS count FROM messages WHERE chat_jid = ?")
+        .get("web:atomic-acceptance")).toEqual({ count: 0 });
+      expect(getDb().prepare("SELECT COUNT(*) AS count FROM chat_accepted_sources WHERE chat_jid = ?")
+        .get("web:atomic-acceptance")).toEqual({ count: 0 });
+      expect(enqueues).toBe(0);
+      expect(fixture.events.some((event) => event.type === "new_post")).toBe(false);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
   test("does not register internal adaptive-card submissions as durable message sources", async () => {
     const agentPool = {
       setSessionBinder: () => {},
@@ -290,6 +346,51 @@ describe("web agent streaming", () => {
         AND source_id = (SELECT id FROM messages WHERE chat_jid = ? AND rowid = ?)`)
         .get("web:default", "web:default", body.user_message.id);
       expect(accepted).toBeNull();
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  test("processes an earlier legacy internal row before claiming the accepted browser row", async () => {
+    const prompts: string[] = [];
+    const agentPool = {
+      setSessionBinder: () => {},
+      isStreaming: () => false,
+      isActive: () => false,
+      runAgent: async (prompt: string) => {
+        prompts.push(prompt);
+        return { status: "success", result: `response-${prompts.length}`, attachments: [] };
+      },
+      getContextUsageForChat: async () => null,
+    } as any;
+    const fixture = await createWebChannelTestFixture({ queue: new AgentQueue(), agentPool });
+
+    try {
+      const legacy = fixture.channel.storeMessage("web:mixed", "earlier internal card input", false, []);
+      expect(legacy).not.toBeNull();
+      const response = await handleAgentMessage(
+        fixture.channel,
+        new Request("https://example.com/agent/default/message", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content: `${getIdentityConfig().assistantName}: later accepted browser input` }),
+        }),
+        "/agent/default/message",
+        "web:mixed",
+        "default",
+      );
+      expect(response.status).toBe(201);
+      const body = await response.json() as { user_message: { id: number } };
+      const source = getDb().prepare(`SELECT source_seq FROM chat_accepted_sources
+        WHERE chat_jid = ? AND source_id = (SELECT id FROM messages WHERE chat_jid = ? AND rowid = ?)`)
+        .get("web:mixed", "web:mixed", body.user_message.id) as { source_seq: number };
+
+      await waitFor(() => Boolean(getChatOperationDisposition(source.source_seq)), 1_000, 2);
+      expect(prompts).toHaveLength(2);
+      expect(prompts[0]).toContain("earlier internal card input");
+      expect(prompts[1]).toContain("later accepted browser input");
+      expect(getChatOperationDisposition(source.source_seq)?.outcome).toBe("succeeded");
+      expect(getChatOperation("web:mixed")).toBeNull();
     } finally {
       fixture.cleanup();
     }

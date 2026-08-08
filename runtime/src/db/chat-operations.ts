@@ -259,14 +259,15 @@ export function registerAcceptedChatSource(input: {
 
 export function acceptStoredChatMessageSource(chatJid: string, messageRowId: number): { status: "registered" | "existing"; source: AcceptedChatSource } {
   const db = getDb();
-  return db.transaction(() => {
+  const accept = () => {
     const message = db.prepare("SELECT id, timestamp FROM messages WHERE chat_jid = ? AND rowid = ?")
       .get(chatJid, messageRowId) as { id: string; timestamp: string } | undefined;
     if (!message) throw new ChatOperationInvariantError("Accepted web message row is missing");
     return registerAcceptedChatSource({ chatJid, sourceClass: "prompt", sourceKind: "message",
       sourceId: message.id, acceptedAt: message.timestamp, payloadRef: `message:${message.id}`,
       frontier: { messageId: message.id, cursorTs: message.timestamp } });
-  }).immediate();
+  };
+  return db.inTransaction ? accept() : db.transaction(accept).immediate();
 }
 
 export function storeAcceptedChatMessageSource(message: NewMessage, acceptedAt = message.timestamp): { status: "registered" | "existing"; source: AcceptedChatSource } {
@@ -340,6 +341,16 @@ export function getChatOperation(chatJid: string): ChatOperationState | null {
 export function getChatOperationDisposition(sourceSeq: number): ChatOperationDisposition | null {
   return dispositionFromRow(getDb().prepare("SELECT * FROM chat_operation_dispositions WHERE source_seq = ?")
     .get(sourceSeq) as DispositionRow | undefined);
+}
+
+export function peekNextAcceptedChatSource(chatJid: string): AcceptedChatSource | null {
+  const row = getDb().prepare(`
+    SELECT s.* FROM chat_accepted_sources s
+    LEFT JOIN chat_operation_dispositions d ON d.source_seq = s.source_seq
+    WHERE s.chat_jid = ? AND s.selectable = 1 AND d.source_seq IS NULL
+    ORDER BY s.source_seq ASC LIMIT 1
+  `).get(chatJid) as SourceRow | undefined;
+  return row ? sourceFromRow(row) : null;
 }
 
 export function claimNextChatOperation(chatJid: string): ChatOperationClaimResult {

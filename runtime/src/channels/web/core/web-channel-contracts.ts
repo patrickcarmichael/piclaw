@@ -120,7 +120,9 @@ export interface WebChannelLike
     threadId?: number,
     isTerminalAgentReply?: boolean,
     beforeBroadcast?: (interaction: InteractionRow) => boolean,
+    deferBroadcast?: boolean,
   ): InteractionRow | null;
+  broadcastQueuedFollowupPlaceholderUpdate(interaction: InteractionRow): void;
   queuePendingSteering(chatJid: string, timestamp: string | undefined): void;
   consumePendingSteering(chatJid: string): string[];
 
