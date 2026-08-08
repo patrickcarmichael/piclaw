@@ -35,6 +35,7 @@ export interface ProcessChatFinalizationRuntime {
   threadId: string | number | null;
   prevCursor: string;
   recovery: { attemptsUsed?: number; recovered?: boolean; exhausted?: boolean; lastClassifier?: string | null } | null;
+  durableOperationCompleted?: boolean;
 }
 
 /** Finalise a successfully persisted terminal outcome, then resume persisted/queued work. */
@@ -42,7 +43,7 @@ export async function finalizeSuccessfulProcessChatRun(options: ProcessChatFinal
   const { channel, chatJid } = options;
   // Stale protected intent was removed atomically with terminal persistence.
   // This update only clears inflight/failed run state.
-  endChatRun(chatJid);
+  if (!options.durableOperationCompleted) endChatRun(chatJid);
   const cursorAfterEnd = getChatCursor(chatJid);
   const pendingSteerTimestamps = channel.consumePendingSteering(chatJid);
   const cursorAfterSteer = getChatCursor(chatJid);

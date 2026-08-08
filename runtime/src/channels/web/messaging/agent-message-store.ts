@@ -11,6 +11,7 @@
 import type { WebChannelLike } from "../core/web-channel-contracts.js";
 import type { AttachmentInfo } from "../../../agent-pool/attachments.js";
 import type { AgentEventEmitter } from "../sse/agent-events.js";
+import type { InteractionRow } from "../../../db.js";
 import { formatOutbound, type ChatChannel } from "../../../router.js";
 import { createLogger, debugSuppressedError } from "../../../utils/logger.js";
 import { sendStoredAgentReplyWebPushNotification } from "../push/web-push-service.js";
@@ -113,6 +114,8 @@ export function storeAgentTurn(
      *  callback are caught and logged but do not prevent the broadcast —
      *  message persistence wins over auxiliary writes. */
     onMessageStored?: (rowId: number) => void;
+    /** Operation completion fence invoked after persistence and before broadcast. */
+    commitTerminal?: (rowId: number) => boolean;
   }
 ): number | null {
   const { mediaIds, contentBlocks } = buildAttachmentBlocks(params.attachments);
@@ -144,6 +147,18 @@ export function storeAgentTurn(
       // Don't override the placeholder's thread_id — it was set correctly
       // when the /queue command created the placeholder (threaded under the
       // /queue message). Passing undefined preserves the original association.
+      let placeholderCommitSucceeded = true;
+      const beforePlaceholderBroadcast = params.onMessageStored || params.commitTerminal
+        ? (interaction: InteractionRow): boolean => {
+            const resolvedRowId = typeof interaction.id === "number" ? interaction.id : placeholderId;
+            safeOnStored(resolvedRowId);
+            placeholderCommitSucceeded = !params.commitTerminal || params.commitTerminal(resolvedRowId);
+            if (placeholderCommitSucceeded && params.commitTerminal) {
+              (interaction.data as unknown as Record<string, unknown>).is_terminal_agent_reply = true;
+            }
+            return placeholderCommitSucceeded;
+          }
+        : undefined;
       const updated = channel.replaceQueuedFollowupPlaceholder(
         params.chatJid,
         placeholderId,
@@ -151,13 +166,12 @@ export function storeAgentTurn(
         mediaIds,
         mergedContentBlocks.length > 0 ? mergedContentBlocks : undefined,
         undefined,
-        params.isTerminalAgentReply
+        params.commitTerminal ? false : params.isTerminalAgentReply,
+        beforePlaceholderBroadcast,
       );
       if (updated) {
+        if (!placeholderCommitSucceeded) return null;
         const resolvedRowId = typeof updated.id === "number" ? updated.id : placeholderId;
-        // Run auxiliary writes BEFORE broadcasting so clients that fetch
-        // related data on the broadcast event don't race the row creation.
-        safeOnStored(resolvedRowId);
         channel.broadcastEvent?.("agent_followup_consumed", {
           chat_jid: params.chatJid,
           thread_id: params.threadId ?? null,
@@ -174,12 +188,14 @@ export function storeAgentTurn(
   const interaction = channel.storeMessage(params.chatJid, formatted, true, mediaIds, {
     contentBlocks: mergedContentBlocks.length > 0 ? mergedContentBlocks : undefined,
     threadId: resolvedThreadId,
-    isTerminalAgentReply: params.isTerminalAgentReply,
+    isTerminalAgentReply: params.commitTerminal ? false : params.isTerminalAgentReply,
     removeProtectedContinuationForSourceMessageId: params.removeProtectedContinuationForSourceMessageId,
   });
   if (interaction) {
     const resolvedRowId = typeof interaction.id === "number" ? interaction.id : null;
     if (resolvedRowId !== null) safeOnStored(resolvedRowId);
+    if (params.commitTerminal && (resolvedRowId === null || !params.commitTerminal(resolvedRowId))) return null;
+    if (params.commitTerminal) (interaction.data as unknown as Record<string, unknown>).is_terminal_agent_reply = true;
     emitter.response(interaction);
     if (params.isTerminalAgentReply) {
       dispatchStoredReplyWebPush(interaction, params.dispatchWebPushNotification);

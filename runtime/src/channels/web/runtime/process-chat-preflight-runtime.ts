@@ -5,7 +5,15 @@ export interface BrowserObservabilityContext {
 }
 import type { WebChannelLike } from "../core/web-channel-contracts.js";
 import { getPrePromptCompactionForegroundMs } from "../../../core/config.js";
-import { beginChatPreflight, clearChatPreflight, promoteChatPreflightToInflight } from "../../../db.js";
+import {
+  beginChatPreflight,
+  blockChatOperation,
+  clearChatPreflight,
+  promoteChatOperation,
+  promoteChatPreflightToInflight,
+  type ChatOperationOwner,
+  type ChatOperationState,
+} from "../../../db.js";
 import { isCompactionCancellationError, maybeAutoCompactSessionBeforePrompt } from "../../../agent-pool/compaction.js";
 import { beginTrackedPhase, endTrackedPhase, heartbeatTrackedPhase } from "../../../runtime/progress-watchdog.js";
 import { createLogger } from "../../../utils/logger.js";
@@ -140,4 +148,140 @@ export async function runProcessChatPreflight(options: {
   }
   heartbeatTrackedPhase(chatJid, "prompt", { eventType: "preflight_promoted" });
   return "continue";
+}
+
+
+interface DurableOperationPreflightDeps {
+  promoteChatOperation: typeof promoteChatOperation;
+  blockChatOperation: typeof blockChatOperation;
+  maybeAutoCompactSessionBeforePrompt: typeof maybeAutoCompactSessionBeforePrompt;
+  getForegroundMs: typeof getPrePromptCompactionForegroundMs;
+}
+
+const durableOperationPreflightDeps: DurableOperationPreflightDeps = {
+  promoteChatOperation,
+  blockChatOperation,
+  maybeAutoCompactSessionBeforePrompt,
+  getForegroundMs: getPrePromptCompactionForegroundMs,
+};
+
+function operationOwner(operation: ChatOperationState): ChatOperationOwner {
+  return {
+    operationId: operation.operationId,
+    sourceSeq: operation.sourceSeq,
+    phase: operation.phase,
+    generation: operation.generation,
+  };
+}
+
+/** Run pre-prompt work for one durable accepted web-message operation. */
+export async function runDurableOperationPreflight(options: {
+  channel: WebChannelLike;
+  chatJid: string;
+  agentId: string;
+  message: { id: string; timestamp: string };
+  operation: ChatOperationState;
+  effectiveThreadRootId: number | null;
+  turnId: string;
+  browserObservability?: BrowserObservabilityContext;
+  streamingHandler(event: Record<string, unknown>): void;
+  compactionState: { lastCompactionErrorMessage: string | null; lastCompactionSuppressed: boolean };
+  enqueueResume(threadRootId: number | undefined): void;
+  deps?: Partial<DurableOperationPreflightDeps>;
+}): Promise<{ status: "continue"; operation: ChatOperationState } | { status: "deferred" }> {
+  const deps = { ...durableOperationPreflightDeps, ...options.deps };
+  let operation = options.operation;
+  if (operation.phase === "running") return { status: "continue", operation };
+  if (operation.phase !== "pending" && operation.phase !== "preflight") return { status: "deferred" };
+
+  if (operation.phase === "pending") {
+    const promoted = deps.promoteChatOperation(options.chatJid, operationOwner(operation), "preflight");
+    if (promoted.status !== "applied") return { status: "deferred" };
+    operation = promoted.operation;
+  }
+
+  const block = (): void => {
+    const blocked = deps.blockChatOperation(options.chatJid, operationOwner(operation));
+    if (blocked.status === "applied") endTrackedPhase(options.chatJid);
+  };
+  const promoteRunning = (): ChatOperationState | null => {
+    const promoted = deps.promoteChatOperation(options.chatJid, operationOwner(operation), "running");
+    return promoted.status === "applied" ? promoted.operation : null;
+  };
+
+  if (typeof options.channel.agentPool.getSessionForIntrospection !== "function") {
+    const running = promoteRunning();
+    return running ? { status: "continue", operation: running } : { status: "deferred" };
+  }
+
+  const rotateIfNeeded = async (source: "foreground" | "background"): Promise<boolean> => {
+    const detail = options.compactionState.lastCompactionErrorMessage?.trim();
+    if (!detail || isCompactionCancellationError(detail)) return false;
+    const result = await options.channel.agentPool.emergencyRotateSession(options.chatJid, detail);
+    log[result.status === "success" ? "info" : "warn"]("Emergency rotation after durable pre-prompt compaction", withMetadata({
+      operation: result.status === "success"
+        ? "process_chat.operation_preflight_emergency_rotate_success"
+        : "process_chat.operation_preflight_emergency_rotate_failed",
+      chatJid: options.chatJid,
+      source,
+      reason: result.message,
+    }, options.turnId, options.browserObservability));
+    return result.status === "success";
+  };
+
+  let session;
+  try {
+    session = await options.channel.agentPool.getSessionForIntrospection(options.chatJid);
+  } catch (error) {
+    block();
+    throw error;
+  }
+
+  beginTrackedPhase(options.chatJid, "preprompt_compaction", {
+    source: "web.process_chat.durable_operation_preflight",
+    messageId: options.message.id,
+  });
+  const compactionPromise = deps.maybeAutoCompactSessionBeforePrompt(session, options.chatJid, {
+    onInfo: (message, details) => log.info(message, withMetadata(details || {}, options.turnId, options.browserObservability)),
+    onWarn: (message, details) => log.warn(message, withMetadata(details || {}, options.turnId, options.browserObservability)),
+  }, options.streamingHandler);
+
+  try {
+    const outcome = await Promise.race([
+      compactionPromise.then(() => "done" as const),
+      Bun.sleep(deps.getForegroundMs()).then(() => "defer" as const),
+    ]);
+    if (outcome === "defer") {
+      void compactionPromise
+        .then(() => rotateIfNeeded("background"))
+        .then(() => {
+          const running = promoteRunning();
+          if (running) options.enqueueResume(options.effectiveThreadRootId ?? undefined);
+        })
+        .catch((error) => {
+          log.warn("Background durable pre-prompt compaction failed", withMetadata({
+            operation: "process_chat.operation_preflight_deferred_failed",
+            chatJid: options.chatJid,
+            messageId: options.message.id,
+            err: error,
+          }, options.turnId, options.browserObservability));
+          block();
+        });
+      return { status: "deferred" };
+    }
+  } catch (error) {
+    block();
+    throw error;
+  }
+
+  if (await rotateIfNeeded("foreground")) {
+    const running = promoteRunning();
+    if (running) options.enqueueResume(options.effectiveThreadRootId ?? undefined);
+    return { status: "deferred" };
+  }
+
+  const running = promoteRunning();
+  if (!running) return { status: "deferred" };
+  heartbeatTrackedPhase(options.chatJid, "prompt", { eventType: "operation_preflight_promoted" });
+  return { status: "continue", operation: running };
 }

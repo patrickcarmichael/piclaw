@@ -515,6 +515,7 @@ export class WebChannelRuntimePublicSurfaceService {
     contentBlocks: Array<Record<string, unknown>> | undefined,
     threadId?: number,
     isTerminalAgentReply?: boolean,
+    beforeBroadcast?: (interaction: InteractionRow) => boolean,
   ): InteractionRow | null {
     return this.channel.runtimeFollowupFacade.replaceQueuedFollowupPlaceholder(
       chatJid,
@@ -524,6 +525,7 @@ export class WebChannelRuntimePublicSurfaceService {
       contentBlocks,
       threadId,
       isTerminalAgentReply,
+      beforeBroadcast,
     );
   }
 

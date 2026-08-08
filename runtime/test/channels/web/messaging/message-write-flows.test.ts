@@ -98,4 +98,61 @@ describe("web message write flows", () => {
     expect(interaction?.data.thread_id).toBe(123);
     expect(events).toEqual(["updated:55"]);
   });
+
+  test("runs the placeholder completion fence after persistence and before update broadcast", () => {
+    const events: string[] = [];
+    const context: MessageWriteContext = {
+      defaultAgentId: "default",
+      store: {
+        storeMessage: () => null,
+        replaceMessageContent: () => {
+          events.push("persist");
+          return {
+            id: 55,
+            timestamp: "2026-01-01T00:00:00.000Z",
+            data: { type: "agent_response", content: "updated" },
+          };
+        },
+        setMessageThreadToSelf: () => {},
+      },
+      broadcaster: {
+        broadcastAgentResponse: () => {},
+        broadcastInteractionUpdated: () => events.push("broadcast"),
+      },
+      followups: { enqueue: () => {} },
+    };
+
+    replaceQueuedFollowupPlaceholderMessage(
+      "web:default",
+      55,
+      "updated",
+      [],
+      undefined,
+      undefined,
+      context,
+      false,
+      () => {
+        events.push("complete");
+        return true;
+      },
+    );
+    expect(events).toEqual(["persist", "complete", "broadcast"]);
+
+    events.length = 0;
+    replaceQueuedFollowupPlaceholderMessage(
+      "web:default",
+      55,
+      "updated",
+      [],
+      undefined,
+      undefined,
+      context,
+      false,
+      () => {
+        events.push("complete-rejected");
+        return false;
+      },
+    );
+    expect(events).toEqual(["persist", "complete-rejected"]);
+  });
 });

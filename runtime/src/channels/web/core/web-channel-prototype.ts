@@ -287,6 +287,7 @@ export function installWebChannelPrototype(
         contentBlocks: Array<Record<string, unknown>> | undefined,
         threadId?: number,
         isTerminalAgentReply?: boolean,
+        beforeBroadcast?: (interaction: InteractionRow) => boolean,
       ): InteractionRow | null =>
         service.replaceQueuedFollowupPlaceholder(
           chatJid,
@@ -296,6 +297,7 @@ export function installWebChannelPrototype(
           contentBlocks,
           threadId,
           isTerminalAgentReply,
+          beforeBroadcast,
         )),
     },
     getThreadRootId: {

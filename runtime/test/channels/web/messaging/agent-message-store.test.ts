@@ -22,12 +22,15 @@ function createMockChannel(placeholderIds: number[] = []) {
         _mediaIds: number[],
         _contentBlocks: unknown,
         threadId: number | undefined,
-        isTerminalAgentReply?: boolean
+        isTerminalAgentReply?: boolean,
+        beforeBroadcast?: (interaction: any) => boolean,
       ) => {
         calls.push(
           `replace:${chatJid}:${rowId}:thread=${threadId ?? "undefined"}:terminal=${isTerminalAgentReply ? 1 : 0}`
         );
-        return { id: rowId, timestamp: "t", data: {} };
+        const interaction = { id: rowId, timestamp: "t", data: {} };
+        beforeBroadcast?.(interaction);
+        return interaction;
       },
       storeMessage: (
         chatJid: string,
@@ -158,6 +161,126 @@ describe("storeAgentTurn", () => {
 
     expect(calls).toEqual(["store:web:default:thread=5:terminal=0"]);
     expect(emitterCalls).toEqual(["response:100"]);
+  });
+
+  test("commits a durable terminal after persistence and before response broadcast", () => {
+    const order: string[] = [];
+    const interaction = { id: 100, timestamp: "t", data: {} as Record<string, unknown> };
+    const channel = {
+      consumeQueuedFollowupPlaceholder: () => null,
+      storeMessage: (_chatJid: string, _content: string, _isBot: boolean, _mediaIds: number[], options: { isTerminalAgentReply?: boolean }) => {
+        order.push(`persist:terminal=${options.isTerminalAgentReply ? 1 : 0}`);
+        return interaction;
+      },
+    } as unknown as WebChannel;
+    const emitter = {
+      response: () => order.push("broadcast"),
+    } as unknown as AgentEventEmitter;
+
+    const rowId = storeAgentTurn(channel, emitter, {
+      chatJid: "web:default",
+      text: "final response",
+      attachments: [],
+      channelName: "web",
+      threadId: 5,
+      isTerminalAgentReply: true,
+      commitTerminal: (persistedRowId) => {
+        order.push(`complete:${persistedRowId}`);
+        return true;
+      },
+    });
+
+    expect(rowId).toBe(100);
+    expect(order).toEqual(["persist:terminal=0", "complete:100", "broadcast"]);
+    expect(interaction.data.is_terminal_agent_reply).toBe(true);
+  });
+
+  test("does not let an auxiliary stored callback prevent durable completion or broadcast", () => {
+    const order: string[] = [];
+    const channel = {
+      consumeQueuedFollowupPlaceholder: () => null,
+      storeMessage: () => {
+        order.push("persist");
+        return { id: 100, timestamp: "t", data: {} };
+      },
+    } as unknown as WebChannel;
+    const emitter = {
+      response: () => order.push("broadcast"),
+    } as unknown as AgentEventEmitter;
+
+    expect(storeAgentTurn(channel, emitter, {
+      chatJid: "web:default",
+      text: "final response",
+      attachments: [],
+      channelName: "web",
+      threadId: 5,
+      isTerminalAgentReply: true,
+      onMessageStored: () => {
+        order.push("auxiliary");
+        throw new Error("auxiliary write failed");
+      },
+      commitTerminal: () => {
+        order.push("complete");
+        return true;
+      },
+    })).toBe(100);
+
+    expect(order).toEqual(["persist", "auxiliary", "complete", "broadcast"]);
+  });
+
+  test("suppresses response broadcast when durable terminal completion is rejected", () => {
+    const order: string[] = [];
+    const channel = {
+      consumeQueuedFollowupPlaceholder: () => null,
+      storeMessage: () => {
+        order.push("persist");
+        return { id: 100, timestamp: "t", data: {} };
+      },
+    } as unknown as WebChannel;
+    const emitter = {
+      response: () => order.push("broadcast"),
+    } as unknown as AgentEventEmitter;
+
+    const rowId = storeAgentTurn(channel, emitter, {
+      chatJid: "web:default",
+      text: "final response",
+      attachments: [],
+      channelName: "web",
+      threadId: 5,
+      isTerminalAgentReply: true,
+      commitTerminal: () => {
+        order.push("complete-rejected");
+        return false;
+      },
+    });
+
+    expect(rowId).toBeNull();
+    expect(order).toEqual(["persist", "complete-rejected"]);
+  });
+
+  test("completes a durable placeholder before its update while preserving thread association", () => {
+    const { channel, calls } = createMockChannel([50]);
+    const { emitter } = createMockEmitter();
+
+    const rowId = storeAgentTurn(channel, emitter, {
+      chatJid: "web:default",
+      text: "follow-up response",
+      attachments: [],
+      channelName: "web",
+      threadId: 999,
+      isTerminalAgentReply: true,
+      commitTerminal: (persistedRowId) => {
+        calls.push(`complete:${persistedRowId}`);
+        return true;
+      },
+    });
+
+    expect(rowId).toBe(50);
+    expect(calls).toEqual([
+      "consume:web:default:50",
+      "replace:web:default:50:thread=undefined:terminal=0",
+      "complete:50",
+    ]);
   });
 
   test("marks terminal assistant replies when requested", () => {

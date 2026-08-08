@@ -118,7 +118,8 @@ export interface WebChannelLike
     mediaIds: number[],
     contentBlocks: Array<Record<string, unknown>> | undefined,
     threadId?: number,
-    isTerminalAgentReply?: boolean
+    isTerminalAgentReply?: boolean,
+    beforeBroadcast?: (interaction: InteractionRow) => boolean,
   ): InteractionRow | null;
   queuePendingSteering(chatJid: string, timestamp: string | undefined): void;
   consumePendingSteering(chatJid: string): string[];

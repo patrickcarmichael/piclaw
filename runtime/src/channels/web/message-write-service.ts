@@ -119,6 +119,7 @@ export class WebMessageWriteService {
     contentBlocks: Array<Record<string, unknown>> | undefined,
     threadId?: number,
     isTerminalAgentReply?: boolean,
+    beforeBroadcast?: (interaction: InteractionRow) => boolean,
   ): InteractionRow | null {
     return replaceQueuedFollowupPlaceholderMessage(
       chatJid,
@@ -129,6 +130,7 @@ export class WebMessageWriteService {
       threadId,
       this.context,
       isTerminalAgentReply,
+      beforeBroadcast,
     );
   }
 }

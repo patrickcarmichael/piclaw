@@ -167,6 +167,7 @@ export class WebChannelRuntimeFollowupFacadeService {
     contentBlocks: Array<Record<string, unknown>> | undefined,
     threadId?: number,
     isTerminalAgentReply?: boolean,
+    beforeBroadcast?: (interaction: InteractionRow) => boolean,
   ): InteractionRow | null {
     return this.deps.getMessageWriteService().replaceQueuedFollowupPlaceholder(
       chatJid,
@@ -176,6 +177,7 @@ export class WebChannelRuntimeFollowupFacadeService {
       contentBlocks,
       threadId,
       isTerminalAgentReply,
+      beforeBroadcast,
     );
   }
 

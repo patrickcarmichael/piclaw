@@ -29,7 +29,12 @@ import { handleUiThemeCommand } from "../theming/ui-theme-commands.js";
 import { handleUiMetersCommand } from "../ui-meters-commands.js";
 import { getServerUiMetersConfig, setServerUiMetersConfig, setServerUiThemeConfig } from "../ui-state.js";
 import {
+  acceptStoredChatMessageSource,
+  blockChatOperation,
+  claimNextChatOperation,
+  completeChatOperation,
   getChatCursor,
+  getChatOperation,
   getChatPreflight,
   getInflightMessageId,
   getMessageRowIdById,
@@ -37,7 +42,12 @@ import {
   rollbackChatRunWithError,
   rollbackInflightRun,
   rollbackInflightRunForCompactionConflict,
+  resumeChatOperation,
   setChatCursor,
+  waitChatOperation,
+  type ChatOperationOutcome,
+  type ChatOperationOwner,
+  type ChatOperationState,
 } from "../../../db.js";
 import { detectChannel, formatMessages, formatOutbound } from "../../../router.js";
 import { createAgentProfileBuilder } from "../agent/agent-utils.js";
@@ -46,7 +56,7 @@ import { broadcastInteractionUpdated } from "../cards/interaction-service.js";
 import { storeAgentTurn } from "../messaging/agent-message-store.js";
 import { finalizeSuccessfulProcessChatRun, persistIntermediateProcessChatTurn } from "../runtime/process-chat-finalization-runtime.js";
 import { createProcessChatStreamingRuntime } from "../runtime/process-chat-streaming-runtime.js";
-import { runProcessChatPreflight } from "../runtime/process-chat-preflight-runtime.js";
+import { runDurableOperationPreflight, runProcessChatPreflight } from "../runtime/process-chat-preflight-runtime.js";
 import {
   MODEL_COMMAND_TYPES,
   executeDeferredControlCommand,
@@ -72,6 +82,15 @@ import { endTrackedPhase } from "../../../runtime/progress-watchdog.js";
 
 const log = createLogger("web.handlers.agent");
 const TOOL_BUDGET_CONTINUATION_EXTENSION_ID = "piclaw.tool-budget-continuation";
+
+function durableOperationOwner(operation: ChatOperationState): ChatOperationOwner {
+  return {
+    operationId: operation.operationId,
+    sourceSeq: operation.sourceSeq,
+    phase: operation.phase,
+    generation: operation.generation,
+  };
+}
 
 function reserveContinuation(extensionId: string, chatJid: string, threadKey: string): boolean {
   const kv = getExtensionKvStore();
@@ -1335,6 +1354,13 @@ export async function handleAgentMessage(
     }
   }
 
+  // Only the direct browser/API normal-message producer migrates in this PR.
+  // Internal adaptive-card, mention-forward, runtime, command, steer, and queued
+  // follow-up producers remain on their legacy paths.
+  if (new URL(req.url).hostname !== "internal") {
+    acceptStoredChatMessageSource(chatJid, interaction.id);
+  }
+
   // Normal (non-queued) message processing — broadcast to timeline now
   broadcastNewPost();
 
@@ -1367,7 +1393,30 @@ export async function processChat(
   threadRootId?: number,
   browserObservability?: BrowserObservabilityContext,
 ): Promise<void> {
-  const activePreflight = getChatPreflight(chatJid);
+  const operationClaim = claimNextChatOperation(chatJid);
+  let durableOperation = operationClaim.status === "claimed" || operationClaim.status === "existing"
+    ? operationClaim.operation
+    : null;
+  const durableSource = operationClaim.status === "claimed" || operationClaim.status === "existing"
+    ? operationClaim.source
+    : null;
+  if (durableOperation && durableSource?.sourceKind !== "message") {
+    log.warn("Durable operation consumer refused a non-message source", {
+      operation: "process_chat.operation_source_not_supported",
+      chatJid,
+      sourceKind: durableSource?.sourceKind ?? null,
+      sourceSeq: durableSource?.sourceSeq ?? null,
+    });
+    return;
+  }
+  if (durableOperation?.phase === "waiting") {
+    const resumed = resumeChatOperation(chatJid, durableOperationOwner(durableOperation));
+    if (resumed.status !== "applied") return;
+    durableOperation = resumed.operation;
+  }
+  if (durableOperation?.phase === "blocked" || durableOperation?.cancellation) return;
+
+  const activePreflight = durableOperation ? null : getChatPreflight(chatJid);
   if (activePreflight) {
     log.info("Deferring chat processor to active preflight owner", {
       operation: "process_chat.preflight_owned",
@@ -1386,6 +1435,7 @@ export async function processChat(
   });
 
   if (selection.kind === "no_messages") {
+    if (durableOperation) blockChatOperation(chatJid, durableOperationOwner(durableOperation));
     log.info("processChat found no pending messages", {
       operation: "process_chat.no_pending_messages",
       chatJid,
@@ -1422,12 +1472,26 @@ export async function processChat(
     return;
   }
 
-  const {
-    pendingMessages: messages,
-    currentMessage,
-    messageThreadId,
-    effectiveThreadRootId,
-  } = selection;
+  const messages = selection.pendingMessages;
+  let currentMessage = selection.currentMessage;
+  let messageThreadId = selection.messageThreadId;
+  let effectiveThreadRootId = selection.effectiveThreadRootId;
+  if (durableSource && currentMessage.id !== durableSource.sourceId) {
+    const claimedMessage = messages.find((message) => message.id === durableSource.sourceId);
+    if (!claimedMessage) {
+      blockChatOperation(chatJid, durableOperationOwner(durableOperation!));
+      log.error("Claimed durable source is not selectable from persisted messages", {
+        operation: "process_chat.operation_source_missing",
+        chatJid,
+        sourceSeq: durableSource.sourceSeq,
+        sourceId: durableSource.sourceId,
+      });
+      return;
+    }
+    currentMessage = claimedMessage;
+    messageThreadId = currentMessage.thread_id ?? null;
+    effectiveThreadRootId = messageThreadId ?? threadRootId ?? null;
+  }
 
   log.info("processChat selected next pending message", {
     operation: "process_chat.select_message",
@@ -1490,18 +1554,90 @@ export async function processChat(
   let intermediatePersistFailed = false;
   const resolvedThreadRootId = resolveThreadRootId(channel, chatJid, currentMessage.id ?? "", effectiveThreadRootId);
 
-  const preflight = await runProcessChatPreflight({
-    channel, chatJid, agentId, message: { id: lastMessage.id, timestamp: lastMessage.timestamp }, prevCursor, effectiveThreadRootId: effectiveThreadRootId ?? null, turnId, runStartedAt, browserObservability,
-    streamingHandler: trackedStreamingHandler, compactionState: streamState,
-    enqueueResume: (root) => enqueueProcessChatAfterCompaction(channel, chatJid, agentId, lastMessage.id, root, browserObservability),
-  });
-  if (preflight === "deferred") return;
+  if (durableOperation) {
+    const preflight = await runDurableOperationPreflight({
+      channel, chatJid, agentId, message: { id: lastMessage.id, timestamp: lastMessage.timestamp },
+      operation: durableOperation, effectiveThreadRootId: effectiveThreadRootId ?? null,
+      turnId, browserObservability, streamingHandler: trackedStreamingHandler, compactionState: streamState,
+      enqueueResume: (root) => enqueueProcessChatAfterCompaction(channel, chatJid, agentId, lastMessage.id, root, browserObservability),
+    });
+    if (preflight.status === "deferred") return;
+    durableOperation = preflight.operation;
+  } else {
+    const preflight = await runProcessChatPreflight({
+      channel, chatJid, agentId, message: { id: lastMessage.id, timestamp: lastMessage.timestamp }, prevCursor, effectiveThreadRootId: effectiveThreadRootId ?? null, turnId, runStartedAt, browserObservability,
+      streamingHandler: trackedStreamingHandler, compactionState: streamState,
+      enqueueResume: (root) => enqueueProcessChatAfterCompaction(channel, chatJid, agentId, lastMessage.id, root, browserObservability),
+    });
+    if (preflight === "deferred") return;
+  }
 
   let shouldRemoveStaleProtectedContinuation = false;
+  let durableOperationCompleted = false;
+  const blockFailedRun = (failed: Parameters<typeof rollbackChatRunWithError>[1]): void => {
+    if (!durableOperation) {
+      rollbackChatRunWithError(chatJid, failed);
+      return;
+    }
+    const current = getChatOperation(chatJid);
+    if (!current || current.operationId !== durableOperation.operationId) return;
+    const blocked = blockChatOperation(chatJid, durableOperationOwner(current));
+    if (blocked.status === "applied") durableOperation = blocked.operation;
+  };
+  const deferDurableRetry = (legacyRollback: () => void): void => {
+    if (!durableOperation) {
+      legacyRollback();
+      return;
+    }
+    const current = getChatOperation(chatJid);
+    if (!current || current.operationId !== durableOperation.operationId) return;
+    const waiting = waitChatOperation(chatJid, durableOperationOwner(current));
+    if (waiting.status === "applied") durableOperation = waiting.operation;
+  };
+  const commitDurableTerminal = (
+    rowId: number,
+    outcome: ChatOperationOutcome,
+    cause: string,
+    provenance: string,
+  ): boolean => {
+    if (!durableOperation) return true;
+    const message = getDb().prepare("SELECT id FROM messages WHERE chat_jid = ? AND rowid = ?")
+      .get(chatJid, rowId) as { id: string } | undefined;
+    if (!message) return false;
+    try {
+      const completed = completeChatOperation(chatJid, {
+        owner: durableOperationOwner(durableOperation),
+        outcome,
+        cause,
+        provenance,
+        createdAt: new Date().toISOString(),
+        artifact: { messageId: message.id },
+      });
+      durableOperationCompleted = completed.status === "completed" || completed.status === "repeated";
+      return durableOperationCompleted;
+    } catch (error) {
+      log.error("Durable terminal completion failed after message persistence", {
+        operation: "process_chat.operation_completion_failed",
+        chatJid,
+        operationId: durableOperation.operationId,
+        sourceSeq: durableOperation.sourceSeq,
+        rowId,
+        err: error,
+      });
+      return false;
+    }
+  };
   const persistTerminalOutcome = (
     text: string,
     marker: Record<string, unknown> | null,
-    options: { critical?: boolean; additionalBlocks?: Array<Record<string, unknown>>; usage?: unknown } = {},
+    options: {
+      critical?: boolean;
+      additionalBlocks?: Array<Record<string, unknown>>;
+      usage?: unknown;
+      outcome?: ChatOperationOutcome;
+      cause?: string;
+      provenance?: string;
+    } = {},
   ) => {
     // Capture thinking BEFORE broadcast via onMessageStored callback so a
     // fast client receiving the SSE agent_response event can immediately
@@ -1524,12 +1660,25 @@ export async function processChat(
         ...streamRuntime.buildThinkingRefBlocks(),
       ],
       onMessageStored: streamRuntime.persistThinkingForRow,
+      commitTerminal: durableOperation
+        ? (rowId) => commitDurableTerminal(
+            rowId,
+            options.outcome ?? "succeeded",
+            options.cause ?? "agent_completed",
+            options.provenance ?? "web_process_chat",
+          )
+        : undefined,
     });
   };
   const persistVisibleFailureOutcome = (
     markerBase: Record<string, unknown>,
     detail?: string,
-    options: { requireDraft?: boolean } = {},
+    options: {
+      requireDraft?: boolean;
+      outcome?: ChatOperationOutcome;
+      cause?: string;
+      provenance?: string;
+    } = {},
   ) => {
     const draft = channel.getBuffer(turnId, "draft");
     const draftText = typeof draft?.text === "string" ? draft.text.trim() : "";
@@ -1560,7 +1709,11 @@ export async function processChat(
       showDiagnosticWithoutDraft,
     });
 
-    return persistTerminalOutcome(text, marker);
+    return persistTerminalOutcome(text, marker, {
+      outcome: options.outcome ?? "failed",
+      cause: options.cause ?? (markerClassifier || markerKind || markerType || "agent_failure"),
+      provenance: options.provenance ?? "web_process_chat_failure",
+    });
   };
 
   const publishDraftFallback = (
@@ -1622,16 +1775,29 @@ export async function processChat(
     return persistVisibleFailureOutcome(markerBase, reason === "timeout" ? detail : undefined, options);
   };
 
-  const finalizeSuccessfulRun = async () => finalizeSuccessfulProcessChatRun({
-    channel,
-    emitter: trackedEmitter,
-    chatJid,
-    agentId,
-    turnId,
-    threadId,
-    prevCursor,
-    recovery: streamState.lastRecoveryMeta,
-  });
+  const finalizeSuccessfulRun = async (): Promise<void> => {
+    if (durableOperation && !durableOperationCompleted) {
+      blockFailedRun({
+        prevTs: prevCursor,
+        failedTs: lastMessage.timestamp,
+        messageId: lastMessage.id,
+        threadRootId: resolvedThreadRootId ?? null,
+        createdAt: new Date().toISOString(),
+      });
+      return;
+    }
+    await finalizeSuccessfulProcessChatRun({
+      channel,
+      emitter: trackedEmitter,
+      chatJid,
+      agentId,
+      turnId,
+      threadId,
+      prevCursor,
+      recovery: streamState.lastRecoveryMeta,
+      durableOperationCompleted,
+    });
+  };
 
   const output = await channel.agentPool.runAgent(prompt, chatJid, {
     timeoutMs,
@@ -1713,12 +1879,21 @@ export async function processChat(
       draftRecovered: Boolean(toolCompleteDraftText),
     });
     const persisted = toolCompleteDraftText
-      ? persistTerminalOutcome(toolCompleteDraftText, marker, { usage: output.usage })
-      : persistVisibleFailureOutcome(marker);
+      ? persistTerminalOutcome(toolCompleteDraftText, marker, {
+          usage: output.usage,
+          outcome: "tool_complete",
+          cause: "provider_tool_complete",
+          provenance: "web_process_chat",
+        })
+      : persistVisibleFailureOutcome(marker, undefined, {
+          outcome: "tool_complete",
+          cause: "provider_tool_complete",
+          provenance: "web_process_chat",
+        });
     if (persisted) {
       await finalizeSuccessfulRun();
     } else {
-      rollbackChatRunWithError(chatJid, {
+      blockFailedRun({
         prevTs: prevCursor,
         failedTs: lastMessage.timestamp,
         messageId: lastMessage.id,
@@ -1738,10 +1913,10 @@ export async function processChat(
       // This processor does not own the SDK's active physical compaction.
       // Preserve that compaction marker and leave the message pending; the
       // owning preflight completion queues the one authoritative resume.
-      rollbackInflightRunForCompactionConflict(chatJid, prevCursor, {
+      deferDurableRetry(() => rollbackInflightRunForCompactionConflict(chatJid, prevCursor, {
         messageId: lastMessage.id,
         startedAt: runStartedAt,
-      });
+      }));
       log.info("Deferred prompt while another physical compaction is active", {
         operation: "process_chat.compaction_in_progress",
         chatJid,
@@ -1752,10 +1927,9 @@ export async function processChat(
     }
 
     if (output.failureCategory === "already_processing") {
-      // A concurrent run is already handling this chat. Roll back the cursor
-      // we advanced so this message stays pending, then throw so the queue
-      // retries after backoff.
-      rollbackInflightRun(chatJid, prevCursor);
+      // A concurrent run is already handling this chat. Preserve durable
+      // ownership in waiting so the queue retry resumes the same operation.
+      deferDurableRetry(() => rollbackInflightRun(chatJid, prevCursor));
       trackedEmitter.status(buildRetryStatusPayload({
         threadId,
         agentId,
@@ -1767,8 +1941,8 @@ export async function processChat(
 
     if (output.failureCategory === "provider_unavailable") {
       // Extension/provider registration races can happen right after restart.
-      // Keep the message pending and let the queue retry automatically.
-      rollbackInflightRun(chatJid, prevCursor);
+      // Keep the same durable operation pending for the queue retry.
+      deferDurableRetry(() => rollbackInflightRun(chatJid, prevCursor));
       trackedEmitter.status(buildRetryStatusPayload({
         threadId,
         agentId,
@@ -1861,7 +2035,7 @@ export async function processChat(
       if (persisted) {
         await finalizeSuccessfulRun();
       } else {
-        rollbackChatRunWithError(chatJid, {
+        blockFailedRun({
           prevTs: prevCursor,
           failedTs: lastMessage.timestamp,
           messageId: lastMessage.id,
@@ -1895,7 +2069,7 @@ export async function processChat(
       queueToolBudgetContinuation();
       await finalizeSuccessfulRun();
     } else {
-      rollbackChatRunWithError(chatJid, {
+      blockFailedRun({
         prevTs: prevCursor,
         failedTs: lastMessage.timestamp,
         messageId: lastMessage.id,
@@ -1946,18 +2120,21 @@ export async function processChat(
           ...streamRuntime.buildThinkingRefBlocks(),
         ],
         onMessageStored: streamRuntime.persistThinkingForRow,
+        commitTerminal: durableOperation
+          ? (rowId) => commitDurableTerminal(rowId, "succeeded", "agent_completed", "web_process_chat")
+          : undefined,
       })
     : hasDraftFallback
       ? publishDraftFallback("empty-final")
       : persistedIntermediateOutput
-        ? true
+        ? (durableOperation ? publishDraftFallback("empty-final") : true)
         : publishDraftFallback("empty-final");
 
   if (!finalized && hasOutput) {
     // The agent produced output but terminal persistence failed.
     // Hold the user turn for an explicit retry/skip decision.
     const errorText = "Agent completed but terminal response could not be persisted.";
-    rollbackChatRunWithError(chatJid, {
+    blockFailedRun({
       prevTs: prevCursor,
       failedTs: lastMessage.timestamp,
       messageId: lastMessage.id,
@@ -1985,7 +2162,7 @@ export async function processChat(
 
     if (hadIntermediateOutput && intermediatePersistFailed) {
       const errorText = "Agent produced intermediate output but it could not be persisted.";
-      rollbackChatRunWithError(chatJid, {
+      blockFailedRun({
         prevTs: prevCursor,
         failedTs: lastMessage.timestamp,
         messageId: lastMessage.id,
@@ -2008,7 +2185,7 @@ export async function processChat(
     const hadDraft = !!(typeof draft?.text === "string" && draft.text.trim());
     if (hadDraft) {
       const errorText = "Agent completed but draft response could not be persisted.";
-      rollbackChatRunWithError(chatJid, {
+      blockFailedRun({
         prevTs: prevCursor,
         failedTs: lastMessage.timestamp,
         messageId: lastMessage.id,
@@ -2075,7 +2252,7 @@ export async function processChat(
       if (persisted) {
         await finalizeSuccessfulRun();
       } else {
-        rollbackChatRunWithError(chatJid, {
+        blockFailedRun({
           prevTs: prevCursor,
           failedTs: lastMessage.timestamp,
           messageId: lastMessage.id,
@@ -2123,7 +2300,7 @@ export async function processChat(
     if (persisted) {
       await finalizeSuccessfulRun();
     } else {
-      rollbackChatRunWithError(chatJid, {
+      blockFailedRun({
         prevTs: prevCursor,
         failedTs: lastMessage.timestamp,
         messageId: lastMessage.id,

@@ -257,6 +257,18 @@ export function registerAcceptedChatSource(input: {
   return { status: result.changes > 0 ? "registered" : "existing", source };
 }
 
+export function acceptStoredChatMessageSource(chatJid: string, messageRowId: number): { status: "registered" | "existing"; source: AcceptedChatSource } {
+  const db = getDb();
+  return db.transaction(() => {
+    const message = db.prepare("SELECT id, timestamp FROM messages WHERE chat_jid = ? AND rowid = ?")
+      .get(chatJid, messageRowId) as { id: string; timestamp: string } | undefined;
+    if (!message) throw new ChatOperationInvariantError("Accepted web message row is missing");
+    return registerAcceptedChatSource({ chatJid, sourceClass: "prompt", sourceKind: "message",
+      sourceId: message.id, acceptedAt: message.timestamp, payloadRef: `message:${message.id}`,
+      frontier: { messageId: message.id, cursorTs: message.timestamp } });
+  }).immediate();
+}
+
 export function storeAcceptedChatMessageSource(message: NewMessage, acceptedAt = message.timestamp): { status: "registered" | "existing"; source: AcceptedChatSource } {
   const db = getDb();
   return db.transaction(() => {
