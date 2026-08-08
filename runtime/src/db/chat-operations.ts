@@ -91,6 +91,10 @@ export type ChatOperationCompletionResult =
   | { status: "completed" | "repeated"; disposition: ChatOperationDisposition }
   | { status: "rejected"; reason: ChatOperationMismatch | "cancelled_outcome_required" | "cancellation_required"; operation: ChatOperationState | null };
 
+export type ChatOperationMessageBindResult =
+  | { status: "bound" }
+  | { status: "rejected"; reason: ChatOperationMismatch | "message_missing" | "message_operation_mismatch" };
+
 export type ChatOperationCompletionBoundary = "artifact" | "intents" | "disposition" | "cursor" | "release";
 export interface ChatOperationCompletionHooks { afterWrite?(boundary: ChatOperationCompletionBoundary): void }
 
@@ -448,6 +452,39 @@ export const waitChatOperation = (chatJid: string, owner: ChatOperationOwner) =>
 export const resumeChatOperation = (chatJid: string, owner: ChatOperationOwner) => applyTransition(chatJid, owner, "running");
 export const blockChatOperation = (chatJid: string, owner: ChatOperationOwner) => applyTransition(chatJid, owner, "blocked");
 export const retryBlockedChatOperation = (chatJid: string, owner: ChatOperationOwner) => applyTransition(chatJid, owner, "pending");
+
+/** Bind a non-terminal bot artifact to the exact active owner without advancing or releasing it. */
+export function bindChatOperationMessage(
+  chatJid: string,
+  messageRowId: number,
+  expected: ChatOperationOwner,
+): ChatOperationMessageBindResult {
+  const db = getDb();
+  const current = getChatOperation(chatJid);
+  const comparison = compareChatOperationOwner(current, expected);
+  if (!comparison.ok) return { status: "rejected", reason: comparison.reason };
+  const message = db.prepare(`SELECT operation_id, is_bot_message FROM messages WHERE chat_jid = ? AND rowid = ?`)
+    .get(chatJid, messageRowId) as { operation_id: string | null; is_bot_message: number } | undefined;
+  if (!message || message.is_bot_message !== 1) return { status: "rejected", reason: "message_missing" };
+  if (message.operation_id && message.operation_id !== expected.operationId) {
+    return { status: "rejected", reason: "message_operation_mismatch" };
+  }
+  db.prepare(`UPDATE messages SET operation_id = ?
+    WHERE chat_jid = ? AND rowid = ? AND (operation_id IS NULL OR operation_id = ?)
+      AND EXISTS (
+        SELECT 1 FROM chat_cursors cursor
+        WHERE cursor.chat_jid = ? AND cursor.operation_id = ? AND cursor.operation_source_seq = ?
+          AND cursor.operation_phase = ? AND cursor.operation_generation = ?
+      )`).run(expected.operationId, chatJid, messageRowId, expected.operationId, chatJid,
+      expected.operationId, expected.sourceSeq, expected.phase, expected.generation);
+  const bound = db.prepare(`SELECT operation_id FROM messages WHERE chat_jid = ? AND rowid = ?`)
+    .get(chatJid, messageRowId) as { operation_id: string | null } | undefined;
+  if (bound?.operation_id === expected.operationId && compareChatOperationOwner(getChatOperation(chatJid), expected).ok) {
+    return { status: "bound" };
+  }
+  const observed = compareChatOperationOwner(getChatOperation(chatJid), expected);
+  return { status: "rejected", reason: observed.ok ? "message_operation_mismatch" : observed.reason };
+}
 
 export function cancelChatOperation(chatJid: string, expected: ChatOperationOwner, cancellation: ChatOperationCancellation): ChatOperationCancelResult {
   const current = getChatOperation(chatJid);

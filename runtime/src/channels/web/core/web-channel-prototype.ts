@@ -207,11 +207,17 @@ export function installWebChannelPrototype(
       value: withRuntimePublicSurface((service, chatJid: string, item: QueuedFollowupItem): boolean =>
         service.replaceQueuedFollowupItem(chatJid, item)),
     },
-    consumeQueuedFollowupPlaceholder: {
+    peekQueuedFollowupPlaceholder: {
       configurable: true,
       writable: true,
       value: withRuntimePublicSurface((service, chatJid: string): number | null =>
-        service.consumeQueuedFollowupPlaceholder(chatJid)),
+        service.peekQueuedFollowupPlaceholder(chatJid)),
+    },
+    consumeQueuedFollowupPlaceholder: {
+      configurable: true,
+      writable: true,
+      value: withRuntimePublicSurface((service, chatJid: string, expectedRowId?: number): number | null =>
+        service.consumeQueuedFollowupPlaceholder(chatJid, expectedRowId)),
     },
     getQueuedFollowupCount: {
       configurable: true,

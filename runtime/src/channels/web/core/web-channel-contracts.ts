@@ -110,7 +110,8 @@ export interface WebChannelLike
   consumeQueuedFollowupItem(chatJid: string): QueuedFollowupItem | null;
   prependQueuedFollowupItem(chatJid: string, item: QueuedFollowupItem): void;
   replaceQueuedFollowupItem(chatJid: string, item: QueuedFollowupItem): boolean;
-  consumeQueuedFollowupPlaceholder(chatJid: string): number | null;
+  peekQueuedFollowupPlaceholder(chatJid: string): number | null;
+  consumeQueuedFollowupPlaceholder(chatJid: string, expectedRowId?: number): number | null;
   replaceQueuedFollowupPlaceholder(
     chatJid: string,
     rowId: number,

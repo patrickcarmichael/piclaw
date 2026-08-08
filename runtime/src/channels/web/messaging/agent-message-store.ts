@@ -11,13 +11,15 @@
 import type { WebChannelLike } from "../core/web-channel-contracts.js";
 import type { AttachmentInfo } from "../../../agent-pool/attachments.js";
 import type { AgentEventEmitter } from "../sse/agent-events.js";
-import { getDb, type InteractionRow } from "../../../db.js";
+import { bindChatOperationMessage, getDb, type ChatOperationOwner, type InteractionRow } from "../../../db.js";
 import { formatOutbound, type ChatChannel } from "../../../router.js";
 import { createLogger, debugSuppressedError } from "../../../utils/logger.js";
 import { sendStoredAgentReplyWebPushNotification } from "../push/web-push-service.js";
 
 const log = createLogger("web.agent-message-store");
 const TERMINAL_COMPLETION_REJECTED = Symbol("terminal-completion-rejected");
+const OPERATION_BINDING_REJECTED = Symbol("operation-binding-rejected");
+const PLACEHOLDER_COMMIT_REJECTED = Symbol("placeholder-commit-rejected");
 const SVG_SOURCE_HINT = /(?:<svg[\s>]|&lt;svg[\s>]|&amp;lt;svg[\s>])/i;
 
 function buildAttachmentBlocks(attachments: AttachmentInfo[]): {
@@ -46,6 +48,19 @@ function dispatchStoredReplyWebPush(
       rowId: interaction.id,
     });
   });
+}
+
+function bindStoredMessageToOperation(chatJid: string, rowId: number, owner: ChatOperationOwner): void {
+  const result = bindChatOperationMessage(chatJid, rowId, owner);
+  if (result.status === "bound") return;
+  log.warn("Durable intermediate message binding lost operation ownership", {
+    operation: "web.agent_message_store.operation_binding_rejected",
+    chatJid,
+    rowId,
+    expectedOwner: owner,
+    reason: result.reason,
+  });
+  throw OPERATION_BINDING_REJECTED;
 }
 
 function maybeWarnOnEscapedSvgSource(
@@ -106,6 +121,8 @@ export function storeAgentTurn(
     skipPlaceholder?: boolean;
     /** True only for the terminal persisted assistant message of a run. */
     isTerminalAgentReply?: boolean;
+    /** Exact active owner bound atomically to a non-terminal durable message. */
+    operationOwner?: ChatOperationOwner;
     /** Atomically remove stale protected handoff intent with terminal insert. */
     removeProtectedContinuationForSourceMessageId?: string | null;
     extraContentBlocks?: Array<Record<string, unknown>>;
@@ -143,7 +160,11 @@ export function storeAgentTurn(
   };
 
   if (!params.skipPlaceholder) {
-    const placeholderId = channel.consumeQueuedFollowupPlaceholder(params.chatJid);
+    // Operation-bound output peeks first so stale-owner rejection cannot
+    // destructively shift the in-memory placeholder queue before SQLite CAS.
+    const placeholderId = params.operationOwner || params.commitTerminal
+      ? channel.peekQueuedFollowupPlaceholder(params.chatJid)
+      : channel.consumeQueuedFollowupPlaceholder(params.chatJid);
     if (placeholderId) {
       // Don't override the placeholder's thread_id — it was set correctly
       // when the /queue command created the placeholder (threaded under the
@@ -167,7 +188,32 @@ export function storeAgentTurn(
             const resolvedRowId = typeof stored.id === "number" ? stored.id : placeholderId;
             safeOnStored(resolvedRowId);
             if (!params.commitTerminal!(resolvedRowId)) throw TERMINAL_COMPLETION_REJECTED;
+            if (channel.consumeQueuedFollowupPlaceholder(params.chatJid, placeholderId) !== placeholderId) {
+              throw PLACEHOLDER_COMMIT_REJECTED;
+            }
             (stored.data as unknown as Record<string, unknown>).is_terminal_agent_reply = true;
+            return stored;
+          }).immediate();
+        } else if (params.operationOwner) {
+          updated = getDb().transaction(() => {
+            const stored = channel.replaceQueuedFollowupPlaceholder(
+              params.chatJid,
+              placeholderId,
+              formatted,
+              mediaIds,
+              mergedContentBlocks.length > 0 ? mergedContentBlocks : undefined,
+              undefined,
+              params.isTerminalAgentReply,
+              undefined,
+              true,
+            );
+            if (!stored) return null;
+            const resolvedRowId = typeof stored.id === "number" ? stored.id : placeholderId;
+            safeOnStored(resolvedRowId);
+            bindStoredMessageToOperation(params.chatJid, resolvedRowId, params.operationOwner!);
+            if (channel.consumeQueuedFollowupPlaceholder(params.chatJid, placeholderId) !== placeholderId) {
+              throw PLACEHOLDER_COMMIT_REJECTED;
+            }
             return stored;
           }).immediate();
         } else {
@@ -189,11 +235,12 @@ export function storeAgentTurn(
           );
         }
       } catch (error) {
-        if (error === TERMINAL_COMPLETION_REJECTED) return null;
+        if (error === TERMINAL_COMPLETION_REJECTED || error === OPERATION_BINDING_REJECTED
+          || error === PLACEHOLDER_COMMIT_REJECTED) return null;
         throw error;
       }
       if (updated) {
-        if (params.commitTerminal) channel.broadcastQueuedFollowupPlaceholderUpdate(updated);
+        if (params.commitTerminal || params.operationOwner) channel.broadcastQueuedFollowupPlaceholderUpdate(updated);
         const resolvedRowId = typeof updated.id === "number" ? updated.id : placeholderId;
         channel.broadcastEvent?.("agent_followup_consumed", {
           chat_jid: params.chatJid,
@@ -226,6 +273,19 @@ export function storeAgentTurn(
         (stored.data as unknown as Record<string, unknown>).is_terminal_agent_reply = true;
         return stored;
       }).immediate();
+    } else if (params.operationOwner) {
+      interaction = getDb().transaction(() => {
+        const stored = channel.storeMessage(params.chatJid, formatted, true, mediaIds, {
+          contentBlocks: mergedContentBlocks.length > 0 ? mergedContentBlocks : undefined,
+          threadId: resolvedThreadId,
+          isTerminalAgentReply: params.isTerminalAgentReply,
+          removeProtectedContinuationForSourceMessageId: params.removeProtectedContinuationForSourceMessageId,
+        });
+        if (!stored || typeof stored.id !== "number") return null;
+        safeOnStored(stored.id);
+        bindStoredMessageToOperation(params.chatJid, stored.id, params.operationOwner!);
+        return stored;
+      }).immediate();
     } else {
       interaction = channel.storeMessage(params.chatJid, formatted, true, mediaIds, {
         contentBlocks: mergedContentBlocks.length > 0 ? mergedContentBlocks : undefined,
@@ -236,7 +296,7 @@ export function storeAgentTurn(
       if (interaction && typeof interaction.id === "number") safeOnStored(interaction.id);
     }
   } catch (error) {
-    if (error === TERMINAL_COMPLETION_REJECTED) return null;
+    if (error === TERMINAL_COMPLETION_REJECTED || error === OPERATION_BINDING_REJECTED) return null;
     throw error;
   }
   if (!interaction) return null;

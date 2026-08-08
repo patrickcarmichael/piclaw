@@ -63,7 +63,12 @@ export class QueuedFollowupLifecycleService {
     this.placeholderStore.enqueue(chatJid, rowId, queuedContent, threadId, queuedAt, extras);
   }
 
-  consumeQueuedFollowupPlaceholder(chatJid: string): number | null {
+  peekQueuedFollowupPlaceholder(chatJid: string): number | null {
+    return this.placeholderStore.peek(chatJid)[0]?.rowId ?? null;
+  }
+
+  consumeQueuedFollowupPlaceholder(chatJid: string, expectedRowId?: number): number | null {
+    if (expectedRowId !== undefined && this.peekQueuedFollowupPlaceholder(chatJid) !== expectedRowId) return null;
     return this.placeholderStore.consume(chatJid);
   }
 

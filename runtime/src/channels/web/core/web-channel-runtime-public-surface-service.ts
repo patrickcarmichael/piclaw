@@ -16,6 +16,7 @@ type WebChannelRuntimePublicSurfaceFollowupFacade = Pick<
   | "consumeQueuedFollowupItem"
   | "prependQueuedFollowupItem"
   | "replaceQueuedFollowupItem"
+  | "peekQueuedFollowupPlaceholder"
   | "consumeQueuedFollowupPlaceholder"
   | "getQueuedFollowupCount"
   | "getQueuedFollowupItems"
@@ -465,8 +466,12 @@ export class WebChannelRuntimePublicSurfaceService {
     return this.channel.runtimeFollowupFacade.replaceQueuedFollowupItem(chatJid, item);
   }
 
-  consumeQueuedFollowupPlaceholder(chatJid: string): number | null {
-    return this.channel.runtimeFollowupFacade.consumeQueuedFollowupPlaceholder(chatJid);
+  peekQueuedFollowupPlaceholder(chatJid: string): number | null {
+    return this.channel.runtimeFollowupFacade.peekQueuedFollowupPlaceholder(chatJid);
+  }
+
+  consumeQueuedFollowupPlaceholder(chatJid: string, expectedRowId?: number): number | null {
+    return this.channel.runtimeFollowupFacade.consumeQueuedFollowupPlaceholder(chatJid, expectedRowId);
   }
 
   getQueuedFollowupCount(chatJid: string): number {

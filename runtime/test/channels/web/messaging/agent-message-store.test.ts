@@ -24,7 +24,9 @@ function createMockChannel(placeholderIds: number[] = []) {
   return {
     calls,
     channel: {
-      consumeQueuedFollowupPlaceholder: (chatJid: string) => {
+      peekQueuedFollowupPlaceholder: () => queue[0] ?? null,
+      consumeQueuedFollowupPlaceholder: (chatJid: string, expectedRowId?: number) => {
+        if (expectedRowId !== undefined && queue[0] !== expectedRowId) return null;
         const next = queue.shift() ?? null;
         if (next) calls.push(`consume:${chatJid}:${next}`);
         return next;
@@ -190,6 +192,7 @@ describe("storeAgentTurn", () => {
     const order: string[] = [];
     const interaction = { id: 100, timestamp: "t", data: {} as Record<string, unknown> };
     const channel = {
+      peekQueuedFollowupPlaceholder: () => null,
       consumeQueuedFollowupPlaceholder: () => null,
       storeMessage: (_chatJid: string, _content: string, _isBot: boolean, _mediaIds: number[], options: { isTerminalAgentReply?: boolean }) => {
         order.push(`persist:terminal=${options.isTerminalAgentReply ? 1 : 0}`);
@@ -221,6 +224,7 @@ describe("storeAgentTurn", () => {
   test("does not let an auxiliary stored callback prevent durable completion or broadcast", () => {
     const order: string[] = [];
     const channel = {
+      peekQueuedFollowupPlaceholder: () => null,
       consumeQueuedFollowupPlaceholder: () => null,
       storeMessage: () => {
         order.push("persist");
@@ -254,6 +258,7 @@ describe("storeAgentTurn", () => {
   test("suppresses response broadcast when durable terminal completion is rejected", () => {
     const order: string[] = [];
     const channel = {
+      peekQueuedFollowupPlaceholder: () => null,
       consumeQueuedFollowupPlaceholder: () => null,
       storeMessage: () => {
         order.push("persist");
@@ -300,11 +305,151 @@ describe("storeAgentTurn", () => {
 
     expect(rowId).toBe(50);
     expect(calls).toEqual([
-      "consume:web:default:50",
       "replace:web:default:50:thread=undefined:terminal=0",
       "complete:50",
+      "consume:web:default:50",
       "updated:50",
     ]);
+  });
+
+  test("atomically binds durable intermediate rows and rolls back stale-owner inserts", () => {
+    const chatJid = `web:intermediate-binding-${crypto.randomUUID()}`;
+    storeAcceptedChatMessageSource({
+      id: `source-${crypto.randomUUID()}`,
+      chat_jid: chatJid,
+      sender: "user",
+      sender_name: "User",
+      content: "prompt",
+      timestamp: "2026-01-01T00:00:01.000Z",
+    });
+    const claim = claimNextChatOperation(chatJid);
+    if (claim.status !== "claimed") throw new Error("expected claim");
+    const preflight = promoteChatOperation(chatJid, {
+      operationId: claim.operation.operationId,
+      sourceSeq: claim.operation.sourceSeq,
+      phase: claim.operation.phase,
+      generation: claim.operation.generation,
+    }, "preflight");
+    if (preflight.status !== "applied") throw new Error("expected preflight");
+    const running = promoteChatOperation(chatJid, {
+      operationId: preflight.operation.operationId,
+      sourceSeq: preflight.operation.sourceSeq,
+      phase: preflight.operation.phase,
+      generation: preflight.operation.generation,
+    }, "running");
+    if (running.status !== "applied") throw new Error("expected running");
+    const exactOwner = {
+      operationId: running.operation.operationId,
+      sourceSeq: running.operation.sourceSeq,
+      phase: running.operation.phase,
+      generation: running.operation.generation,
+    } as const;
+    const channel = {
+      peekQueuedFollowupPlaceholder: () => null,
+      consumeQueuedFollowupPlaceholder: () => null,
+      storeMessage: (targetChatJid: string, content: string) => {
+        const rowId = storeDbMessage({
+          id: `intermediate-${crypto.randomUUID()}`,
+          chat_jid: targetChatJid,
+          sender: "agent",
+          sender_name: "Agent",
+          content,
+          timestamp: new Date().toISOString(),
+          is_bot_message: true,
+        });
+        return getMessageByRowId(targetChatJid, rowId)!;
+      },
+    } as unknown as WebChannel;
+    const emitter = { response: () => {} } as unknown as AgentEventEmitter;
+
+    const rowId = storeAgentTurn(channel, emitter, {
+      chatJid,
+      text: "owned intermediate",
+      attachments: [],
+      channelName: "web",
+      threadId: null,
+      operationOwner: exactOwner,
+    });
+    expect(rowId).toBeNumber();
+    expect(getDb().prepare("SELECT operation_id, is_terminal_agent_reply FROM messages WHERE rowid = ?")
+      .get(rowId!)).toEqual({ operation_id: exactOwner.operationId, is_terminal_agent_reply: 0 });
+
+    expect(storeAgentTurn(channel, emitter, {
+      chatJid,
+      text: "stale intermediate",
+      attachments: [],
+      channelName: "web",
+      threadId: null,
+      operationOwner: { ...exactOwner, generation: exactOwner.generation - 1 },
+    })).toBeNull();
+    expect(getDb().prepare("SELECT COUNT(*) AS count FROM messages WHERE chat_jid = ? AND is_bot_message = 1")
+      .get(chatJid)).toEqual({ count: 1 });
+
+    const placeholderRowId = storeDbMessage({
+      id: `placeholder-${crypto.randomUUID()}`,
+      chat_jid: chatJid,
+      sender: "agent",
+      sender_name: "Agent",
+      content: "Queued placeholder",
+      timestamp: new Date().toISOString(),
+      is_bot_message: true,
+    });
+    const placeholderQueue = [placeholderRowId];
+    const placeholderChannel = {
+      peekQueuedFollowupPlaceholder: () => placeholderQueue[0] ?? null,
+      consumeQueuedFollowupPlaceholder: (_jid: string, expectedRowId?: number) => {
+        if (expectedRowId !== undefined && placeholderQueue[0] !== expectedRowId) return null;
+        return placeholderQueue.shift() ?? null;
+      },
+      replaceQueuedFollowupPlaceholder: (targetChatJid: string, targetRowId: number, text: string) => {
+        getDb().prepare("UPDATE messages SET content = ? WHERE chat_jid = ? AND rowid = ?")
+          .run(text, targetChatJid, targetRowId);
+        return getMessageByRowId(targetChatJid, targetRowId) ?? null;
+      },
+      broadcastQueuedFollowupPlaceholderUpdate: () => {},
+    } as unknown as WebChannel;
+
+    expect(storeAgentTurn(placeholderChannel, emitter, {
+      chatJid,
+      text: "stale placeholder replacement",
+      attachments: [],
+      channelName: "web",
+      threadId: null,
+      operationOwner: { ...exactOwner, generation: exactOwner.generation - 1 },
+    })).toBeNull();
+    expect(placeholderQueue).toEqual([placeholderRowId]);
+    expect(getDb().prepare("SELECT content, operation_id FROM messages WHERE chat_jid = ? AND rowid = ?")
+      .get(chatJid, placeholderRowId)).toEqual({ content: "Queued placeholder", operation_id: null });
+
+    expect(storeAgentTurn(placeholderChannel, emitter, {
+      chatJid,
+      text: "stale terminal replacement",
+      attachments: [],
+      channelName: "web",
+      threadId: null,
+      isTerminalAgentReply: true,
+      commitTerminal: (rowId) => {
+        const message = getDb().prepare("SELECT id FROM messages WHERE chat_jid = ? AND rowid = ?")
+          .get(chatJid, rowId) as { id: string };
+        const completed = completeChatOperation(chatJid, {
+          owner: { ...exactOwner, generation: exactOwner.generation - 1 },
+          outcome: "succeeded",
+          cause: "stale_terminal_test",
+          provenance: "test",
+          createdAt: new Date().toISOString(),
+          artifact: { messageId: message.id },
+        });
+        return completed.status === "completed" || completed.status === "repeated";
+      },
+    })).toBeNull();
+    expect(placeholderQueue).toEqual([placeholderRowId]);
+    expect(getDb().prepare("SELECT content, operation_id, is_terminal_agent_reply FROM messages WHERE chat_jid = ? AND rowid = ?")
+      .get(chatJid, placeholderRowId)).toEqual({
+      content: "Queued placeholder",
+      operation_id: null,
+      is_terminal_agent_reply: 0,
+    });
+    expect(getChatOperation(chatJid)).toEqual(running.operation);
   });
 
   test("rolls back terminal rows with disposition, cursor, and release on completion faults", () => {
@@ -336,6 +481,7 @@ describe("storeAgentTurn", () => {
       if (running.status !== "applied") throw new Error("expected running");
 
       const channel = {
+        peekQueuedFollowupPlaceholder: () => null,
         consumeQueuedFollowupPlaceholder: () => null,
         storeMessage: (targetChatJid: string, content: string) => {
           const messageId = `terminal-${faultPoint}`;
