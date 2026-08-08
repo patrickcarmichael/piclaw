@@ -185,7 +185,9 @@ export const chatTool: ExtensionFactory = (pi: ExtensionAPI) => {
 
         const target = describeTarget(result);
         const statusText = result.delivery_disposition === "indeterminate"
-          ? `Delivery to ${target} is indeterminate because durable acknowledgement timed out. Retry only with the same idempotency_key.`
+          ? result.timed_out === true
+            ? `Delivery to ${target} is indeterminate because durable acknowledgement timed out. Retry only with the same idempotency_key.`
+            : `Delivery to ${target} is indeterminate because durable acceptance was not acknowledged. Retry only with the same idempotency_key.`
           : result.delivery_disposition === "cancelled"
             ? `Delivery to ${target} was cancelled before durable acknowledgement; delivery is indeterminate.`
             : result.queued === "followup"

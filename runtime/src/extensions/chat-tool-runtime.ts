@@ -54,6 +54,9 @@ type DirectChatToolRelayOptions = {
   getChatBranchByChatJid?: (chatJid: string) => ChatBranchLike | null;
   getChatBranchByAgentName?: (agentName: string) => ChatBranchLike | null;
   ackTimeoutMs?: number;
+  idempotencyMaxEntries?: number;
+  idempotencyRetentionMs?: number;
+  now?: () => number;
 };
 
 function fallbackPeerAgentHandle(chatJid: string): string {
@@ -228,11 +231,24 @@ export function createDirectChatToolRelayHandler(
 ): (request: ChatRelayRequest) => Promise<ChatRelayResult> {
   const defaultAgentId = options.defaultAgentId || "default";
   const ackTimeoutMs = Math.max(1, Math.floor(options.ackTimeoutMs ?? 5_000));
-  const idempotentAttempts = new Map<string, {
+  const idempotencyMaxEntries = Math.max(1, Math.floor(options.idempotencyMaxEntries ?? 1_024));
+  const idempotencyRetentionMs = Math.max(1, Math.floor(options.idempotencyRetentionMs ?? 10 * 60_000));
+  const now = options.now ?? Date.now;
+  type IdempotentAttempt = {
     fingerprint: string;
     promise: Promise<ChatRelayResult>;
     latestResult?: ChatRelayResult;
-  }>();
+    settledAt?: number;
+  };
+  const idempotentAttempts = new Map<string, IdempotentAttempt>();
+  const pruneExpiredIdempotentAttempts = () => {
+    const cutoff = now() - idempotencyRetentionMs;
+    for (const [key, attempt] of idempotentAttempts) {
+      if (attempt.settledAt !== undefined && attempt.settledAt <= cutoff) {
+        idempotentAttempts.delete(key);
+      }
+    }
+  };
 
   return async (request) => {
     const displayName = getRuntimeAgentDisplayName(options);
@@ -260,6 +276,7 @@ export function createDirectChatToolRelayHandler(
       mode,
       in_reply_to: request.in_reply_to?.trim() || null,
     });
+    if (cacheKey) pruneExpiredIdempotentAttempts();
     const existing = cacheKey ? idempotentAttempts.get(cacheKey) : undefined;
     if (existing) {
       if (existing.fingerprint !== fingerprint) {
@@ -267,12 +284,20 @@ export function createDirectChatToolRelayHandler(
       }
       return existing.latestResult ?? existing.promise;
     }
+    if (cacheKey && idempotentAttempts.size >= idempotencyMaxEntries) {
+      log.warn("Cross-session chat idempotency capacity is exhausted.", {
+        operation: "chat_tool_relay.idempotency_capacity_exhausted",
+        sourceChatJid: source.chat_jid,
+        targetChatJid: target.chat_jid,
+        idempotencyMaxEntries,
+      });
+      throw new Error(
+        `Cross-session chat idempotency capacity (${idempotencyMaxEntries}) is exhausted; ` +
+        "retry an existing idempotency_key after unresolved deliveries settle.",
+      );
+    }
 
-    let entry: {
-      fingerprint: string;
-      promise: Promise<ChatRelayResult>;
-      latestResult?: ChatRelayResult;
-    } | undefined;
+    let entry: IdempotentAttempt | undefined;
 
     const deliver = async (): Promise<ChatRelayResult> => {
       const replyTo = buildReplyToDescriptor(source);
@@ -365,7 +390,10 @@ export function createDirectChatToolRelayHandler(
           acknowledged: true,
           delivery_disposition: "accepted",
         };
-        if (entry) entry.latestResult = acceptedResult;
+        if (entry) {
+          entry.latestResult = acceptedResult;
+          entry.settledAt ??= now();
+        }
         log.info("Cross-session steer received durable target acceptance.", {
           operation: terminalDisposition === "pending"
             ? "chat_tool_relay.acknowledged"
@@ -404,6 +432,9 @@ export function createDirectChatToolRelayHandler(
                 : { status: completion.response.status }),
             });
             return;
+          }
+          if (entry && cacheKey && idempotentAttempts.get(cacheKey) === entry) {
+            entry.settledAt ??= now();
           }
           log.info("Cross-session steer recipient handling completed after sender acknowledgement.", {
             operation: "chat_tool_relay.deferred_delivery_completed",
@@ -523,19 +554,33 @@ export function createDirectChatToolRelayHandler(
       };
     };
 
+    if (cacheKey) {
+      // Reserve capacity before delivery starts so a synchronous acceptance
+      // callback can reconcile this exact entry without a registration gap.
+      entry = {
+        fingerprint,
+        promise: Promise.resolve(undefined as never),
+      };
+      idempotentAttempts.set(cacheKey, entry);
+    }
     const promise = deliver().then((result) => {
       if (entry && result.acknowledged && result.delivery_disposition === "accepted") {
         entry.latestResult = result;
+        entry.settledAt ??= now();
+      } else if (entry && (
+        mode !== "steer"
+        || (result.delivery_disposition === "indeterminate" && result.timed_out !== true)
+      )) {
+        entry.settledAt ??= now();
       }
       return result;
     }).catch((error) => {
-      if (cacheKey) idempotentAttempts.delete(cacheKey);
+      if (cacheKey && (!entry || idempotentAttempts.get(cacheKey) === entry)) {
+        idempotentAttempts.delete(cacheKey);
+      }
       throw error;
     });
-    if (cacheKey) {
-      entry = { fingerprint, promise };
-      idempotentAttempts.set(cacheKey, entry);
-    }
+    if (entry) entry.promise = promise;
     return await promise;
   };
 }

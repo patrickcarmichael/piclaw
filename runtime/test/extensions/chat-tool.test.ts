@@ -193,6 +193,28 @@ describe("chat tool extension", () => {
     });
   });
 
+  test("distinguishes missing acknowledgement from acknowledgement timeout", async () => {
+    const { tool, chatToolModule } = await getTool();
+    chatToolModule.setChatToolRelayFn(async (request) => ({
+      status: "indeterminate",
+      relayed: false,
+      source_chat_jid: request.source_chat_jid,
+      target_chat_jid: "web:target",
+      target_agent_name: "research",
+      acknowledged: false,
+      delivery_disposition: "indeterminate",
+    }));
+
+    const result = await withChatContext(chatJid, "web", () => tool.execute("x", {
+      target_agent_name: "research",
+      content: "hello",
+      idempotency_key: "missing-ack",
+    }));
+
+    expect(result.content[0].text).toContain("durable acceptance was not acknowledged");
+    expect(result.content[0].text).not.toContain("timed out");
+  });
+
   test("dispatches one-hop bang addresses with transport metadata", async () => {
     const { tool } = await getTool();
     const calls: Array<Record<string, unknown>> = [];

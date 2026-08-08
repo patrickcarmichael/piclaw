@@ -274,6 +274,91 @@ describe("direct chat tool runtime relay", () => {
     expect(handlerCalls).toBe(1);
   });
 
+  test("bounds idempotency retention without evicting unresolved deliveries", async () => {
+    let clock = 0;
+    let handlerCalls = 0;
+    const acceptByKey = new Map<string, (value: any) => void>();
+    const relay = createDirectChatToolRelayHandler(makeAgentPool(), {
+      handleAgentMessage: async (req, _pathname, onAccepted) => {
+        handlerCalls += 1;
+        acceptByKey.set(req.headers.get("x-piclaw-idempotency-key")!, onAccepted!);
+        return await new Promise<Response>(() => {});
+      },
+    }, {
+      ackTimeoutMs: 5,
+      idempotencyMaxEntries: 2,
+      idempotencyRetentionMs: 10,
+      now: () => clock,
+      getAgentDisplayName: () => "Smith",
+      getChatBranchByChatJid: () => null,
+      getChatBranchByAgentName: () => null,
+    });
+    const request = (key: string) => ({
+      source_chat_jid: "web:source", target_agent_name: "research", content: key, mode: "steer" as const,
+      idempotency_key: key,
+    });
+
+    const first = await relay(request("key-a"));
+    await relay(request("key-b"));
+    expect(handlerCalls).toBe(2);
+
+    clock = 100;
+    expect(await relay(request("key-a"))).toEqual(first);
+    await expect(relay(request("key-c"))).rejects.toThrow("idempotency capacity (2) is exhausted");
+    expect(handlerCalls).toBe(2);
+
+    acceptByKey.get("key-a")!({
+      chat_jid: "web:target", row_id: 83, thread_id: 83, accepted_at: "now", created: true,
+    });
+    expect(await relay(request("key-a"))).toMatchObject({
+      status: "ok", row_id: 83, acknowledged: true, delivery_disposition: "accepted",
+    });
+    expect(handlerCalls).toBe(2);
+
+    clock = 111;
+    expect(await relay(request("key-c"))).toMatchObject({ status: "indeterminate", timed_out: true });
+    expect(handlerCalls).toBe(3);
+    await expect(relay(request("key-d"))).rejects.toThrow("idempotency capacity (2) is exhausted");
+    expect(handlerCalls).toBe(3);
+  });
+
+  test("expires timed-out attempts only after their forward delivery settles", async () => {
+    let clock = 0;
+    let handlerCalls = 0;
+    let settleFirst!: (response: Response) => void;
+    const relay = createDirectChatToolRelayHandler(makeAgentPool(), {
+      handleAgentMessage: async () => {
+        handlerCalls += 1;
+        if (handlerCalls === 1) {
+          return await new Promise<Response>((resolve) => { settleFirst = resolve; });
+        }
+        return await new Promise<Response>(() => {});
+      },
+    }, {
+      ackTimeoutMs: 5,
+      idempotencyMaxEntries: 1,
+      idempotencyRetentionMs: 10,
+      now: () => clock,
+      getAgentDisplayName: () => "Smith",
+      getChatBranchByChatJid: () => null,
+      getChatBranchByAgentName: () => null,
+    });
+    const request = (key: string) => ({
+      source_chat_jid: "web:source", target_agent_name: "research", content: key, mode: "steer" as const,
+      idempotency_key: key,
+    });
+
+    await relay(request("unresolved"));
+    clock = 100;
+    await expect(relay(request("blocked"))).rejects.toThrow("idempotency capacity (1) is exhausted");
+    settleFirst(jsonResponse({ row_id: 84, created: true }, 201));
+    await Bun.sleep(0);
+
+    clock = 111;
+    expect(await relay(request("replacement"))).toMatchObject({ status: "indeterminate", timed_out: true });
+    expect(handlerCalls).toBe(2);
+  });
+
   test("does not redeliver after acknowledged delivery later fails in recipient handling", async () => {
     let handlerCalls = 0;
     let rejectRecipient!: (error: Error) => void;
