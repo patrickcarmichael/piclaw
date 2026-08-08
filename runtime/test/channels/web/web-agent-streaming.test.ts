@@ -560,6 +560,57 @@ describe("web agent streaming", () => {
         generation: 3,
       });
       expect(getChatOperationDisposition(accepted.source.sourceSeq)).toBeNull();
+
+      fixture.channel.storeMessage = originalStoreMessage;
+      expect(fixture.channel.retryFailedOnModelSwitch("web:blocked")).toBe(true);
+      expect(getChatOperation("web:blocked")).toMatchObject({
+        sourceSeq: accepted.source.sourceSeq,
+        phase: "pending",
+        generation: 4,
+      });
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  test("operator skip completes a blocked durable frontier and wakes its successor", async () => {
+    let runs = 0;
+    const agentPool = {
+      setSessionBinder: () => {},
+      runAgent: async () => {
+        runs += 1;
+        return { status: "success", result: `response-${runs}`, attachments: [] };
+      },
+      getContextUsageForChat: async () => null,
+    } as any;
+    const fixture = await createWebChannelTestFixture({ queue: new AgentQueue(), agentPool });
+
+    try {
+      const chatJid = "web:blocked-skip-successor";
+      const first = fixture.channel.storeMessage(chatJid, "first blocked prompt", false, []);
+      const firstAccepted = acceptStoredChatMessageSource(chatJid, first!.id);
+      const second = fixture.channel.storeMessage(chatJid, "second pending prompt", false, []);
+      const secondAccepted = acceptStoredChatMessageSource(chatJid, second!.id);
+      const originalStoreMessage = fixture.channel.storeMessage.bind(fixture.channel);
+      fixture.channel.storeMessage = ((targetChatJid: string, content: string, isBot: boolean, mediaIds: number[], options?: unknown) =>
+        isBot ? null : originalStoreMessage(targetChatJid, content, isBot, mediaIds, options as any)) as typeof fixture.channel.storeMessage;
+
+      await fixture.channel.processChat(chatJid, "default");
+      expect(getChatOperation(chatJid)?.phase).toBe("blocked");
+      expect(getChatOperationDisposition(firstAccepted.source.sourceSeq)).toBeNull();
+
+      fixture.channel.storeMessage = originalStoreMessage;
+      expect(fixture.channel.skipFailedOnModelSwitch(chatJid)).toBe(true);
+      expect(getChatOperationDisposition(firstAccepted.source.sourceSeq)).toMatchObject({
+        outcome: "skipped",
+        cause: "operator_skip_failed",
+        terminalMessageId: null,
+      });
+
+      await waitFor(() => Boolean(getChatOperationDisposition(secondAccepted.source.sourceSeq)), 1_000, 2);
+      expect(getChatOperationDisposition(secondAccepted.source.sourceSeq)?.outcome).toBe("succeeded");
+      expect(getChatOperation(chatJid)).toBeNull();
+      expect(runs).toBe(2);
     } finally {
       fixture.cleanup();
     }

@@ -494,6 +494,12 @@ function sameDisposition(
     && existing.terminalMessageId === terminalMessageId;
 }
 
+export interface BlockedChatOperationSkip {
+  cause: string;
+  provenance: string;
+  createdAt: string;
+}
+
 export interface ChatOperationCompletion {
   owner: ChatOperationOwner;
   outcome: ChatOperationOutcome;
@@ -512,6 +518,42 @@ function insertDisposition(source: AcceptedChatSource, operationId: string, outc
     .run(source.sourceSeq, operationId, source.chatJid, source.sourceClass, source.sourceKind, source.sourceId,
       outcome, cause, provenance, artifact?.chatJid ?? null, artifact?.messageId ?? null, createdAt);
   return getChatOperationDisposition(source.sourceSeq)!;
+}
+
+export function skipBlockedChatOperation(
+  chatJid: string,
+  owner: ChatOperationOwner,
+  resolution: BlockedChatOperationSkip,
+  hooks: ChatOperationCompletionHooks = {},
+): ChatOperationCompletionResult {
+  const db = getDb();
+  return db.transaction(() => {
+    const existing = getChatOperationDisposition(owner.sourceSeq);
+    if (!existing) {
+      const active = getChatOperation(chatJid);
+      const comparison = compareChatOperationOwner(active, owner);
+      if (!comparison.ok) return { status: "rejected", reason: comparison.reason, operation: active } as const;
+      if (active!.phase !== "blocked") {
+        return { status: "rejected", reason: "phase_mismatch", operation: active } as const;
+      }
+    }
+    const intentDispositions = (db.prepare(`SELECT source_seq FROM chat_accepted_sources
+      WHERE operation_id = ? AND selectable = 0 ORDER BY source_seq`).all(owner.operationId) as Array<{ source_seq: number }>)
+      .map(({ source_seq: sourceSeq }) => ({
+        sourceSeq,
+        outcome: "skipped" as const,
+        cause: resolution.cause,
+        provenance: resolution.provenance,
+      }));
+    return completeChatOperation(chatJid, {
+      owner,
+      outcome: "skipped",
+      cause: resolution.cause,
+      provenance: resolution.provenance,
+      createdAt: resolution.createdAt,
+      intentDispositions,
+    }, hooks);
+  }).immediate();
 }
 
 export function completeChatOperation(

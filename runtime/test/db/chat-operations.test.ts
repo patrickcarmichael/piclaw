@@ -284,6 +284,68 @@ describe("durable accepted-input operations", () => {
     expect(op.getChatOperationDisposition(source.sourceSeq)?.terminalMessageChatJid).toBe(parentJid);
   });
 
+  test("shared blocked skip atomically disposes the frontier and intents and is idempotent", () => {
+    const chatJid = jid("blocked-skip");
+    const source = register(chatJid, "blocked-source");
+    const claimed = op.claimNextChatOperation(chatJid).operation!;
+    const intent = op.registerChatOperationIntent(chatJid, owner(claimed), {
+      sourceKind: "steer", sourceId: "blocked-intent", acceptedAt: "now", payloadRef: "steer:blocked-intent",
+    });
+    if (intent.status !== "registered") throw new Error("expected intent");
+    const blocked = op.blockChatOperation(chatJid, owner(claimed));
+    if (blocked.status !== "applied") throw new Error("expected block");
+    const request = { cause: "operator_skip_failed", provenance: "test", createdAt: "2026-08-07T22:03:00Z" };
+
+    const skipped = op.skipBlockedChatOperation(chatJid, owner(blocked.operation), request);
+    expect(skipped.status).toBe("completed");
+    expect(op.getChatOperation(chatJid)).toBeNull();
+    expect(op.getChatOperationDisposition(source.sourceSeq)).toMatchObject({
+      outcome: "skipped", cause: request.cause, provenance: request.provenance, terminalMessageId: null,
+    });
+    expect(op.getChatOperationDisposition(intent.source.sourceSeq)).toMatchObject({
+      outcome: "skipped", cause: request.cause, provenance: request.provenance, terminalMessageId: null,
+    });
+    expect(db.getChatCursor(chatJid)).toBe(source.frontierCursorTs);
+    expect(op.skipBlockedChatOperation(chatJid, owner(blocked.operation), request)).toEqual({
+      status: "repeated",
+      disposition: skipped.status === "completed" ? skipped.disposition : null,
+    });
+  });
+
+  test("blocked skip rolls back at every completion boundary and remains retryable", () => {
+    for (const boundary of ["artifact", "intents", "disposition", "cursor", "release"] as const) {
+      const chatJid = jid(`blocked-skip-${boundary}`);
+      const source = register(chatJid, `blocked-${boundary}`);
+      const claimed = op.claimNextChatOperation(chatJid).operation!;
+      const blocked = op.blockChatOperation(chatJid, owner(claimed));
+      if (blocked.status !== "applied") throw new Error("expected block");
+      const blockedOwner = owner(blocked.operation);
+      const resolution = { cause: "operator_skip_failed", provenance: "test", createdAt: "now" };
+
+      expect(() => op.skipBlockedChatOperation(chatJid, blockedOwner, resolution, {
+        afterWrite(point) { if (point === boundary) throw new Error(`fault:${point}`); },
+      })).toThrow(`fault:${boundary}`);
+      expect(op.getChatOperation(chatJid)).toEqual(blocked.operation);
+      expect(op.getChatOperationDisposition(source.sourceSeq)).toBeNull();
+      expect(op.skipBlockedChatOperation(chatJid, blockedOwner, resolution).status).toBe("completed");
+    }
+  });
+
+  test("blocked retry wins owner races without allowing a stale skip", () => {
+    const chatJid = jid("blocked-race"); register(chatJid, "blocked-source");
+    const claimed = op.claimNextChatOperation(chatJid).operation!;
+    const blocked = op.blockChatOperation(chatJid, owner(claimed));
+    if (blocked.status !== "applied") throw new Error("expected block");
+    const blockedOwner = owner(blocked.operation);
+
+    const retried = op.retryBlockedChatOperation(chatJid, blockedOwner);
+    expect(retried.status).toBe("applied");
+    expect(op.skipBlockedChatOperation(chatJid, blockedOwner, {
+      cause: "stale_skip", provenance: "test", createdAt: "now",
+    })).toMatchObject({ status: "rejected", reason: "phase_mismatch" });
+    expect(op.getChatOperation(chatJid)).toEqual(retried.status === "applied" ? retried.operation : null);
+  });
+
   test("restart discovery finds unclaimed and active durable work but holds blocked operations", () => {
     const chatJid = jid("restart-discovery");
     register(chatJid, "restart-source");

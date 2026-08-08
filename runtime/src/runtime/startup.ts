@@ -446,8 +446,8 @@ function registerSessionControlHandler(agentPool: AgentPool, web: WebChannel): v
       extra = { retried };
     } else if (request.action === "skip_failed") {
       const skipped = web.skipFailedOnModelSwitch(target.chatJid);
-      message = skipped ? "Failed run skipped." : "No failed run to skip.";
-      extra = { skipped };
+      message = skipped ? "Failed run skipped and chat resumed." : "No failed run to skip.";
+      extra = { skipped, resumed: skipped };
     } else if (request.action === "wake") {
       web.resumeChat(target.chatJid);
       message = "Chat wake/resume queued.";

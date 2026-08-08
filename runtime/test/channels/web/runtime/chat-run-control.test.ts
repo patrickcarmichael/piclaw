@@ -94,6 +94,75 @@ describe("web chat run control helpers", () => {
     await queue.shutdown(100);
   });
 
+  test("skipFailedOnModelSwitch resolves a durable blocked owner through shared completion", () => {
+    const operation = {
+      chatJid: "web:blocked", operationId: "op-blocked", sourceSeq: 7,
+      phase: "blocked" as const, generation: 3, cancellation: null,
+    };
+    const calls: any[] = [];
+    const store: ChatRunControlStore = {
+      getThreadRootId: () => null,
+      getFailedRun: () => { throw new Error("legacy fallback must not run"); },
+      getChatCursor: () => "",
+      setChatCursor: () => {},
+      clearFailedRun: () => {},
+      getChatOperation: () => operation,
+      skipBlockedChatOperation: ((chatJid: string, owner: unknown, resolution: unknown) => {
+        calls.push({ chatJid, owner, resolution });
+        return { status: "completed", disposition: {} };
+      }) as any,
+    };
+
+    expect(skipFailedOnModelSwitch("web:blocked", store)).toBe(true);
+    expect(calls).toEqual([expect.objectContaining({
+      chatJid: "web:blocked",
+      owner: { operationId: "op-blocked", sourceSeq: 7, phase: "blocked", generation: 3 },
+      resolution: expect.objectContaining({ cause: "operator_skip_failed", provenance: "web_chat_run_control" }),
+    })]);
+  });
+
+  test("retryFailedOnModelSwitch uses durable blocked CAS and rejects stale resolution", () => {
+    const operation = {
+      chatJid: "web:blocked", operationId: "op-blocked", sourceSeq: 7,
+      phase: "blocked" as const, generation: 3, cancellation: null,
+    };
+    let status: "applied" | "rejected" = "applied";
+    const store: ChatRunControlStore = {
+      getThreadRootId: () => null,
+      getFailedRun: () => { throw new Error("legacy fallback must not run"); },
+      getChatCursor: () => "",
+      setChatCursor: () => {},
+      clearFailedRun: () => {},
+      getChatOperation: () => operation,
+      retryBlockedChatOperation: (() => status === "applied"
+        ? { status: "applied", operation: { ...operation, phase: "pending", generation: 4 } }
+        : { status: "rejected", reason: "generation_mismatch", operation }) as any,
+    };
+
+    expect(retryFailedOnModelSwitch("web:blocked", store)).toBe(true);
+    status = "rejected";
+    expect(retryFailedOnModelSwitch("web:blocked", store)).toBe(false);
+  });
+
+  test("an active non-blocked durable owner cannot fall through to legacy failed markers", () => {
+    let legacyReads = 0;
+    const store: ChatRunControlStore = {
+      getThreadRootId: () => null,
+      getFailedRun: () => { legacyReads += 1; return { prevTs: "before", failedTs: "failed" }; },
+      getChatCursor: () => "",
+      setChatCursor: () => {},
+      clearFailedRun: () => {},
+      getChatOperation: () => ({
+        chatJid: "web:running", operationId: "op-running", sourceSeq: 8,
+        phase: "running", generation: 2, cancellation: null,
+      }),
+    };
+
+    expect(skipFailedOnModelSwitch("web:running", store)).toBe(false);
+    expect(retryFailedOnModelSwitch("web:running", store)).toBe(false);
+    expect(legacyReads).toBe(0);
+  });
+
   test("skipFailedOnModelSwitch advances cursor only when needed and clears failure", () => {
     const setCalls: Array<{ chatJid: string; ts: string }> = [];
     const clearCalls: string[] = [];
