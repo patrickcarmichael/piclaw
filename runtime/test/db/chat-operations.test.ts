@@ -137,7 +137,7 @@ describe("durable accepted-input operations", () => {
   });
 
   test("completion rolls back at every write boundary and remains recoverable", () => {
-    for (const boundary of ["artifact", "intents", "disposition", "cursor", "release"] as const) {
+    for (const boundary of ["artifact", "successor", "intents", "disposition", "frontier", "release"] as const) {
       const chatJid = jid(`rollback-${boundary}`); const source = register(chatJid, "a");
       const claimed = op.claimNextChatOperation(chatJid).operation!;
       expect(() => op.completeChatOperation(chatJid, { owner: owner(claimed), outcome: "succeeded", cause: "normal",
@@ -157,6 +157,167 @@ describe("durable accepted-input operations", () => {
     const first = op.completeChatOperation(chatJid, request);
     expect(op.completeChatOperation(chatJid, request)).toEqual({ status: "repeated", disposition: first.status === "completed" ? first.disposition : null });
     expect(() => op.completeChatOperation(chatJid, { ...request, outcome: "failed" })).toThrow("Conflicting repeated completion");
+  });
+
+  test("atomically registers one deterministic protected continuation and validates repeated lineage", () => {
+    const chatJid = jid("protected-successor");
+    const root = register(chatJid, "root");
+    const claimed = op.claimNextChatOperation(chatJid).operation!;
+    const request = {
+      owner: owner(claimed), outcome: "interrupted" as const,
+      cause: "protected_recovery_continuation_registered", provenance: "web_process_chat",
+      createdAt: "2026-08-08T13:10:00.000Z",
+      artifact: { message: terminal(chatJid, `bot-handoff-${serial}`) },
+      successor: { sourceKind: "protected_continuation" as const, rootSourceSeq: root.sourceSeq },
+    };
+    const completed = op.completeChatOperation(chatJid, request);
+    expect(completed.status).toBe("completed");
+    const successor = op.peekNextAcceptedChatSource(chatJid)!;
+    expect(successor).toMatchObject({
+      sourceClass: "prompt", sourceKind: "protected_continuation", sourceId: `source:${root.sourceSeq}`,
+      acceptedAt: request.createdAt, selectable: true, payloadRef: `accepted-source:${root.sourceSeq}`,
+      frontierMessageId: null, frontierCursorTs: null, operationId: null,
+    });
+    expect(op.getProtectedContinuationRootSource(successor)).toEqual({
+      ...root,
+      operationId: claimed.operationId,
+    });
+    expect(op.getProtectedContinuationRootSource({
+      ...successor,
+      sourceId: `source:0${root.sourceSeq}`,
+    })).toBeNull();
+    expect(op.getProtectedContinuationRootSource({
+      ...successor,
+      chatJid: `${chatJid}:other`,
+    })).toBeNull();
+    expect(op.completeChatOperation(chatJid, request)).toEqual({
+      status: "repeated", disposition: completed.status === "completed" ? completed.disposition : null,
+    });
+    expect(() => op.completeChatOperation(chatJid, { ...request, successor: undefined }))
+      .toThrow("Conflicting repeated protected continuation successor");
+    expect(() => op.completeChatOperation(chatJid, {
+      ...request, successor: { sourceKind: "protected_continuation", rootSourceSeq: root.sourceSeq + 1 },
+    })).toThrow("lineage conflicts");
+  });
+
+  test("protected handoff is all-or-nothing at every write boundary and stale ownership writes nothing", () => {
+    for (const boundary of ["artifact", "successor", "intents", "disposition", "frontier", "release"] as const) {
+      const chatJid = jid(`protected-fault-${boundary}`);
+      const root = register(chatJid, `root-${boundary}`);
+      const claimed = op.claimNextChatOperation(chatJid).operation!;
+      const request = {
+        owner: owner(claimed), outcome: "interrupted" as const,
+        cause: "protected_recovery_continuation_registered", provenance: "test", createdAt: "now",
+        artifact: { message: terminal(chatJid, `handoff-${boundary}-${serial}`) },
+        successor: { sourceKind: "protected_continuation" as const, rootSourceSeq: root.sourceSeq },
+      };
+      expect(() => op.completeChatOperation(chatJid, request, {
+        afterWrite(point) { if (point === boundary) throw new Error(`fault:${point}`); },
+      })).toThrow(`fault:${boundary}`);
+      expect(op.getChatOperation(chatJid)).toEqual(claimed);
+      expect(op.getChatOperationDisposition(root.sourceSeq)).toBeNull();
+      expect(db.getDb().prepare("SELECT 1 FROM chat_accepted_sources WHERE chat_jid = ? AND source_kind = 'protected_continuation'")
+        .get(chatJid)).toBeNull();
+      expect(db.getDb().prepare("SELECT 1 FROM messages WHERE chat_jid = ? AND id = ?")
+        .get(chatJid, request.artifact.message.id)).toBeNull();
+      expect(op.completeChatOperation(chatJid, request).status).toBe("completed");
+    }
+
+    const chatJid = jid("protected-stale-owner");
+    const root = register(chatJid, "root");
+    const claimed = op.claimNextChatOperation(chatJid).operation!;
+    const stale = op.completeChatOperation(chatJid, {
+      owner: { ...owner(claimed), generation: claimed.generation + 1 }, outcome: "interrupted",
+      cause: "protected_recovery_continuation_registered", provenance: "test", createdAt: "now",
+      artifact: { message: terminal(chatJid, `stale-handoff-${serial}`) },
+      successor: { sourceKind: "protected_continuation", rootSourceSeq: root.sourceSeq },
+    });
+    expect(stale).toMatchObject({ status: "rejected", reason: "generation_mismatch" });
+    expect(db.getDb().prepare("SELECT 1 FROM chat_accepted_sources WHERE chat_jid = ? AND source_kind = 'protected_continuation'")
+      .get(chatJid)).toBeNull();
+    expect(db.getDb().prepare("SELECT 1 FROM messages WHERE chat_jid = ? AND id = ?")
+      .get(chatJid, `stale-handoff-${serial}`)).toBeNull();
+
+    const cancelledChatJid = jid("protected-cancelled-owner");
+    const cancelledRoot = register(cancelledChatJid, "root");
+    const cancelledClaim = op.claimNextChatOperation(cancelledChatJid).operation!;
+    const cancelled = op.cancelChatOperation(cancelledChatJid, owner(cancelledClaim), {
+      cause: "user_abort", requestedAt: "cancelled-now",
+    });
+    if (cancelled.status !== "applied") throw new Error("expected cancellation");
+    expect(op.completeChatOperation(cancelledChatJid, {
+      owner: owner(cancelled.operation), outcome: "interrupted",
+      cause: "protected_recovery_continuation_registered", provenance: "test", createdAt: "now",
+      artifact: { message: terminal(cancelledChatJid, `cancelled-handoff-${serial}`) },
+      successor: { sourceKind: "protected_continuation", rootSourceSeq: cancelledRoot.sourceSeq },
+    })).toMatchObject({ status: "rejected", reason: "cancelled_outcome_required" });
+    expect(db.getDb().prepare("SELECT 1 FROM chat_accepted_sources WHERE chat_jid = ? AND source_kind = 'protected_continuation'")
+      .get(cancelledChatJid)).toBeNull();
+    expect(db.getDb().prepare("SELECT 1 FROM messages WHERE chat_jid = ? AND id = ?")
+      .get(cancelledChatJid, `cancelled-handoff-${serial}`)).toBeNull();
+  });
+
+  test("canonical source_seq keeps already accepted work ahead of the protected child without starvation", () => {
+    const chatJid = jid("protected-ordering");
+    const root = register(chatJid, "root");
+    const claimed = op.claimNextChatOperation(chatJid).operation!;
+    const acceptedAhead = register(chatJid, "accepted-ahead");
+    op.completeChatOperation(chatJid, {
+      owner: owner(claimed), outcome: "interrupted", cause: "protected_recovery_continuation_registered",
+      provenance: "test", createdAt: "now", artifact: { message: terminal(chatJid, `ordered-handoff-${serial}`) },
+      successor: { sourceKind: "protected_continuation", rootSourceSeq: root.sourceSeq },
+    });
+    const child = db.getDb().prepare(`SELECT source_seq FROM chat_accepted_sources
+      WHERE chat_jid = ? AND source_kind = 'protected_continuation'`).get(chatJid) as { source_seq: number };
+    expect(acceptedAhead.sourceSeq).toBeLessThan(child.source_seq);
+    const aheadClaim = op.claimNextChatOperation(chatJid);
+    expect(aheadClaim.source?.sourceSeq).toBe(acceptedAhead.sourceSeq);
+    expect(complete(chatJid, aheadClaim.operation!, `ahead-terminal-${serial}`).status).toBe("completed");
+    const childClaim = op.claimNextChatOperation(chatJid);
+    expect(childClaim.source?.sourceSeq).toBe(child.source_seq);
+    expect(childClaim.source?.sourceKind).toBe("protected_continuation");
+    expect(op.getResumableDurableChatJids()).toContain(chatJid);
+    const blocked = op.blockChatOperation(chatJid, owner(childClaim.operation!));
+    expect(blocked.status).toBe("applied");
+    expect(op.getBlockedDurableChatJids()).toContain(chatJid);
+  });
+
+  test("protected children require the exact handoff outcome and cannot externalize recursively or use the public source API", () => {
+    const invalidChatJid = jid("protected-invalid-settlement");
+    const invalidRoot = register(invalidChatJid, "root");
+    const invalidClaim = op.claimNextChatOperation(invalidChatJid).operation!;
+    expect(() => op.completeChatOperation(invalidChatJid, {
+      owner: owner(invalidClaim), outcome: "interrupted", cause: "generic_interruption", provenance: "test", createdAt: "now",
+      artifact: { message: terminal(invalidChatJid, `invalid-cause-handoff-${serial}`) },
+      successor: { sourceKind: "protected_continuation", rootSourceSeq: invalidRoot.sourceSeq },
+    })).toThrow("interrupted protected handoff outcome");
+    expect(() => op.completeChatOperation(invalidChatJid, {
+      owner: owner(invalidClaim), outcome: "interrupted", cause: "protected_recovery_continuation_registered", provenance: "test", createdAt: "now",
+      artifact: { message: { ...terminal(invalidChatJid, `blank-handoff-${serial}`), content: "  " } },
+      successor: { sourceKind: "protected_continuation", rootSourceSeq: invalidRoot.sourceSeq },
+    })).toThrow("non-blank scheduling artifact");
+    expect(db.getDb().prepare("SELECT 1 FROM chat_accepted_sources WHERE chat_jid = ? AND source_kind = 'protected_continuation'")
+      .get(invalidChatJid)).toBeNull();
+    expect(db.getDb().prepare("SELECT 1 FROM messages WHERE chat_jid = ? AND is_bot_message = 1")
+      .get(invalidChatJid)).toBeNull();
+
+    const chatJid = jid("protected-recursion");
+    const root = register(chatJid, "root");
+    const claimed = op.claimNextChatOperation(chatJid).operation!;
+    op.completeChatOperation(chatJid, {
+      owner: owner(claimed), outcome: "interrupted", cause: "protected_recovery_continuation_registered",
+      provenance: "test", createdAt: "now", artifact: { message: terminal(chatJid, `root-handoff-${serial}`) },
+      successor: { sourceKind: "protected_continuation", rootSourceSeq: root.sourceSeq },
+    });
+    const child = op.claimNextChatOperation(chatJid);
+    expect(() => op.completeChatOperation(chatJid, {
+      owner: owner(child.operation!), outcome: "interrupted", cause: "protected_recovery_continuation_registered", provenance: "test", createdAt: "later",
+      artifact: { message: terminal(chatJid, `child-handoff-${serial}`) },
+      successor: { sourceKind: "protected_continuation", rootSourceSeq: child.source!.sourceSeq },
+    })).toThrow("non-continuation selectable prompt root");
+    expect(op.getChatOperation(chatJid)).toEqual(child.operation);
+    expect(() => op.registerAcceptedChatSource({ chatJid, sourceClass: "prompt", sourceKind: "protected_continuation",
+      sourceId: "forged", acceptedAt: "now", payloadRef: "accepted-source:1" })).toThrow("only be registered");
   });
 
   test("terminal artifact policy requires prompt closure, allows control output, and prohibits intent output", () => {
@@ -313,7 +474,7 @@ describe("durable accepted-input operations", () => {
   });
 
   test("blocked skip rolls back at every completion boundary and remains retryable", () => {
-    for (const boundary of ["artifact", "intents", "disposition", "cursor", "release"] as const) {
+    for (const boundary of ["artifact", "successor", "intents", "disposition", "frontier", "release"] as const) {
       const chatJid = jid(`blocked-skip-${boundary}`);
       const source = register(chatJid, `blocked-${boundary}`);
       const claimed = op.claimNextChatOperation(chatJid).operation!;

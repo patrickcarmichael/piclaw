@@ -66,7 +66,8 @@ export async function finalizeSuccessfulProcessChatRun(options: ProcessChatFinal
 
   const cursorNow = getChatCursor(chatJid);
   const remainingPersisted = getMessagesSince(chatJid, cursorNow, getIdentityConfig().assistantName);
-  const pendingDurableMessage = peekNextAcceptedChatSource(chatJid)?.sourceKind === "message";
+  const pendingDurableSource = ["message", "protected_continuation"]
+    .includes(peekNextAcceptedChatSource(chatJid)?.sourceKind ?? "");
   log.info("finalizeSuccessfulRun advanced cursor", {
     operation: "process_chat.finalize_successful_run",
     chatJid,
@@ -77,11 +78,11 @@ export async function finalizeSuccessfulProcessChatRun(options: ProcessChatFinal
     cursorAfterSteer,
     cursorNow,
     remainingCount: remainingPersisted.length,
-    pendingDurableMessage,
+    pendingDurableSource,
     remainingMessages: remainingPersisted.map((message) => `${message.id}@${message.timestamp}`),
   });
 
-  if (remainingPersisted.length > 0 || pendingDurableMessage) {
+  if (remainingPersisted.length > 0 || pendingDurableSource) {
     channel.resumeChat(chatJid);
     return;
   }

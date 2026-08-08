@@ -80,6 +80,8 @@ export interface AgentOutput {
   nextAction?: string;
   /** A protected recovery ran without tools and must hand off to one ordinary tool-enabled turn. */
   requiresToolEnabledContinuation?: boolean;
+  /** Typed evidence used to bound durable post-compaction continuation policy. */
+  protectedRecoveryHandoff?: { afterSuccessfulCompaction: boolean };
   abortCause?: AgentAbortCause;
   abortOperation?: string;
 }
@@ -132,6 +134,8 @@ export interface RunAgentOptions {
    * has closed; false leaves maintenance suppressed.
    */
   onTerminalOutput?: (output: AgentOutput) => boolean | Promise<boolean>;
+  /** Persist a durable protected handoff while the prompt mutation lane is still held. */
+  onProtectedRecoveryHandoff?: (output: AgentOutput) => boolean | Promise<boolean>;
   /** Stable runtime turn identifier for observability/correlation. */
   turnId?: string;
   /** Optional browser/user correlation identifier supplied by the caller. */
@@ -167,6 +171,10 @@ export interface RunAgentOptions {
   toolCeilingFilter?: (toolName: string) => boolean;
   /** This run is the internal, one-shot ordinary continuation after protected recovery. */
   protectedRecoveryContinuation?: boolean;
+  /** Explicit protected-recovery ownership policy; omitted preserves legacy internal one-shot behavior. */
+  protectedRecoveryHandoffMode?: "durable_externalize" | "durable_continuation";
+  /** The one internal post-compaction resume is currently executing. */
+  protectedRecoveryInternalResume?: boolean;
 }
 
 export interface RetrySettingsProvider {

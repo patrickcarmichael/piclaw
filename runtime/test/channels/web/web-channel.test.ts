@@ -2735,6 +2735,226 @@ test("processChat completes protected recovery internally without a synthetic us
   expect(web.getQueuedFollowupItems("web:default")).toHaveLength(0);
 });
 
+test("durable processChat externalizes one protected child then completes one post-compaction internal resume", async () => {
+  const ws = createTempWorkspace("piclaw-web-channel-");
+  cleanupWorkspace = ws.cleanup;
+  restoreEnv = setEnv({ PICLAW_WORKSPACE: ws.workspace, PICLAW_STORE: ws.store, PICLAW_DATA: ws.data });
+
+  const db = await import("../../../src/db.js");
+  const { TOOL_ENABLED_RECOVERY_CONTINUATION_PROMPT } = await import("../../../src/agent-pool/context-pressure-retry.js");
+  const { runWithProtectedRecoveryHandoff } = await import("../../../src/agent-pool/protected-recovery-handoff.js");
+  db.initDatabase();
+  db.getDb().exec("DELETE FROM message_media; DELETE FROM messages; DELETE FROM chats; DELETE FROM chat_cursors;");
+  db.storeChatMetadata("web:default", new Date().toISOString(), "Web");
+  const sourceTimestamp = new Date().toISOString();
+  const accepted = db.storeAcceptedChatMessageSource({
+    id: `msg-${Math.random()}`,
+    chat_jid: "web:default",
+    sender: "user",
+    sender_name: "User",
+    content: "finish the durable release",
+    timestamp: sourceTimestamp,
+    is_from_me: false,
+    is_bot_message: false,
+  }).source;
+
+  const prompts: string[] = [];
+  const modes: string[] = [];
+  const webMod = await import("../../../src/channels/web.js");
+  const web = new (webMod.WebChannel as any)({
+    queue: { enqueue: () => {} },
+    agentPool: {
+      setSessionBinder: () => {},
+      runAgent: async (prompt: string, _chatJid: string, options: any) => {
+        modes.push(options.protectedRecoveryHandoffMode ?? "legacy");
+        const output = await runWithProtectedRecoveryHandoff(
+          prompt,
+          options,
+          async (nextPrompt: string, nextOptions: any) => {
+            prompts.push(nextPrompt);
+            if (prompts.length === 1) {
+              return {
+                status: "error", result: null, error: "durable external handoff required",
+                requiresToolEnabledContinuation: true,
+                protectedRecoveryHandoff: { afterSuccessfulCompaction: false },
+              };
+            }
+            if (prompts.length === 2) {
+              expect(nextOptions.turnId).toBe(options.turnId);
+              return {
+                status: "error", result: null, error: "post-compaction internal resume required",
+                requiresToolEnabledContinuation: true,
+                protectedRecoveryHandoff: { afterSuccessfulCompaction: true },
+              };
+            }
+            expect(nextOptions.protectedRecoveryInternalResume).toBe(true);
+            expect(nextOptions.turnId).toBe(options.turnId);
+            return { status: "success", result: "Durable release completed with tools.", attachments: [] };
+          },
+        );
+        if ((output.status === "success" || output.status === "tool_complete") && options.onTerminalOutput) {
+          await options.onTerminalOutput(output);
+        } else if (output.requiresToolEnabledContinuation
+          && options.protectedRecoveryHandoffMode === "durable_externalize") {
+          await options.onProtectedRecoveryHandoff?.(output);
+        }
+        return output;
+      },
+      getContextUsageForChat: async () => null,
+    },
+  });
+
+  await web.processChat("web:default", "default");
+
+  expect(db.getChatOperationDisposition(accepted.sourceSeq)).toMatchObject({
+    outcome: "interrupted", cause: "protected_recovery_continuation_registered",
+  });
+  const child = db.peekNextAcceptedChatSource("web:default")!;
+  expect(child).toMatchObject({ sourceKind: "protected_continuation", payloadRef: `accepted-source:${accepted.sourceSeq}` });
+  expect(db.getChatCursor("web:default")).toBe(sourceTimestamp);
+  expect(db.getDb().prepare(`SELECT COUNT(*) AS count FROM messages
+    WHERE chat_jid = ? AND is_bot_message = 1 AND content = 'Recovery continuation scheduled.'`)
+    .get("web:default") as any).toMatchObject({ count: 1 });
+  expect(db.getDb().prepare(`SELECT COUNT(*) AS count FROM messages
+    WHERE chat_jid = ? AND is_bot_message = 0 AND content = ?`)
+    .get("web:default", TOOL_ENABLED_RECOVERY_CONTINUATION_PROMPT) as any).toMatchObject({ count: 0 });
+
+  await web.processChat("web:default", "default");
+
+  expect(modes).toEqual(["durable_externalize", "durable_continuation"]);
+  expect(prompts).toHaveLength(3);
+  expect(prompts[1]).toContain(TOOL_ENABLED_RECOVERY_CONTINUATION_PROMPT);
+  expect(prompts[2]).toBe(TOOL_ENABLED_RECOVERY_CONTINUATION_PROMPT);
+  expect(db.getChatOperationDisposition(child.sourceSeq)).toMatchObject({ outcome: "succeeded" });
+  expect(db.getChatOperation("web:default")).toBeNull();
+  expect(db.getDb().prepare(`SELECT COUNT(*) AS count FROM messages
+    WHERE chat_jid = ? AND is_bot_message = 1 AND content = 'Durable release completed with tools.'`)
+    .get("web:default") as any).toMatchObject({ count: 1 });
+  expect(db.getDb().prepare(`SELECT COUNT(*) AS count FROM messages
+    WHERE chat_jid = ? AND is_bot_message = 1 AND content_blocks LIKE '%blank_final%'`)
+    .get("web:default") as any).toMatchObject({ count: 0 });
+  expect(web.getQueuedFollowupItems("web:default")).toHaveLength(0);
+});
+
+test("durable protected handoff rolls back its artifact on successor failure and retries exactly once", async () => {
+  const ws = createTempWorkspace("piclaw-web-channel-");
+  cleanupWorkspace = ws.cleanup;
+  restoreEnv = setEnv({ PICLAW_WORKSPACE: ws.workspace, PICLAW_STORE: ws.store, PICLAW_DATA: ws.data });
+
+  const db = await import("../../../src/db.js");
+  db.initDatabase();
+  db.getDb().exec("DELETE FROM message_media; DELETE FROM messages; DELETE FROM chats; DELETE FROM chat_cursors;");
+  db.storeChatMetadata("web:default", new Date().toISOString(), "Web");
+  const source = db.storeAcceptedChatMessageSource({
+    id: `msg-${crypto.randomUUID()}`,
+    chat_jid: "web:default",
+    sender: "user",
+    sender_name: "User",
+    content: "continue after an atomic successor fault",
+    timestamp: new Date().toISOString(),
+    is_from_me: false,
+    is_bot_message: false,
+  }).source;
+  db.getDb().exec(`CREATE TRIGGER fail_protected_successor
+    BEFORE INSERT ON chat_accepted_sources
+    WHEN NEW.source_kind = 'protected_continuation'
+    BEGIN SELECT RAISE(ABORT, 'forced protected successor failure'); END;`);
+
+  const commits: boolean[] = [];
+  const webMod = await import("../../../src/channels/web.js");
+  const web = new (webMod.WebChannel as any)({
+    queue: { enqueue: () => {} },
+    agentPool: {
+      setSessionBinder: () => {},
+      runAgent: async (_prompt: string, _chatJid: string, options: any) => {
+        expect(options.protectedRecoveryHandoffMode).toBe("durable_externalize");
+        const output = {
+          status: "error" as const,
+          result: null,
+          error: "protected handoff required",
+          requiresToolEnabledContinuation: true,
+          protectedRecoveryHandoff: { afterSuccessfulCompaction: false },
+        };
+        commits.push(Boolean(await options.onProtectedRecoveryHandoff?.(output)));
+        return output;
+      },
+      getContextUsageForChat: async () => null,
+    },
+  });
+
+  await web.processChat("web:default", "default");
+
+  expect(commits).toEqual([false]);
+  const blocked = db.getChatOperation("web:default")!;
+  expect(blocked).toMatchObject({ sourceSeq: source.sourceSeq, phase: "blocked" });
+  expect(db.getChatOperationDisposition(source.sourceSeq)).toBeNull();
+  expect(db.getDb().prepare(`SELECT COUNT(*) AS count FROM messages
+    WHERE chat_jid = ? AND is_bot_message = 1`).get("web:default") as any).toMatchObject({ count: 0 });
+  expect(db.getDb().prepare(`SELECT COUNT(*) AS count FROM chat_accepted_sources
+    WHERE chat_jid = ? AND source_kind = 'protected_continuation'`).get("web:default") as any).toMatchObject({ count: 0 });
+
+  db.getDb().exec("DROP TRIGGER fail_protected_successor");
+  expect(db.retryBlockedChatOperation("web:default", {
+    operationId: blocked.operationId,
+    sourceSeq: blocked.sourceSeq,
+    phase: blocked.phase,
+    generation: blocked.generation,
+  }).status).toBe("applied");
+  await web.processChat("web:default", "default");
+
+  expect(commits).toEqual([false, true]);
+  expect(db.getChatOperationDisposition(source.sourceSeq)).toMatchObject({
+    outcome: "interrupted", cause: "protected_recovery_continuation_registered",
+  });
+  expect(db.getDb().prepare(`SELECT COUNT(*) AS count FROM messages
+    WHERE chat_jid = ? AND is_bot_message = 1 AND content = 'Recovery continuation scheduled.'`)
+    .get("web:default") as any).toMatchObject({ count: 1 });
+  expect(db.getDb().prepare(`SELECT COUNT(*) AS count FROM chat_accepted_sources
+    WHERE chat_jid = ? AND source_kind = 'protected_continuation'`).get("web:default") as any).toMatchObject({ count: 1 });
+});
+
+test("durable processChat atomically refuses malformed protected lineage with visible terminal evidence", async () => {
+  const ws = createTempWorkspace("piclaw-web-channel-");
+  cleanupWorkspace = ws.cleanup;
+  restoreEnv = setEnv({ PICLAW_WORKSPACE: ws.workspace, PICLAW_STORE: ws.store, PICLAW_DATA: ws.data });
+
+  const db = await import("../../../src/db.js");
+  db.initDatabase();
+  db.getDb().exec("DELETE FROM message_media; DELETE FROM messages; DELETE FROM chats; DELETE FROM chat_cursors;");
+  db.storeChatMetadata("web:default", new Date().toISOString(), "Web");
+  const missingRootSeq = 999_999;
+  db.getDb().prepare(`INSERT INTO chat_accepted_sources
+    (chat_jid, source_class, source_kind, source_id, accepted_at, selectable, payload_ref,
+     frontier_message_id, frontier_cursor_ts, operation_id)
+    VALUES (?, 'prompt', 'protected_continuation', ?, ?, 1, ?, NULL, NULL, NULL)`)
+    .run("web:default", `source:${missingRootSeq}`, new Date().toISOString(), `accepted-source:${missingRootSeq}`);
+  const source = db.peekNextAcceptedChatSource("web:default")!;
+  let runCalls = 0;
+  const webMod = await import("../../../src/channels/web.js");
+  const web = new (webMod.WebChannel as any)({
+    queue: { enqueue: () => {} },
+    agentPool: {
+      setSessionBinder: () => {},
+      runAgent: async () => { runCalls += 1; throw new Error("must not run"); },
+      getContextUsageForChat: async () => null,
+    },
+  });
+
+  await web.processChat("web:default", "default");
+
+  expect(runCalls).toBe(0);
+  expect(db.getChatOperationDisposition(source.sourceSeq)).toMatchObject({
+    outcome: "failed",
+    cause: "protected_continuation_invalid_lineage",
+    provenance: "web_process_chat_protected_refusal",
+  });
+  expect(db.getChatOperation("web:default")).toBeNull();
+  expect(db.getDb().prepare(`SELECT COUNT(*) AS count FROM messages
+    WHERE chat_jid = ? AND is_terminal_agent_reply = 1
+      AND content LIKE 'Protected recovery continuation could not be resumed%'`)
+    .get("web:default") as any).toMatchObject({ count: 1 });
+});
+
 test("processChat never enqueues when an internal handoff invariant escapes AgentPool", async () => {
   const ws = createTempWorkspace("piclaw-web-channel-");
   cleanupWorkspace = ws.cleanup;

@@ -365,6 +365,10 @@ export class AgentPool {
       const result = await this.runAgentOwned(prompt, chatJid, options);
       if ((result.status === "success" || result.status === "tool_complete") && options.onTerminalOutput) {
         terminalOutputCommitted = await options.onTerminalOutput(result);
+      } else if (result.requiresToolEnabledContinuation
+        && options.protectedRecoveryHandoffMode === "durable_externalize"
+        && options.onProtectedRecoveryHandoff) {
+        terminalOutputCommitted = await options.onProtectedRecoveryHandoff(result);
       }
       return result;
     });

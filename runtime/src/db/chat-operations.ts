@@ -10,7 +10,7 @@ export type ChatOperationPhase = (typeof CHAT_OPERATION_PHASES)[number];
 export const CHAT_SOURCE_CLASSES = ["prompt", "control", "intent"] as const;
 export type ChatSourceClass = (typeof CHAT_SOURCE_CLASSES)[number];
 
-export const CHAT_SOURCE_KINDS = ["message", "queued_followup", "command", "steer"] as const;
+export const CHAT_SOURCE_KINDS = ["message", "queued_followup", "protected_continuation", "command", "steer"] as const;
 export type ChatSourceKind = (typeof CHAT_SOURCE_KINDS)[number];
 
 export const CHAT_OPERATION_OUTCOMES = [
@@ -95,7 +95,7 @@ export type ChatOperationMessageBindResult =
   | { status: "bound" }
   | { status: "rejected"; reason: ChatOperationMismatch | "message_missing" | "message_operation_mismatch" };
 
-export type ChatOperationCompletionBoundary = "artifact" | "intents" | "disposition" | "cursor" | "release";
+export type ChatOperationCompletionBoundary = "artifact" | "successor" | "intents" | "disposition" | "frontier" | "release";
 export interface ChatOperationCompletionHooks { afterWrite?(boundary: ChatOperationCompletionBoundary): void }
 
 export class ChatOperationInvariantError extends Error {
@@ -219,6 +219,9 @@ export function registerAcceptedChatSource(input: {
   frontier?: { messageId: string; cursorTs: string };
 }): { status: "registered" | "existing"; source: AcceptedChatSource } {
   if (input.sourceClass === "intent") throw new Error("Use registerChatOperationIntent for operation-bound intent acceptance");
+  if (input.sourceClass === "prompt" && input.sourceKind === "protected_continuation") {
+    throw new Error("Protected continuations can only be registered by atomic operation completion");
+  }
   if (input.sourceClass === "prompt" && input.sourceKind !== "message" && input.sourceKind !== "queued_followup") {
     throw new Error("Prompt sources must be messages or queued follow-ups");
   }
@@ -335,18 +338,47 @@ export function getAcceptedChatSource(sourceSeq: number): AcceptedChatSource | n
   return row ? sourceFromRow(row) : null;
 }
 
+const PROTECTED_CONTINUATION_SOURCE_PREFIX = "source:";
+const PROTECTED_CONTINUATION_PAYLOAD_PREFIX = "accepted-source:";
+
+function protectedContinuationIdentity(rootSourceSeq: number): { sourceId: string; payloadRef: string } {
+  if (!Number.isInteger(rootSourceSeq) || rootSourceSeq <= 0) {
+    throw new ChatOperationInvariantError("Protected continuation root source must be a positive integer");
+  }
+  return {
+    sourceId: `${PROTECTED_CONTINUATION_SOURCE_PREFIX}${rootSourceSeq}`,
+    payloadRef: `${PROTECTED_CONTINUATION_PAYLOAD_PREFIX}${rootSourceSeq}`,
+  };
+}
+
+/** Resolve and transactionally revalidate a protected continuation's immutable root lineage. */
+export function getProtectedContinuationRootSource(source: AcceptedChatSource): AcceptedChatSource | null {
+  if (source.sourceClass !== "prompt" || source.sourceKind !== "protected_continuation" || !source.selectable) return null;
+  const sourceIdSeq = Number(source.sourceId.slice(PROTECTED_CONTINUATION_SOURCE_PREFIX.length));
+  const payloadSeq = Number(source.payloadRef.slice(PROTECTED_CONTINUATION_PAYLOAD_PREFIX.length));
+  if (!source.sourceId.startsWith(PROTECTED_CONTINUATION_SOURCE_PREFIX)
+    || !source.payloadRef.startsWith(PROTECTED_CONTINUATION_PAYLOAD_PREFIX)
+    || !Number.isInteger(sourceIdSeq) || sourceIdSeq <= 0 || sourceIdSeq !== payloadSeq) return null;
+  const identity = protectedContinuationIdentity(sourceIdSeq);
+  if (source.sourceId !== identity.sourceId || source.payloadRef !== identity.payloadRef) return null;
+  const root = getAcceptedChatSource(sourceIdSeq);
+  if (!root || root.chatJid !== source.chatJid || root.sourceSeq !== sourceIdSeq
+    || root.sourceClass !== "prompt" || !root.selectable || root.sourceKind === "protected_continuation") return null;
+  return root;
+}
+
 export function getResumableDurableChatJids(): string[] {
   const rows = getDb().prepare(`
     SELECT cursor.chat_jid FROM chat_cursors cursor
     JOIN chat_accepted_sources source ON source.source_seq = cursor.operation_source_seq
     WHERE cursor.operation_id IS NOT NULL AND cursor.operation_phase IN ('pending', 'preflight', 'running', 'waiting')
-      AND source.source_kind = 'message'
+      AND source.source_kind IN ('message', 'protected_continuation')
     UNION
     SELECT source.chat_jid
     FROM chat_accepted_sources source
     LEFT JOIN chat_operation_dispositions disposition ON disposition.source_seq = source.source_seq
     LEFT JOIN chat_cursors cursor ON cursor.chat_jid = source.chat_jid
-    WHERE source.source_kind = 'message' AND source.selectable = 1
+    WHERE source.source_kind IN ('message', 'protected_continuation') AND source.selectable = 1
       AND disposition.source_seq IS NULL AND cursor.operation_id IS NULL
     ORDER BY 1
   `).all() as Array<{ chat_jid: string }>;
@@ -357,7 +389,7 @@ export function getBlockedDurableChatJids(): string[] {
   const rows = getDb().prepare(`SELECT cursor.chat_jid FROM chat_cursors cursor
     JOIN chat_accepted_sources source ON source.source_seq = cursor.operation_source_seq
     WHERE cursor.operation_id IS NOT NULL AND cursor.operation_phase = 'blocked'
-      AND source.source_kind = 'message' ORDER BY cursor.chat_jid`)
+      AND source.source_kind IN ('message', 'protected_continuation') ORDER BY cursor.chat_jid`)
     .all() as Array<{ chat_jid: string }>;
   return rows.map((row) => row.chat_jid);
 }
@@ -537,6 +569,11 @@ export interface BlockedChatOperationSkip {
   createdAt: string;
 }
 
+export interface ProtectedContinuationSuccessor {
+  sourceKind: "protected_continuation";
+  rootSourceSeq: number;
+}
+
 export interface ChatOperationCompletion {
   owner: ChatOperationOwner;
   outcome: ChatOperationOutcome;
@@ -544,6 +581,7 @@ export interface ChatOperationCompletion {
   provenance: string;
   createdAt: string;
   artifact?: { messageId: string; message?: never } | { message: NewMessage; messageId?: never };
+  successor?: ProtectedContinuationSuccessor;
   intentDispositions?: Array<{ sourceSeq: number; outcome: ChatOperationOutcome; cause: string; provenance: string }>;
 }
 
@@ -606,6 +644,27 @@ export function completeChatOperation(
       if (!sameDisposition(existing, source, chatJid, request)) {
         throw new ChatOperationInvariantError("Conflicting repeated completion");
       }
+      const identity = protectedContinuationIdentity(request.owner.sourceSeq);
+      const successorRow = db.prepare(`SELECT * FROM chat_accepted_sources
+        WHERE chat_jid = ? AND source_kind = 'protected_continuation' AND source_id = ?`)
+        .get(chatJid, identity.sourceId) as SourceRow | undefined;
+      if (Boolean(successorRow) !== Boolean(request.successor)) {
+        throw new ChatOperationInvariantError("Conflicting repeated protected continuation successor");
+      }
+      if (request.successor) {
+        if (request.successor.sourceKind !== "protected_continuation"
+          || request.successor.rootSourceSeq !== request.owner.sourceSeq) {
+          throw new ChatOperationInvariantError("Protected continuation lineage conflicts with completed source");
+        }
+        const successor = sourceFromRow(successorRow!);
+        if (successor.sourceClass !== "prompt" || successor.sourceKind !== "protected_continuation"
+          || !successor.selectable || successor.payloadRef !== identity.payloadRef
+          || successor.acceptedAt !== existing.createdAt || successor.operationId !== null
+          || successor.frontierMessageId !== null || successor.frontierCursorTs !== null
+          || getProtectedContinuationRootSource(successor)?.sourceSeq !== request.owner.sourceSeq) {
+          throw new ChatOperationInvariantError("Conflicting repeated protected continuation successor");
+        }
+      }
       return { status: "repeated", disposition: existing } as const;
     }
     const active = getChatOperation(chatJid);
@@ -645,6 +704,45 @@ export function completeChatOperation(
       artifact = { chatJid, messageId };
     }
     hooks.afterWrite?.("artifact");
+
+    if (request.successor) {
+      if (request.successor.sourceKind !== "protected_continuation") {
+        throw new ChatOperationInvariantError("Protected continuation successor kind is invalid");
+      }
+      if (request.outcome !== "interrupted"
+        || request.cause !== "protected_recovery_continuation_registered") {
+        throw new ChatOperationInvariantError("Protected continuation requires the interrupted protected handoff outcome");
+      }
+      const schedulingArtifact = artifact
+        ? db.prepare("SELECT content FROM messages WHERE chat_jid = ? AND id = ?")
+          .get(artifact.chatJid, artifact.messageId) as { content: string | null } | undefined
+        : undefined;
+      if (!schedulingArtifact || !String(schedulingArtifact.content ?? "").trim()) {
+        throw new ChatOperationInvariantError("Protected continuation requires one non-blank scheduling artifact");
+      }
+      if (request.successor.rootSourceSeq !== source.sourceSeq || source.sourceClass !== "prompt"
+        || !source.selectable || source.sourceKind === "protected_continuation") {
+        throw new ChatOperationInvariantError("Protected continuation requires a non-continuation selectable prompt root");
+      }
+      const identity = protectedContinuationIdentity(source.sourceSeq);
+      const inserted = db.prepare(`INSERT INTO chat_accepted_sources
+        (chat_jid, source_class, source_kind, source_id, accepted_at, selectable, payload_ref,
+         frontier_message_id, frontier_cursor_ts, operation_id)
+        VALUES (?, 'prompt', 'protected_continuation', ?, ?, 1, ?, NULL, NULL, NULL)
+        ON CONFLICT(chat_jid, source_kind, source_id) DO NOTHING`)
+        .run(chatJid, identity.sourceId, request.createdAt, identity.payloadRef);
+      const successor = sourceFromRow(db.prepare(`SELECT * FROM chat_accepted_sources
+        WHERE chat_jid = ? AND source_kind = 'protected_continuation' AND source_id = ?`)
+        .get(chatJid, identity.sourceId) as SourceRow);
+      if (inserted.changes !== 1 || successor.acceptedAt !== request.createdAt
+        || successor.sourceClass !== "prompt" || !successor.selectable
+        || successor.payloadRef !== identity.payloadRef || successor.operationId !== null
+        || successor.frontierMessageId !== null || successor.frontierCursorTs !== null
+        || getProtectedContinuationRootSource(successor)?.sourceSeq !== source.sourceSeq) {
+        throw new ChatOperationInvariantError("Protected continuation identity was reused with different immutable lineage");
+      }
+    }
+    hooks.afterWrite?.("successor");
 
     const pendingIntentRows = db.prepare(`SELECT source_seq FROM chat_accepted_sources
       WHERE operation_id = ? AND selectable = 0 ORDER BY source_seq`)
@@ -686,7 +784,7 @@ export function completeChatOperation(
         chatJid, active.operationId, active.sourceSeq, active.phase, active.generation);
     const released = db.prepare("SELECT changes() AS changes").get() as { changes: number };
     if (released.changes !== 1) throw new ChatOperationInvariantError("Active release lost owner comparison");
-    hooks.afterWrite?.("cursor");
+    hooks.afterWrite?.("frontier");
     hooks.afterWrite?.("release");
     return { status: "completed", disposition } as const;
   }).immediate();
