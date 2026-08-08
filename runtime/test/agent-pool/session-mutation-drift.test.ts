@@ -1,0 +1,153 @@
+import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { relative, resolve } from "node:path";
+import * as ts from "typescript";
+
+const sourceRoot = resolve(import.meta.dir, "../../src");
+const directMethodNames = new Set([
+  "prompt", "compact", "abortCompaction", "setModel", "setThinkingLevel", "newSession",
+  "switchSession", "fork", "navigateTree", "reload", "setSessionName",
+  "setAutoCompactionEnabled", "setAutoRetryEnabled", "abortRetry", "clearQueue", "bindExtensions",
+]);
+const directFunctionNames = new Set(["rotateSession", "maybeAutoCompactSessionBeforePrompt"]);
+const gatewayMethodNames = new Set([
+  "runAgent", "applyControlCommand", "emergencyRotateSession", "runSessionMutation",
+  "restoreSessionPosition", "disposeChatSession", "getSessionForIntrospection", "renameChatBranch",
+  "pruneChatBranch", "mergeChatBranchIntoParent", "renameChatJid", "restoreChatBranch",
+  "permanentPurgeChatBranch", "queueStreamingMessage", "removeQueuedFollowupMessage", "applySlashCommand",
+]);
+
+type Inventory = Record<string, Record<string, number>>;
+
+function add(inventory: Inventory, file: string, mutation: string): void {
+  const entry = (inventory[file] ??= {});
+  entry[mutation] = (entry[mutation] ?? 0) + 1;
+}
+
+function sortInventory(inventory: Inventory): Inventory {
+  return Object.fromEntries(
+    Object.entries(inventory).sort(([left], [right]) => left.localeCompare(right)).map(([file, methods]) => [
+      file,
+      Object.fromEntries(Object.entries(methods).sort(([left], [right]) => left.localeCompare(right))),
+    ]),
+  );
+}
+
+function collectInventory(): { direct: Inventory; callers: Inventory } {
+  const direct: Inventory = {};
+  const callers: Inventory = {};
+  for (const path of new Bun.Glob("**/*.ts").scanSync({ cwd: sourceRoot, absolute: true })) {
+    const file = relative(sourceRoot, path).replaceAll("\\", "/");
+    const source = readFileSync(path, "utf8");
+    const sourceFile = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+    const visit = (node: ts.Node): void => {
+      if (ts.isCallExpression(node)) {
+        const expression = node.expression;
+        if (ts.isPropertyAccessExpression(expression)) {
+          const method = expression.name.text;
+          const receiver = expression.expression.getText(sourceFile);
+          if (directMethodNames.has(method)) add(direct, file, method);
+          if (method === "abort" && /session/i.test(receiver)) add(direct, file, method);
+          if (method === "dispose" && /(?:session|runtime)/i.test(receiver)) add(direct, file, method);
+          if (file !== "agent-pool.ts" && gatewayMethodNames.has(method)) add(callers, file, method);
+        } else if (ts.isIdentifier(expression) && directFunctionNames.has(expression.text)) {
+          add(direct, file, expression.text);
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(sourceFile);
+  }
+  return { direct: sortInventory(direct), callers: sortInventory(callers) };
+}
+
+const directOwnershipClass: Record<string, string> = {
+  "agent-control/agent-control-helpers.ts": "control-or-recovery-beneath-gateway",
+  "agent-control/handlers/control.ts": "legacy-control-beneath-gateway",
+  "agent-control/handlers/model.ts": "legacy-control-beneath-gateway",
+  "agent-control/handlers/queue.ts": "legacy-control-beneath-gateway",
+  "agent-control/handlers/session.ts": "legacy-control-beneath-gateway",
+  "agent-control/handlers/tree.ts": "legacy-control-beneath-gateway",
+  "agent-pool.ts": "gateway-implementation",
+  "agent-pool/branch-manager.ts": "legacy-lifecycle-beneath-gateway",
+  "agent-pool/compaction.ts": "operation-or-legacy-beneath-gateway",
+  "agent-pool/context-pressure-retry.ts": "operation-or-legacy-beneath-gateway",
+  "agent-pool/run-agent-attempt-context.ts": "operation-owned-beneath-gateway",
+  "agent-pool/run-agent-orchestrator.ts": "operation-or-legacy-beneath-gateway",
+  "agent-pool/run-agent-recovery-phase.ts": "operation-or-legacy-beneath-gateway",
+  "agent-pool/runtime-facade.ts": "operation-or-legacy-beneath-gateway",
+  "agent-pool/session-manager.ts": "session-lifecycle-beneath-gateway",
+  "agent-pool/session.ts": "session-lifecycle-beneath-gateway",
+  "agent-pool/side-prompt-runner.ts": "isolated-side-session",
+  "agent-pool/slash-command.ts": "control-beneath-gateway",
+  "agent-pool/turn-coordinator.ts": "operation-or-legacy-beneath-gateway",
+  "channels/web/theming/ui-bridge.ts": "bound-callback-through-gateway",
+  "extensions/model-control.ts": "extension-inside-owning-prompt-context",
+  "session-rotation.ts": "rotation-beneath-gateway",
+};
+
+const expectedDirect: Inventory = {
+  "agent-control/agent-control-helpers.ts": { compact: 1, prompt: 1, setThinkingLevel: 1 },
+  "agent-control/handlers/control.ts": { abort: 3, abortCompaction: 1, abortRetry: 1, compact: 1, reload: 1, setAutoCompactionEnabled: 1, setAutoRetryEnabled: 1 },
+  "agent-control/handlers/model.ts": { compact: 1, setModel: 2 },
+  "agent-control/handlers/queue.ts": { prompt: 1 },
+  "agent-control/handlers/session.ts": { fork: 2, newSession: 1, rotateSession: 1, setSessionName: 2, switchSession: 2 },
+  "agent-control/handlers/tree.ts": { navigateTree: 1 },
+  "agent-pool.ts": { rotateSession: 1 },
+  "agent-pool/branch-manager.ts": { dispose: 10, setSessionName: 1 },
+  "agent-pool/compaction.ts": { abort: 1, abortCompaction: 1, compact: 1 },
+  "agent-pool/context-pressure-retry.ts": { compact: 1, prompt: 1 },
+  "agent-pool/run-agent-attempt-context.ts": { abort: 2 },
+  "agent-pool/run-agent-orchestrator.ts": { abort: 3, maybeAutoCompactSessionBeforePrompt: 1, prompt: 1, rotateSession: 4 },
+  "agent-pool/run-agent-recovery-phase.ts": { compact: 1 },
+  "agent-pool/runtime-facade.ts": { clearQueue: 2, navigateTree: 1, prompt: 2 },
+  "agent-pool/session-manager.ts": { dispose: 1, newSession: 2, setModel: 1, setSessionName: 1, setThinkingLevel: 2, switchSession: 1 },
+  "agent-pool/session.ts": { reload: 1, setAutoCompactionEnabled: 1 },
+  "agent-pool/side-prompt-runner.ts": { abort: 2, prompt: 1 },
+  "agent-pool/slash-command.ts": { abort: 1 },
+  "agent-pool/turn-coordinator.ts": { abort: 1 },
+  "channels/web/theming/ui-bridge.ts": { bindExtensions: 1, fork: 1, navigateTree: 1, newSession: 1, reload: 1, switchSession: 1 },
+  "extensions/model-control.ts": { setModel: 1, setThinkingLevel: 1 },
+  "session-rotation.ts": { compact: 1, newSession: 1, switchSession: 2 },
+};
+
+const expectedCallers: Inventory = {
+  "channels/web/agent/agent-commands.ts": { getSessionForIntrospection: 1 },
+  "channels/web/agent/agent-control-plane-service.ts": { applySlashCommand: 1, mergeChatBranchIntoParent: 1, permanentPurgeChatBranch: 1, pruneChatBranch: 1, queueStreamingMessage: 1, removeQueuedFollowupMessage: 1, renameChatBranch: 1, renameChatJid: 1, restoreChatBranch: 1 },
+  "channels/web/agent/agent-debug.ts": { getSessionForIntrospection: 1 },
+  "channels/web/cards/adaptive-card-side-prompt-service.ts": { applyControlCommand: 1 },
+  "channels/web/core/web-channel-runtime-public-surface-service.ts": { queueStreamingMessage: 1 },
+  "channels/web/handlers/addons.ts": { applySlashCommand: 1 },
+  "channels/web/handlers/agent.ts": { applyControlCommand: 3, applySlashCommand: 1, queueStreamingMessage: 2, runAgent: 1 },
+  "channels/web/runtime/process-chat-control-runtime.ts": { applyControlCommand: 1 },
+  "channels/web/runtime/process-chat-preflight-runtime.ts": { emergencyRotateSession: 2, runSessionMutation: 2 },
+  "channels/web/runtime/queued-followup-lifecycle-service.ts": { removeQueuedFollowupMessage: 1 },
+  "dream.ts": { applyControlCommand: 1, disposeChatSession: 1, runAgent: 1 },
+  "runtime/message-loop.ts": { applyControlCommand: 1, applySlashCommand: 1, runAgent: 1 },
+  "runtime/startup.ts": { applyControlCommand: 5 },
+  "task-scheduler.ts": { applyControlCommand: 1, restoreSessionPosition: 1, runAgent: 1 },
+};
+
+const mutationInventory = collectInventory();
+
+describe("persistent session mutation drift", () => {
+  test("snapshots every direct runtime mutator and assigns one ownership class", () => {
+    expect(mutationInventory.direct).toEqual(expectedDirect);
+    expect(Object.keys(directOwnershipClass).sort()).toEqual(Object.keys(mutationInventory.direct).sort());
+  });
+
+  test("snapshots every caller of a public persistent-session gateway entry", () => {
+    expect(mutationInventory.callers).toEqual(expectedCallers);
+  });
+
+  test("keeps web preflight and bound extension actions on the gateway", () => {
+    const preflight = readFileSync(resolve(sourceRoot, "channels/web/runtime/process-chat-preflight-runtime.ts"), "utf8");
+    expect(preflight).not.toContain("getSessionForIntrospection");
+    expect(preflight.match(/\.runSessionMutation\(/g)).toHaveLength(2);
+
+    const uiBridge = readFileSync(resolve(sourceRoot, "channels/web/theming/ui-bridge.ts"), "utf8");
+    for (const mutation of ["newSession", "fork", "navigateTree", "switchSession", "reload"]) {
+      expect(uiBridge).toMatch(new RegExp(`${mutation}:[\\s\\S]{0,180}mutate\\(`));
+    }
+  });
+});

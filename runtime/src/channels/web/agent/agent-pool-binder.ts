@@ -2,10 +2,14 @@
  * channels/web/agent-pool-binder.ts – safely bind UI session bridge to AgentPool.
  */
 
-import type { AgentPool } from "../../../agent-pool.js";
+import type { AgentPool, BoundSessionMutationRunner } from "../../../agent-pool.js";
 import type { AgentSessionRuntime } from "@earendil-works/pi-coding-agent";
 
-type SessionBinder = (runtime: AgentSessionRuntime, chatJid: string) => Promise<void> | void;
+type SessionBinder = (
+  runtime: AgentSessionRuntime,
+  chatJid: string,
+  mutate: BoundSessionMutationRunner,
+) => Promise<void> | void;
 
 interface SessionBinderCapable {
   setSessionBinder(binder?: SessionBinder): void;

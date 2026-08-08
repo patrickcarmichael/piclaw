@@ -11,6 +11,7 @@ import type {
 import type { AttachmentInfo } from "./attachments.js";
 import type { AgentAbortCause } from "./abort-provenance.js";
 import type { PiclawCredentialStore } from "./credential-store.js";
+import type { ChatOperationOwner } from "../db.js";
 
 export type AgentFailureCategory =
   | "rate_limit"
@@ -118,6 +119,8 @@ export interface SidePromptOptions {
 
 /** Options for AgentPool.runAgent(): chatJid, messages, callbacks. */
 export interface RunAgentOptions {
+  /** Exact durable operation owner for persistent-session mutation fencing. */
+  operationOwner?: ChatOperationOwner;
   onEvent?: (event: AgentSessionEvent) => void;
   /** Called when a completed assistant message can be committed, including before tool dispatch. */
   onTurnComplete?: (turn: TurnOutput) => void;

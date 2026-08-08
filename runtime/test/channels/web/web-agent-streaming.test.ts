@@ -199,12 +199,14 @@ describe("web agent streaming", () => {
 
   test("accepts and atomically completes one normal web message as a durable operation", async () => {
     let runs = 0;
+    let runOwner: { operationId: string; sourceSeq: number; phase: string; generation: number } | undefined;
     const agentPool = {
       setSessionBinder: () => {},
       isStreaming: () => false,
       isActive: () => false,
-      runAgent: async () => {
+      runAgent: async (_prompt: string, _chatJid: string, options: { operationOwner?: typeof runOwner }) => {
         runs += 1;
+        runOwner = options.operationOwner;
         return { status: "success", result: "durable response", attachments: [] };
       },
       getContextUsageForChat: async () => null,
@@ -253,6 +255,12 @@ describe("web agent streaming", () => {
           operation_id: string | null;
         };
       expect(terminal).toEqual({ is_terminal_agent_reply: 1, operation_id: disposition!.operationId });
+      expect(runOwner).toEqual({
+        operationId: disposition!.operationId,
+        sourceSeq: accepted!.source_seq,
+        phase: "running",
+        generation: 2,
+      });
 
       await fixture.channel.processChat("web:default", "default");
       expect(runs).toBe(1);
@@ -963,7 +971,7 @@ describe("web agent streaming", () => {
     } as any;
     const agentPool = {
       setSessionBinder: () => {},
-      getSessionForIntrospection: async () => session,
+      runSessionMutation: async (_chatJid: string, _mutation: string, _request: unknown, action: (current: typeof session) => unknown) => action(session),
       runAgent: async () => {
         runCalls += 1;
         return { status: "success", result: "after compaction", attachments: [] };
