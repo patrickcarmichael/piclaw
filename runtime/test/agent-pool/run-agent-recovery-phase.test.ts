@@ -64,6 +64,35 @@ function recoveryConfig(overrides: Partial<Parameters<typeof runAgentRecoveryPha
 }
 
 describe("runAgentRecoveryPhase", () => {
+  test("does not begin or retry an attempt after operation cancellation", async () => {
+    let attempts = 0;
+    const result = await runAgentRecoveryPhase({
+      prompt: "cancelled prompt",
+      chatJid: "web:test-recovery-phase",
+      session: {} as any,
+      sessionCtrl: null,
+      timeoutMs: 10_000,
+      startTime: Date.now(),
+      modelLabel: "test/model",
+      recoveryConfig: recoveryConfig(),
+      runOptions: {},
+      logsDir: "/tmp/nonexistent-piclaw-test-logs",
+      clearAttachments: () => {},
+      isCancelled: () => true,
+      runPromptAttempt: async () => {
+        attempts += 1;
+        return attempt();
+      },
+    });
+
+    expect(attempts).toBe(0);
+    expect(result).toMatchObject({
+      status: "error",
+      failureCategory: "aborted",
+      error: "Operation cancelled.",
+    });
+  });
+
   test("continues after resolved tool work with tools available and execution budget carried", async () => {
     let activeTools = ["read", "bash"];
     const activeToolSets: string[][] = [];

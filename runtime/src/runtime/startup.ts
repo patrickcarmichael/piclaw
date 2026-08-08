@@ -322,6 +322,7 @@ async function buildSessionControlSnapshot(agentPool: AgentPool, chatJid: string
   const activity = getSessionActivitySnapshot(chatJid);
   const context = await agentPool.getContextUsageForChat(chatJid).catch(() => null);
   const tree = agentPool.getSessionTreeForChat(chatJid);
+  const operation = getChatOperation(chatJid);
   return {
     chat_jid: chatJid,
     active: agentPool.isActive(chatJid),
@@ -336,6 +337,13 @@ async function buildSessionControlSnapshot(agentPool: AgentPool, chatJid: string
     thinking_level: models?.thinking_level ?? null,
     context_usage: context,
     failed_run: summarizeFailedRun(chatJid),
+    operation: operation ? {
+      operation_id: operation.operationId,
+      source_seq: operation.sourceSeq,
+      phase: operation.phase,
+      generation: operation.generation,
+      cancellation: operation.cancellation,
+    } : null,
     cursor: getCursorSnapshot(chatJid),
     tree: tree ? { leaf_id: tree.leafId, total: tree.total, capped: tree.capped ?? false } : null,
   };
@@ -392,20 +400,20 @@ function resolveSessionControlTarget(agentPool: AgentPool, request: SessionContr
   return { chatJid: found.chat_jid, agentName: found.agent_name || agentName, sessionTree: buildSessionControlTreeDescriptor(known) };
 }
 
-function currentOperationMutationRequest(chatJid: string) {
+function operationExpectationMismatch(chatJid: string, expectedOperationId: string): {
+  reason: "no_active_operation" | "operation_mismatch";
+  observedOperationId: string | null;
+} | null {
   const operation = getChatOperation(chatJid);
-  return operation
-    ? { operationOwner: {
-        operationId: operation.operationId,
-        sourceSeq: operation.sourceSeq,
-        phase: operation.phase,
-        generation: operation.generation,
-      } }
-    : {};
+  if (!operation) return { reason: "no_active_operation", observedOperationId: null };
+  if (operation.operationId !== expectedOperationId) {
+    return { reason: "operation_mismatch", observedOperationId: operation.operationId };
+  }
+  return null;
 }
 
-function registerSessionControlHandler(agentPool: AgentPool, web: WebChannel): void {
-  setSessionControlHandler(async (request): Promise<SessionControlResult> => {
+export function createSessionControlHandler(agentPool: AgentPool, web: WebChannel) {
+  return async (request: SessionControlRequest): Promise<SessionControlResult> => {
     if (getSessionIsolationLevel() === "full") throw new Error("Session isolation is full; session_control is disabled.");
     const target = resolveSessionControlTarget(agentPool, request);
     const base = {
@@ -420,6 +428,46 @@ function registerSessionControlHandler(agentPool: AgentPool, web: WebChannel): v
     if (request.action === "inspect") return { ok: true, ...base, before };
     if (request.action === "assess_stuck") return { ok: true, ...base, before, assessment: assessSessionSnapshot(before) };
 
+    const expectedOperationId = request.expected_operation_id?.trim() || "";
+    const expectedNoOp = (): SessionControlResult | null => {
+      if (request.action !== "abort" && request.action !== "unblock") return null;
+      if (request.target_agent_name) {
+        const latestAlias = String(request.target_agent_name).trim().replace(/^@+/, "").trim();
+        const latestTarget = getChatBranchByAgentName(latestAlias);
+        if (!latestTarget || latestTarget.chat_jid !== target.chatJid) {
+          return {
+            ok: true,
+            ...base,
+            before,
+            status: "no_op",
+            no_op: true,
+            reason: "target_changed",
+            expected_operation_id: expectedOperationId,
+            observed_operation_id: latestTarget ? getChatOperation(latestTarget.chat_jid)?.operationId ?? null : null,
+            observed_target_chat_jid: latestTarget?.chat_jid ?? null,
+            message: "The target alias changed after resolution; no action was taken.",
+          };
+        }
+      }
+      const mismatch = operationExpectationMismatch(target.chatJid, expectedOperationId);
+      if (!mismatch) return null;
+      return {
+        ok: true,
+        ...base,
+        before,
+        status: "no_op",
+        no_op: true,
+        reason: mismatch.reason,
+        expected_operation_id: expectedOperationId,
+        observed_operation_id: mismatch.observedOperationId,
+        message: mismatch.reason === "no_active_operation"
+          ? "No active operation matched the request; no action was taken."
+          : "The active operation changed after inspection; no action was taken.",
+      };
+    };
+    const initialNoOp = expectedNoOp();
+    if (initialNoOp) return initialNoOp;
+
     let message: string;
     let extra: Record<string, unknown>;
     if (request.action === "compact") {
@@ -432,13 +480,29 @@ function registerSessionControlHandler(agentPool: AgentPool, web: WebChannel): v
       message = result.message || `Compaction ${result.status}.`;
       extra = { control_status: result.status };
     } else if (request.action === "abort") {
-      const result = await agentPool.applyControlCommand(
-        target.chatJid,
-        { type: "abort", raw: "/abort" },
-        currentOperationMutationRequest(target.chatJid),
-      );
-      message = result.message || `Abort ${result.status}.`;
-      extra = { control_status: result.status };
+      const result = await agentPool.cancelOperationAndAbort(target.chatJid, expectedOperationId);
+      if (result.status === "no_op") {
+        return {
+          ok: true,
+          ...base,
+          before,
+          status: "no_op",
+          no_op: true,
+          reason: result.reason,
+          expected_operation_id: expectedOperationId,
+          observed_operation_id: result.operation?.operationId ?? null,
+          message: "The target operation changed before cancellation; no action was taken.",
+        };
+      }
+      web.resumeChat(target.chatJid);
+      message = result.physicallyAborted
+        ? "Operation cancellation persisted and the matching active session was aborted."
+        : "Operation cancellation persisted; no matching active session required a physical abort.";
+      extra = {
+        control_status: result.abortResult?.status ?? "not_active",
+        cancellation_status: result.status,
+        physically_aborted: result.physicallyAborted,
+      };
     } else if (request.action === "switch_model") {
       const model = request.model?.trim();
       if (!model) throw new Error("switch_model requires model.");
@@ -473,6 +537,8 @@ function registerSessionControlHandler(agentPool: AgentPool, web: WebChannel): v
       const steps: Record<string, unknown>[] = [];
       if (request.model?.trim()) {
         const resolved = agentPool.resolveModelInput(request.model.trim());
+        const modelNoOp = expectedNoOp();
+        if (modelNoOp) return modelNoOp;
         if (!resolved.model) throw new Error(resolved.error || `Invalid model: ${request.model}`);
         const { provider, modelId } = parseModelLabel(resolved.model);
         const result = await agentPool.applyControlCommand(target.chatJid, {
@@ -484,6 +550,8 @@ function registerSessionControlHandler(agentPool: AgentPool, web: WebChannel): v
         steps.push({ action: "switch_model", status: result.status, requested_model: request.model.trim(), resolved_model: resolved.model });
       }
 
+      const racedNoOp = expectedNoOp();
+      if (racedNoOp) return racedNoOp;
       const retried = web.retryFailedOnModelSwitch(target.chatJid);
       if (retried) {
         web.resumeChat(target.chatJid);
@@ -491,16 +559,27 @@ function registerSessionControlHandler(agentPool: AgentPool, web: WebChannel): v
         steps.push({ action: "wake", resumed: true });
         message = "Failed run marked for retry and chat resumed.";
       } else if (before.streaming || before.compacting || before.active || (Array.isArray(before.active_tools) && before.active_tools.length > 0)) {
-        const result = await agentPool.applyControlCommand(
-          target.chatJid,
-          { type: "abort", raw: "/abort" },
-          currentOperationMutationRequest(target.chatJid),
-        );
-        steps.push({ action: "abort", status: result.status });
+        const result = await agentPool.cancelOperationAndAbort(target.chatJid, expectedOperationId);
+        if (result.status === "no_op") {
+          return {
+            ok: true,
+            ...base,
+            before,
+            status: "no_op",
+            no_op: true,
+            reason: result.reason,
+            expected_operation_id: expectedOperationId,
+            observed_operation_id: result.operation?.operationId ?? null,
+            message: "The target operation changed before cancellation; no action was taken.",
+          };
+        }
+        steps.push({ action: "abort", status: result.status, physically_aborted: result.physicallyAborted });
         web.resumeChat(target.chatJid);
         steps.push({ action: "wake", resumed: true });
-        message = "Active target work aborted and chat resumed.";
+        message = "Active target operation cancelled and chat resumed.";
       } else {
+        const wakeNoOp = expectedNoOp();
+        if (wakeNoOp) return wakeNoOp;
         web.resumeChat(target.chatJid);
         steps.push({ action: "wake", resumed: true });
         message = "Chat wake/resume queued.";
@@ -512,7 +591,11 @@ function registerSessionControlHandler(agentPool: AgentPool, web: WebChannel): v
 
     const after = await buildSessionControlSnapshot(agentPool, target.chatJid);
     return { ok: true, ...base, before, after, message, ...extra };
-  });
+  };
+}
+
+function registerSessionControlHandler(agentPool: AgentPool, web: WebChannel): void {
+  setSessionControlHandler(createSessionControlHandler(agentPool, web));
 }
 
 export function runWebStartupRecoveryBootstrap(

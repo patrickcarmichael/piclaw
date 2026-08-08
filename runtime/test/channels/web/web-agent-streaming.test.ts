@@ -11,6 +11,7 @@ import { getIdentityConfig } from "../../../src/core/config.js";
 import { buildAgentStatusPhaseKey, handleAgentMessage } from "../../../src/channels/web/handlers/agent.js";
 import {
   acceptStoredChatMessageSource,
+  cancelChatOperation,
   claimNextChatOperation,
   getChatCursor,
   getChatOperation,
@@ -264,6 +265,118 @@ describe("web agent streaming", () => {
 
       await fixture.channel.processChat("web:default", "default");
       expect(runs).toBe(1);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  test("completes a cancellation that lands during preflight compaction without prompting", async () => {
+    let runs = 0;
+    const agentPool = {
+      setSessionBinder: () => {},
+      isStreaming: () => false,
+      isActive: () => false,
+      runAgent: async () => {
+        runs += 1;
+        return { status: "success", result: "must not run", attachments: [] };
+      },
+      getContextUsageForChat: async () => null,
+    } as any;
+    const fixture = await createWebChannelTestFixture({ queue: new AgentQueue(), agentPool });
+
+    try {
+      const chatJid = "web:cancelled-preflight-frontier";
+      storeAcceptedChatMessageSource({
+        chat_jid: chatJid,
+        id: "cancelled-preflight-message",
+        sender: "user",
+        sender_name: "User",
+        content: "cancel during preflight",
+        timestamp: "2026-08-08T08:58:00.000Z",
+      });
+      const claim = claimNextChatOperation(chatJid);
+      if (claim.status !== "claimed") throw new Error("expected claim");
+      const preflight = promoteChatOperation(chatJid, {
+        operationId: claim.operation.operationId,
+        sourceSeq: claim.operation.sourceSeq,
+        phase: claim.operation.phase,
+        generation: claim.operation.generation,
+      }, "preflight");
+      if (preflight.status !== "applied") throw new Error("expected preflight");
+      const cancelled = cancelChatOperation(chatJid, {
+        operationId: preflight.operation.operationId,
+        sourceSeq: preflight.operation.sourceSeq,
+        phase: preflight.operation.phase,
+        generation: preflight.operation.generation,
+      }, { cause: "user_abort", requestedAt: "2026-08-08T08:58:01.000Z" });
+      expect(cancelled.status).toBe("applied");
+
+      await fixture.channel.processChat(chatJid, "default");
+
+      expect(runs).toBe(0);
+      expect(getChatOperation(chatJid)).toBeNull();
+      expect(getChatOperationDisposition(claim.source.sourceSeq)).toMatchObject({
+        outcome: "cancelled",
+        cause: "user_abort",
+        provenance: "process_chat_cancelled_frontier",
+        terminalMessageId: null,
+      });
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  test("completes a remotely cancelled turn without persisting the stale terminal output", async () => {
+    let cancelledOperationId: string | null = null;
+    const agentPool = {
+      setSessionBinder: () => {},
+      isStreaming: () => false,
+      isActive: () => false,
+      runAgent: async (_prompt: string, chatJid: string, options: { operationOwner?: any }) => {
+        const cancellation = cancelChatOperation(chatJid, options.operationOwner, {
+          cause: "remote_abort",
+          requestedAt: "2026-08-08T08:50:00.000Z",
+        });
+        if (cancellation.status !== "applied") throw new Error("expected cancellation");
+        cancelledOperationId = cancellation.operation.operationId;
+        return { status: "success", result: "stale output must not persist", attachments: [] };
+      },
+      getContextUsageForChat: async () => null,
+    } as any;
+    const fixture = await createWebChannelTestFixture({ queue: new AgentQueue(), agentPool });
+
+    try {
+      const response = await handleAgentMessage(
+        fixture.channel,
+        new Request("https://example.com/agent/default/message", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content: `${getIdentityConfig().assistantName}: cancel this turn` }),
+        }),
+        "/agent/default/message",
+        "web:default",
+        "default",
+      );
+      expect(response.status).toBe(201);
+      const body = await response.json() as { user_message: { id: number } };
+      const source = getDb().prepare(`SELECT source_seq FROM chat_accepted_sources
+        WHERE chat_jid = ? AND source_id = (SELECT id FROM messages WHERE chat_jid = ? AND rowid = ?)`).get(
+          "web:default", "web:default", body.user_message.id,
+        ) as { source_seq: number };
+
+      await waitFor(() => Boolean(getChatOperationDisposition(source.source_seq)), 1_000, 2);
+      expect(getChatOperationDisposition(source.source_seq)).toMatchObject({
+        operationId: cancelledOperationId,
+        outcome: "cancelled",
+        cause: "remote_abort",
+        provenance: "session_control_abort",
+        terminalMessageId: null,
+      });
+      expect(getChatOperation("web:default")).toBeNull();
+      expect(getDb().prepare(`SELECT COUNT(*) AS count FROM messages
+        WHERE chat_jid = ? AND is_bot_message = 1 AND operation_id = ?`)
+        .get("web:default", cancelledOperationId)).toEqual({ count: 0 });
+      expect(fixture.events.some((event) => JSON.stringify(event).includes("stale output must not persist"))).toBe(false);
     } finally {
       fixture.cleanup();
     }

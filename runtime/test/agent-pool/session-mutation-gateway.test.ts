@@ -158,6 +158,67 @@ describe("SessionMutationGateway", () => {
     expect(aborted).toBe(false);
   });
 
+  test("couples durable cancellation to the exact pre-cancellation lane occupant", async () => {
+    let active: ChatOperationState | null = operation();
+    const preCancelOwner = owner(active);
+    const gateway = new SessionMutationGateway({ getOperation: () => active });
+    const entered = deferred();
+    const release = deferred();
+    const running = gateway.run("web:test", "prompt", { scope: "operation", owner: preCancelOwner }, async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    await entered.promise;
+
+    const events: string[] = [];
+    const result = await gateway.cancelAndActAbort(
+      "web:test",
+      { scope: "operation", owner: preCancelOwner },
+      () => {
+        events.push("cancel");
+        active = { ...operation(1), cancellation: { cause: "remote_abort", requestedAt: "now" } };
+        return { status: "applied" as const };
+      },
+      (cancellation) => cancellation.status === "applied",
+      () => { events.push("abort"); },
+    );
+    expect(result).toEqual({ cancellation: { status: "applied" }, acted: true, result: undefined });
+    expect(events).toEqual(["cancel", "abort"]);
+
+    release.resolve();
+    await running;
+  });
+
+  test("rejects stale cancellation before its callback and can cancel without an occupant", async () => {
+    let active: ChatOperationState | null = operation(1);
+    const gateway = new SessionMutationGateway({ getOperation: () => active });
+    let cancelCalls = 0;
+
+    await expect(gateway.cancelAndActAbort(
+      "web:test",
+      { scope: "operation", owner: owner(operation()) },
+      () => { cancelCalls += 1; return { status: "applied" as const }; },
+      (cancellation) => cancellation.status === "applied",
+      () => {},
+    )).rejects.toMatchObject({ reason: "generation_mismatch" });
+    expect(cancelCalls).toBe(0);
+
+    const exactOwner = owner(active);
+    const result = await gateway.cancelAndActAbort(
+      "web:test",
+      { scope: "operation", owner: exactOwner },
+      () => {
+        cancelCalls += 1;
+        active = { ...operation(2), cancellation: { cause: "remote_abort", requestedAt: "now" } };
+        return { status: "applied" as const };
+      },
+      (cancellation) => cancellation.status === "applied",
+      () => { throw new Error("no occupant must not be aborted"); },
+    );
+    expect(result).toEqual({ cancellation: { status: "applied" }, acted: false });
+    expect(cancelCalls).toBe(1);
+  });
+
   test("allows only exact compare-and-act abort to bypass an occupied lane", async () => {
     let active: ChatOperationState | null = operation();
     const gateway = new SessionMutationGateway({ getOperation: () => active });

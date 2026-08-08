@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { runDurableOperationPreflight, runProcessChatPreflight } from "../../../../src/channels/web/runtime/process-chat-preflight-runtime.js";
 import {
+  cancelChatOperation,
   claimNextChatOperation,
   getChatCursor,
   getChatOperation,
@@ -160,6 +161,72 @@ describe("process chat preflight runtime", () => {
         generation: 2,
       });
       expect(getChatPreflight(chatJid)).toBeNull();
+    });
+  });
+
+  test("cancellation during deferred durable compaction prevents rotation, promotion, and resume", async () => {
+    await withTempWorkspaceEnv("durable-preflight-cancelled-", {}, async () => {
+      initDatabase();
+      const chatJid = "web:durable-cancelled";
+      storeChatMetadata(chatJid, "", "Web");
+      storeAcceptedChatMessageSource({
+        chat_jid: chatJid,
+        id: "m-cancelled",
+        sender: "user",
+        sender_name: "User",
+        content: "cancelled prompt",
+        timestamp: "2026-01-01T00:00:01.000Z",
+      });
+      const claim = claimNextChatOperation(chatJid);
+      if (claim.status !== "claimed") throw new Error("expected durable claim");
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      let rotations = 0;
+      let resumes = 0;
+
+      const result = await runDurableOperationPreflight({
+        channel: {
+          agentPool: {
+            runSessionMutation: async (_chatJid: string, _mutation: string, _request: unknown, action: (session: object) => unknown) => action({}),
+            emergencyRotateSession: async () => {
+              rotations += 1;
+              return { status: "success", message: "rotated" };
+            },
+          },
+        } as any,
+        chatJid,
+        agentId: "default",
+        message: { id: "m-cancelled", timestamp: "2026-01-01T00:00:01.000Z" },
+        operation: claim.operation,
+        effectiveThreadRootId: null,
+        turnId: "turn-cancelled",
+        streamingHandler() {},
+        compactionState: { lastCompactionErrorMessage: "force rotation", lastCompactionSuppressed: false },
+        enqueueResume() { resumes += 1; },
+        deps: {
+          getForegroundMs: () => 0,
+          maybeAutoCompactSessionBeforePrompt: async () => { await gate; },
+        },
+      });
+      expect(result.status).toBe("deferred");
+      const preflight = getChatOperation(chatJid)!;
+      const cancelled = cancelChatOperation(chatJid, {
+        operationId: preflight.operationId,
+        sourceSeq: preflight.sourceSeq,
+        phase: preflight.phase,
+        generation: preflight.generation,
+      }, { cause: "remote_abort", requestedAt: "2026-08-08T08:55:00.000Z" });
+      expect(cancelled.status).toBe("applied");
+
+      release();
+      await Bun.sleep(20);
+      expect(rotations).toBe(0);
+      expect(resumes).toBe(0);
+      expect(getChatOperation(chatJid)).toMatchObject({
+        operationId: claim.operation.operationId,
+        phase: "preflight",
+        cancellation: { cause: "remote_abort" },
+      });
     });
   });
 

@@ -58,12 +58,15 @@ import type { PiclawCredentialStore } from "./agent-pool/credential-store.js";
 import { installLegacySessionAffinityCompatibility } from "./agent-pool/session-affinity-compat.js";
 import {
   type ChatBranchRecord,
+  type ChatOperationState,
   type MergeChatBranchIntoParentResult,
   type SshConfig,
   type SshConfigApplyTiming,
   type SshConfigClearResult,
   type SshConfigSetResult,
+  cancelChatOperation,
   deleteSshConfig,
+  getChatOperation,
   getSshConfig,
   listRecentChatJids,
   pruneOldTokenUsage,
@@ -110,6 +113,14 @@ export type BoundSessionMutationRunner = <T>(
   mutation: Exclude<SessionMutationClass, "abort">,
   action: (runtime: AgentSessionRuntime) => Promise<T> | T,
 ) => Promise<T>;
+
+export interface OperationCancellationControlResult {
+  status: "cancelled" | "no_op";
+  reason?: string;
+  operation: ChatOperationState | null;
+  physicallyAborted: boolean;
+  abortResult?: AgentControlResult;
+}
 
 export interface AgentPoolRecoveryInstrumentationSnapshot {
   attemptsTotal: number;
@@ -373,6 +384,10 @@ export class AgentPool {
 
       const output = await runWithProtectedRecoveryHandoff(prompt, options, runPrompt, (observed) => {
         observedOutputs.push(observed);
+      }, () => {
+        if (!options.operationOwner) return false;
+        const current = getChatOperation(chatJid);
+        return current?.operationId !== options.operationOwner.operationId || Boolean(current.cancellation);
       });
       const recoveries = observedOutputs.map((observed) => observed.recovery).filter(Boolean);
       this.recoveryStats.attemptsTotal += recoveries.reduce(
@@ -415,6 +430,60 @@ export class AgentPool {
       }
       throw error;
     }
+  }
+
+  async cancelOperationAndAbort(
+    chatJid: string,
+    expectedOperationId: string,
+    cause = "remote_abort",
+  ): Promise<OperationCancellationControlResult> {
+    const operation = getChatOperation(chatJid);
+    if (!operation) {
+      return { status: "no_op", reason: "no_active_operation", operation: null, physicallyAborted: false };
+    }
+    if (operation.operationId !== expectedOperationId) {
+      return { status: "no_op", reason: "operation_mismatch", operation, physicallyAborted: false };
+    }
+    if (operation.cancellation) {
+      return { status: "no_op", reason: "already_cancelled", operation, physicallyAborted: false };
+    }
+
+    const owner = {
+      operationId: operation.operationId,
+      sourceSeq: operation.sourceSeq,
+      phase: operation.phase,
+      generation: operation.generation,
+    };
+    const abort = await this.mutationGateway.cancelAndActAbort(
+      chatJid,
+      { scope: "operation", owner },
+      () => cancelChatOperation(chatJid, owner, {
+        cause,
+        requestedAt: new Date().toISOString(),
+      }),
+      (cancellation) => cancellation.status === "applied",
+      () => {
+        const runtime = this.pool.get(chatJid)?.runtime;
+        if (!runtime) return { status: "error", message: "No active session to abort." } as AgentControlResult;
+        return this.runtimeFacade.applyControlCommandToRuntime(chatJid, runtime, { type: "abort", raw: "/abort" });
+      },
+    );
+    const cancellation = abort.cancellation;
+    if (cancellation.status !== "applied") {
+      return {
+        status: "no_op",
+        reason: cancellation.reason,
+        operation: getChatOperation(chatJid),
+        physicallyAborted: false,
+      };
+    }
+    const abortResult = abort.result;
+    return {
+      status: "cancelled",
+      operation: cancellation.operation,
+      physicallyAborted: abort.acted && abortResult?.status === "success",
+      ...(abortResult ? { abortResult } : {}),
+    };
   }
 
   private async applyControlCommandOwned(chatJid: string, command: AgentControlCommand): Promise<AgentControlResult> {
