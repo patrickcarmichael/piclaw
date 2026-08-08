@@ -166,7 +166,9 @@ export function replaceQueuedFollowupPlaceholderMessage(
   contentBlocks: Array<Record<string, unknown>> | undefined,
   threadId: number | undefined,
   ctx: MessageWriteContext,
-  isTerminalAgentReply?: boolean
+  isTerminalAgentReply?: boolean,
+  beforeBroadcast?: (interaction: InteractionRow) => boolean,
+  deferBroadcast = false,
 ): InteractionRow | null {
   const updated = ctx.store.replaceMessageContent(
     chatJid,
@@ -181,6 +183,7 @@ export function replaceQueuedFollowupPlaceholderMessage(
   updated.data.agent_id = ctx.defaultAgentId;
   if (threadId) updated.data.thread_id = threadId;
 
-  ctx.broadcaster.broadcastInteractionUpdated(updated);
+  const fencePassed = !beforeBroadcast || beforeBroadcast(updated);
+  if (fencePassed && !deferBroadcast) ctx.broadcaster.broadcastInteractionUpdated(updated);
   return updated;
 }

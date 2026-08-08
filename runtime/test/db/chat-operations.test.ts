@@ -284,6 +284,20 @@ describe("durable accepted-input operations", () => {
     expect(op.getChatOperationDisposition(source.sourceSeq)?.terminalMessageChatJid).toBe(parentJid);
   });
 
+  test("restart discovery finds unclaimed and active durable work but holds blocked operations", () => {
+    const chatJid = jid("restart-discovery");
+    register(chatJid, "restart-source");
+    expect(op.getResumableDurableChatJids()).toContain(chatJid);
+    expect(op.getBlockedDurableChatJids()).not.toContain(chatJid);
+
+    const claim = op.claimNextChatOperation(chatJid);
+    if (claim.status !== "claimed") throw new Error("expected claim");
+    expect(op.getResumableDurableChatJids()).toContain(chatJid);
+    expect(op.blockChatOperation(chatJid, owner(claim.operation)).status).toBe("applied");
+    expect(op.getResumableDurableChatJids()).not.toContain(chatJid);
+    expect(op.getBlockedDurableChatJids()).toContain(chatJid);
+  });
+
   test("claim rejects legacy ownership and ignores non-selectable operation-bound steer intents", () => {
     const chatJid = jid("legacy"); const source = register(chatJid, "a");
     db.getDb().prepare("INSERT INTO chat_cursors (chat_jid, cursor_ts, inflight_message_id) VALUES (?, '', 'legacy')").run(chatJid);

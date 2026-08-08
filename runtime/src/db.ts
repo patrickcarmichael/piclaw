@@ -152,10 +152,14 @@ export type {
 } from "./db/chat-cursors.js";
 export {
   registerAcceptedChatSource,
+  acceptStoredChatMessageSource,
   storeAcceptedChatMessageSource,
   registerChatOperationIntent,
   getAcceptedChatSource,
   getChatOperation,
+  getResumableDurableChatJids,
+  getBlockedDurableChatJids,
+  peekNextAcceptedChatSource,
   claimNextChatOperation,
   promoteChatOperation,
   waitChatOperation,

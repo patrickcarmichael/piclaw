@@ -7,7 +7,20 @@
 
 import { describe, test, expect } from "bun:test";
 import { AgentQueue } from "../../../src/queue.js";
-import { buildAgentStatusPhaseKey } from "../../../src/channels/web/handlers/agent.js";
+import { getIdentityConfig } from "../../../src/core/config.js";
+import { buildAgentStatusPhaseKey, handleAgentMessage } from "../../../src/channels/web/handlers/agent.js";
+import {
+  acceptStoredChatMessageSource,
+  claimNextChatOperation,
+  getChatCursor,
+  getChatOperation,
+  getChatOperationDisposition,
+  getDb,
+  promoteChatOperation,
+  registerAcceptedChatSource,
+  setChatCursor,
+  storeAcceptedChatMessageSource,
+} from "../../../src/db.js";
 import { waitFor } from "../../helpers.js";
 import { createWebChannelTestFixture } from "./helpers/web-channel-fixture.js";
 
@@ -179,6 +192,374 @@ describe("web agent streaming", () => {
         (event) => event.type === "agent_status" && event.data?.type === "done"
       );
       expect(done).toBeDefined();
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  test("accepts and atomically completes one normal web message as a durable operation", async () => {
+    let runs = 0;
+    const agentPool = {
+      setSessionBinder: () => {},
+      isStreaming: () => false,
+      isActive: () => false,
+      runAgent: async () => {
+        runs += 1;
+        return { status: "success", result: "durable response", attachments: [] };
+      },
+      getContextUsageForChat: async () => null,
+    } as any;
+    const fixture = await createWebChannelTestFixture({ queue: new AgentQueue(), agentPool });
+
+    try {
+      const request = new Request("https://example.com/agent/default/message", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: `${getIdentityConfig().assistantName}: durable prompt` }),
+      });
+      const response = await handleAgentMessage(
+        fixture.channel,
+        request,
+        "/agent/default/message",
+        "web:default",
+        "default",
+      );
+      expect(response.status).toBe(201);
+      const body = await response.json() as { user_message: { id: number } };
+      const accepted = getDb().prepare(`SELECT source_seq, operation_id, accepted_at
+        FROM chat_accepted_sources WHERE chat_jid = ? AND source_kind = 'message'
+        AND source_id = (SELECT id FROM messages WHERE chat_jid = ? AND rowid = ?)`)
+        .get("web:default", "web:default", body.user_message.id) as {
+          source_seq: number;
+          operation_id: string | null;
+          accepted_at: string;
+        } | undefined;
+      expect(accepted).toBeDefined();
+
+      await waitFor(() => Boolean(accepted && getChatOperationDisposition(accepted.source_seq)), 1_000, 2);
+      const disposition = getChatOperationDisposition(accepted!.source_seq);
+      expect(disposition).toMatchObject({
+        sourceKind: "message",
+        outcome: "succeeded",
+        cause: "agent_completed",
+        provenance: "web_process_chat",
+      });
+      expect(getChatOperation("web:default")).toBeNull();
+      expect(getChatCursor("web:default")).toBe(accepted!.accepted_at);
+      const terminal = getDb().prepare(`SELECT is_terminal_agent_reply, operation_id
+        FROM messages WHERE chat_jid = ? AND id = ?`)
+        .get("web:default", disposition!.terminalMessageId) as {
+          is_terminal_agent_reply: number;
+          operation_id: string | null;
+        };
+      expect(terminal).toEqual({ is_terminal_agent_reply: 1, operation_id: disposition!.operationId });
+
+      await fixture.channel.processChat("web:default", "default");
+      expect(runs).toBe(1);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  test("rolls back browser message storage when durable acceptance fails", async () => {
+    let enqueues = 0;
+    const fixture = await createWebChannelTestFixture({
+      queue: { enqueue: () => { enqueues += 1; } } as any,
+      agentPool: {
+        setSessionBinder: () => {},
+        isStreaming: () => false,
+        isActive: () => false,
+      } as any,
+    });
+
+    try {
+      const originalStoreMessage = fixture.channel.storeMessage.bind(fixture.channel);
+      fixture.channel.storeMessage = ((chatJid: string, content: string, isBot: boolean, mediaIds: number[], options?: any) => {
+        const interaction = originalStoreMessage(chatJid, content, isBot, mediaIds, options);
+        if (interaction && !isBot) {
+          const message = getDb().prepare("SELECT id, timestamp FROM messages WHERE chat_jid = ? AND rowid = ?")
+            .get(chatJid, interaction.id) as { id: string; timestamp: string };
+          registerAcceptedChatSource({
+            chatJid,
+            sourceClass: "prompt",
+            sourceKind: "message",
+            sourceId: message.id,
+            acceptedAt: "2020-01-01T00:00:00.000Z",
+            payloadRef: `message:${message.id}`,
+            frontier: { messageId: message.id, cursorTs: message.timestamp },
+          });
+        }
+        return interaction;
+      }) as typeof fixture.channel.storeMessage;
+
+      const response = await handleAgentMessage(
+        fixture.channel,
+        new Request("https://example.com/agent/default/message", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content: "must roll back" }),
+        }),
+        "/agent/default/message",
+        "web:atomic-acceptance",
+        "default",
+      );
+      expect(response.status).toBe(500);
+      expect(getDb().prepare("SELECT COUNT(*) AS count FROM messages WHERE chat_jid = ?")
+        .get("web:atomic-acceptance")).toEqual({ count: 0 });
+      expect(getDb().prepare("SELECT COUNT(*) AS count FROM chat_accepted_sources WHERE chat_jid = ?")
+        .get("web:atomic-acceptance")).toEqual({ count: 0 });
+      expect(enqueues).toBe(0);
+      expect(fixture.events.some((event) => event.type === "new_post")).toBe(false);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  test("does not register internal adaptive-card submissions as durable message sources", async () => {
+    const agentPool = {
+      setSessionBinder: () => {},
+      isStreaming: () => false,
+      isActive: () => false,
+      runAgent: async () => ({ status: "success", result: "legacy internal response", attachments: [] }),
+      getContextUsageForChat: async () => null,
+    } as any;
+    const queue = { enqueue: () => {} } as any;
+    const fixture = await createWebChannelTestFixture({ queue, agentPool });
+
+    try {
+      const response = await handleAgentMessage(
+        fixture.channel,
+        new Request("http://internal/agent/default/message", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            content: "Card submission: Approve",
+            content_blocks: [{ type: "adaptive_card_submission", card_id: "card-1" }],
+          }),
+        }),
+        "/agent/default/message",
+        "web:default",
+        "default",
+      );
+      expect(response.status).toBe(201);
+      const body = await response.json() as { user_message: { id: number } };
+      const accepted = getDb().prepare(`SELECT source_seq FROM chat_accepted_sources
+        WHERE chat_jid = ? AND source_kind = 'message'
+        AND source_id = (SELECT id FROM messages WHERE chat_jid = ? AND rowid = ?)`)
+        .get("web:default", "web:default", body.user_message.id);
+      expect(accepted).toBeNull();
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  test("processes an earlier legacy internal row before claiming the accepted browser row", async () => {
+    const prompts: string[] = [];
+    const agentPool = {
+      setSessionBinder: () => {},
+      isStreaming: () => false,
+      isActive: () => false,
+      runAgent: async (prompt: string) => {
+        prompts.push(prompt);
+        return { status: "success", result: `response-${prompts.length}`, attachments: [] };
+      },
+      getContextUsageForChat: async () => null,
+    } as any;
+    const fixture = await createWebChannelTestFixture({ queue: new AgentQueue(), agentPool });
+
+    try {
+      const legacy = fixture.channel.storeMessage("web:mixed", "earlier internal card input", false, []);
+      expect(legacy).not.toBeNull();
+      const response = await handleAgentMessage(
+        fixture.channel,
+        new Request("https://example.com/agent/default/message", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content: `${getIdentityConfig().assistantName}: later accepted browser input` }),
+        }),
+        "/agent/default/message",
+        "web:mixed",
+        "default",
+      );
+      expect(response.status).toBe(201);
+      const body = await response.json() as { user_message: { id: number } };
+      const source = getDb().prepare(`SELECT source_seq FROM chat_accepted_sources
+        WHERE chat_jid = ? AND source_id = (SELECT id FROM messages WHERE chat_jid = ? AND rowid = ?)`)
+        .get("web:mixed", "web:mixed", body.user_message.id) as { source_seq: number };
+
+      await waitFor(() => Boolean(getChatOperationDisposition(source.source_seq)), 1_000, 2);
+      expect(prompts).toHaveLength(2);
+      expect(prompts[0]).toContain("earlier internal card input");
+      expect(prompts[1]).toContain("later accepted browser input");
+      expect(getChatOperationDisposition(source.source_seq)?.outcome).toBe("succeeded");
+      expect(getChatOperation("web:mixed")).toBeNull();
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  test("resumes a persisted running web-message operation after restart without duplicate completion", async () => {
+    let runs = 0;
+    const agentPool = {
+      setSessionBinder: () => {},
+      runAgent: async () => {
+        runs += 1;
+        return { status: "success", result: "restarted response", attachments: [] };
+      },
+      getContextUsageForChat: async () => null,
+    } as any;
+    const fixture = await createWebChannelTestFixture({ queue: new AgentQueue(), agentPool });
+
+    try {
+      const interaction = fixture.channel.storeMessage("web:restart", "resume me", false, []);
+      expect(interaction).not.toBeNull();
+      const accepted = acceptStoredChatMessageSource("web:restart", interaction!.id);
+      const claim = claimNextChatOperation("web:restart");
+      if (claim.status !== "claimed") throw new Error("expected durable claim");
+      const preflight = promoteChatOperation("web:restart", {
+        operationId: claim.operation.operationId,
+        sourceSeq: claim.operation.sourceSeq,
+        phase: claim.operation.phase,
+        generation: claim.operation.generation,
+      }, "preflight");
+      if (preflight.status !== "applied") throw new Error("expected preflight promotion");
+      const running = promoteChatOperation("web:restart", {
+        operationId: preflight.operation.operationId,
+        sourceSeq: preflight.operation.sourceSeq,
+        phase: preflight.operation.phase,
+        generation: preflight.operation.generation,
+      }, "running");
+      expect(running.status).toBe("applied");
+
+      await fixture.channel.processChat("web:restart", "default");
+      const firstDisposition = getChatOperationDisposition(accepted.source.sourceSeq);
+      expect(firstDisposition).toMatchObject({ outcome: "succeeded", cause: "agent_completed" });
+      expect(getChatOperation("web:restart")).toBeNull();
+
+      await fixture.channel.processChat("web:restart", "default");
+      expect(runs).toBe(1);
+      expect(getChatOperationDisposition(accepted.source.sourceSeq)).toEqual(firstDisposition);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  test("defers a durable provider-unavailable run in waiting and resumes the same operation", async () => {
+    let runs = 0;
+    const agentPool = {
+      setSessionBinder: () => {},
+      runAgent: async () => {
+        runs += 1;
+        return runs === 1
+          ? { status: "error", error: "provider is initializing", failureCategory: "provider_unavailable" }
+          : { status: "success", result: "provider recovered", attachments: [] };
+      },
+      getContextUsageForChat: async () => null,
+    } as any;
+    const fixture = await createWebChannelTestFixture({ queue: new AgentQueue(), agentPool });
+
+    try {
+      const interaction = fixture.channel.storeMessage("web:waiting", "retry me", false, []);
+      const accepted = acceptStoredChatMessageSource("web:waiting", interaction!.id);
+
+      await expect(fixture.channel.processChat("web:waiting", "default")).rejects.toThrow("provider is initializing");
+      const waiting = getChatOperation("web:waiting");
+      expect(waiting).toMatchObject({
+        sourceSeq: accepted.source.sourceSeq,
+        phase: "waiting",
+        generation: 3,
+      });
+
+      await fixture.channel.processChat("web:waiting", "default");
+      expect(runs).toBe(2);
+      expect(getChatOperation("web:waiting")).toBeNull();
+      expect(getChatOperationDisposition(accepted.source.sourceSeq)).toMatchObject({ outcome: "succeeded" });
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  test("startup pending recovery gives durable owned work hidden from legacy selectors one terminal completion", async () => {
+    const chatJid = "web:durable-startup-recovery";
+    const prompts: string[] = [];
+    const fixture = await createWebChannelTestFixture({
+      queue: new AgentQueue(),
+      agentPool: {
+        setSessionBinder: () => {},
+        isStreaming: () => false,
+        isActive: () => false,
+        runAgent: async (prompt: string) => {
+          prompts.push(prompt);
+          return { status: "success", result: "recovered once", attachments: [] };
+        },
+        getContextUsageForChat: async () => null,
+      } as any,
+    });
+
+    try {
+      const accepted = storeAcceptedChatMessageSource({
+        id: "durable-restart-hidden",
+        chat_jid: chatJid,
+        sender: "user",
+        sender_name: "User",
+        content: `${getIdentityConfig().assistantName}: hidden durable restart prompt`,
+        timestamp: "2026-01-01T00:00:01.000Z",
+      });
+      setChatCursor(chatJid, "2026-01-01T00:00:02.000Z");
+      const claim = claimNextChatOperation(chatJid);
+      if (claim.status !== "claimed") throw new Error("expected durable claim");
+      const preflight = promoteChatOperation(chatJid, {
+        operationId: claim.operation.operationId,
+        sourceSeq: claim.operation.sourceSeq,
+        phase: claim.operation.phase,
+        generation: claim.operation.generation,
+      }, "preflight");
+      if (preflight.status !== "applied") throw new Error("expected preflight promotion");
+      const running = promoteChatOperation(chatJid, {
+        operationId: preflight.operation.operationId,
+        sourceSeq: preflight.operation.sourceSeq,
+        phase: preflight.operation.phase,
+        generation: preflight.operation.generation,
+      }, "running");
+      if (running.status !== "applied") throw new Error("expected running promotion");
+
+      fixture.channel.resumePendingChats();
+
+      await waitFor(() => Boolean(getChatOperationDisposition(accepted.source.sourceSeq)), 5_000, 5);
+      await Bun.sleep(25);
+      expect(prompts.some((prompt) => prompt.includes("hidden durable restart prompt"))).toBe(true);
+      expect(getChatOperationDisposition(accepted.source.sourceSeq)?.outcome).toBe("succeeded");
+      expect(getChatOperation(chatJid)).toBeNull();
+      expect(getChatCursor(chatJid)).toBe("2026-01-01T00:00:02.000Z");
+      expect(getDb().prepare("SELECT COUNT(*) AS count FROM messages WHERE chat_jid = ? AND is_bot_message = 1")
+        .get(chatJid)).toEqual({ count: 1 });
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  test("blocks a durable frontier when terminal persistence fails", async () => {
+    const agentPool = {
+      setSessionBinder: () => {},
+      runAgent: async () => ({ status: "success", result: "cannot persist", attachments: [] }),
+      getContextUsageForChat: async () => null,
+    } as any;
+    const fixture = await createWebChannelTestFixture({ queue: new AgentQueue(), agentPool });
+
+    try {
+      const interaction = fixture.channel.storeMessage("web:blocked", "persist failure", false, []);
+      const accepted = acceptStoredChatMessageSource("web:blocked", interaction!.id);
+      const originalStoreMessage = fixture.channel.storeMessage.bind(fixture.channel);
+      fixture.channel.storeMessage = ((chatJid: string, content: string, isBot: boolean, mediaIds: number[], options?: unknown) =>
+        isBot ? null : originalStoreMessage(chatJid, content, isBot, mediaIds, options as any)) as typeof fixture.channel.storeMessage;
+
+      await fixture.channel.processChat("web:blocked", "default");
+      expect(getChatOperation("web:blocked")).toMatchObject({
+        sourceSeq: accepted.source.sourceSeq,
+        phase: "blocked",
+        generation: 3,
+      });
+      expect(getChatOperationDisposition(accepted.source.sourceSeq)).toBeNull();
     } finally {
       fixture.cleanup();
     }

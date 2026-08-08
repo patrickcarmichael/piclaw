@@ -287,6 +287,8 @@ export function installWebChannelPrototype(
         contentBlocks: Array<Record<string, unknown>> | undefined,
         threadId?: number,
         isTerminalAgentReply?: boolean,
+        beforeBroadcast?: (interaction: InteractionRow) => boolean,
+        deferBroadcast?: boolean,
       ): InteractionRow | null =>
         service.replaceQueuedFollowupPlaceholder(
           chatJid,
@@ -296,7 +298,16 @@ export function installWebChannelPrototype(
           contentBlocks,
           threadId,
           isTerminalAgentReply,
+          beforeBroadcast,
+          deferBroadcast,
         )),
+    },
+    broadcastQueuedFollowupPlaceholderUpdate: {
+      configurable: true,
+      writable: true,
+      value: withRuntimePublicSurface((service, interaction: InteractionRow): void => {
+        service.broadcastQueuedFollowupPlaceholderUpdate(interaction);
+      }),
     },
     getThreadRootId: {
       configurable: true,

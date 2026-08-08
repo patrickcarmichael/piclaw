@@ -1,6 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { runProcessChatPreflight } from "../../../../src/channels/web/runtime/process-chat-preflight-runtime.js";
-import { getChatCursor, getChatPreflight, initDatabase, storeChatMetadata } from "../../../../src/db.js";
+import { runDurableOperationPreflight, runProcessChatPreflight } from "../../../../src/channels/web/runtime/process-chat-preflight-runtime.js";
+import {
+  claimNextChatOperation,
+  getChatCursor,
+  getChatOperation,
+  getChatPreflight,
+  initDatabase,
+  storeAcceptedChatMessageSource,
+  storeChatMetadata,
+} from "../../../../src/db.js";
 import { waitFor, withTempWorkspaceEnv } from "../../../helpers.js";
 
 describe("process chat preflight runtime", () => {
@@ -111,6 +119,115 @@ describe("process chat preflight runtime", () => {
       await waitFor(() => resumes === 1, 250, 1);
       expect(getChatPreflight(chatJid)).toBeNull();
       expect(resumes).toBe(1);
+    });
+  });
+
+  test("promotes a durable accepted message from pending through preflight to running", async () => {
+    await withTempWorkspaceEnv("durable-preflight-runtime-", {}, async () => {
+      initDatabase();
+      const chatJid = "web:durable";
+      storeChatMetadata(chatJid, "", "Web");
+      storeAcceptedChatMessageSource({
+        chat_jid: chatJid,
+        id: "m-durable",
+        sender: "user",
+        sender_name: "User",
+        content: "durable prompt",
+        timestamp: "2026-01-01T00:00:01.000Z",
+      });
+      const claim = claimNextChatOperation(chatJid);
+      expect(claim.status).toBe("claimed");
+      if (claim.status !== "claimed") throw new Error("expected durable claim");
+
+      const result = await runDurableOperationPreflight({
+        channel: { agentPool: {} } as any,
+        chatJid,
+        agentId: "default",
+        message: { id: "m-durable", timestamp: "2026-01-01T00:00:01.000Z" },
+        operation: claim.operation,
+        effectiveThreadRootId: null,
+        turnId: "turn-durable",
+        streamingHandler() {},
+        compactionState: { lastCompactionErrorMessage: null, lastCompactionSuppressed: false },
+        enqueueResume() {},
+      });
+
+      expect(result.status).toBe("continue");
+      expect(getChatOperation(chatJid)).toMatchObject({
+        operationId: claim.operation.operationId,
+        sourceSeq: claim.operation.sourceSeq,
+        phase: "running",
+        generation: 2,
+      });
+      expect(getChatPreflight(chatJid)).toBeNull();
+    });
+  });
+
+  test("retains durable preflight ownership across deferred compaction and resumes as running", async () => {
+    await withTempWorkspaceEnv("durable-preflight-deferred-", {}, async () => {
+      initDatabase();
+      const chatJid = "web:durable-deferred";
+      storeChatMetadata(chatJid, "", "Web");
+      storeAcceptedChatMessageSource({
+        chat_jid: chatJid,
+        id: "m-deferred",
+        sender: "user",
+        sender_name: "User",
+        content: "deferred prompt",
+        timestamp: "2026-01-01T00:00:01.000Z",
+      });
+      const claim = claimNextChatOperation(chatJid);
+      if (claim.status !== "claimed") throw new Error("expected durable claim");
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      let resumes = 0;
+      let physicalCompactions = 0;
+      const base = {
+        channel: {
+          agentPool: {
+            getSessionForIntrospection: async () => ({}),
+            emergencyRotateSession: async () => ({ status: "success", message: "rotated" }),
+          },
+        } as any,
+        chatJid,
+        agentId: "default",
+        message: { id: "m-deferred", timestamp: "2026-01-01T00:00:01.000Z" },
+        effectiveThreadRootId: 42,
+        streamingHandler() {},
+        compactionState: { lastCompactionErrorMessage: null, lastCompactionSuppressed: false },
+        enqueueResume(root: number | undefined) {
+          expect(root).toBe(42);
+          resumes += 1;
+        },
+        deps: {
+          getForegroundMs: () => 0,
+          maybeAutoCompactSessionBeforePrompt: async () => {
+            physicalCompactions += 1;
+            await gate;
+          },
+        },
+      };
+
+      const result = await runDurableOperationPreflight({
+        ...base,
+        operation: claim.operation,
+        turnId: "turn-deferred",
+      });
+      expect(result.status).toBe("deferred");
+      const ownedPreflight = getChatOperation(chatJid)!;
+      expect(ownedPreflight.phase).toBe("preflight");
+
+      const duplicate = await runDurableOperationPreflight({
+        ...base,
+        operation: ownedPreflight,
+        turnId: "turn-duplicate",
+      });
+      expect(duplicate.status).toBe("deferred");
+      expect(physicalCompactions).toBe(1);
+      expect(resumes).toBe(0);
+      release();
+      await waitFor(() => resumes === 1, 250, 1);
+      expect(getChatOperation(chatJid)).toMatchObject({ phase: "running", generation: 2 });
     });
   });
 });

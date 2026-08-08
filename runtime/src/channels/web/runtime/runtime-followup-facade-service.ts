@@ -16,7 +16,7 @@ import type { WebChannelRuntimeStateService } from "./runtime-state-service.js";
 
 type RuntimeFollowupMessageWriteService = Pick<
   WebMessageWriteService,
-  "sendMessage" | "postDashboardWidget" | "queueFollowupPlaceholder" | "replaceQueuedFollowupPlaceholder"
+  "sendMessage" | "postDashboardWidget" | "queueFollowupPlaceholder" | "replaceQueuedFollowupPlaceholder" | "broadcastQueuedFollowupPlaceholderUpdate"
 >;
 
 type RuntimeFollowupQueuedLifecycle = Pick<
@@ -167,6 +167,8 @@ export class WebChannelRuntimeFollowupFacadeService {
     contentBlocks: Array<Record<string, unknown>> | undefined,
     threadId?: number,
     isTerminalAgentReply?: boolean,
+    beforeBroadcast?: (interaction: InteractionRow) => boolean,
+    deferBroadcast?: boolean,
   ): InteractionRow | null {
     return this.deps.getMessageWriteService().replaceQueuedFollowupPlaceholder(
       chatJid,
@@ -176,7 +178,13 @@ export class WebChannelRuntimeFollowupFacadeService {
       contentBlocks,
       threadId,
       isTerminalAgentReply,
+      beforeBroadcast,
+      deferBroadcast,
     );
+  }
+
+  broadcastQueuedFollowupPlaceholderUpdate(interaction: InteractionRow): void {
+    this.deps.getMessageWriteService().broadcastQueuedFollowupPlaceholderUpdate(interaction);
   }
 
   getThreadRootId(chatJid: string, messageId: string): number | null {

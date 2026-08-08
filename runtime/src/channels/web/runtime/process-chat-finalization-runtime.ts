@@ -1,5 +1,5 @@
 import { getIdentityConfig } from "../../../core/config.js";
-import { endChatRun, getChatCursor, getMessagesSince } from "../../../db.js";
+import { endChatRun, getChatCursor, getMessagesSince, peekNextAcceptedChatSource } from "../../../db.js";
 import { checkPendingShutdown } from "../../../runtime/shutdown-registry.js";
 import { createLogger } from "../../../utils/logger.js";
 import type { WebChannelLike } from "../core/web-channel-contracts.js";
@@ -35,6 +35,7 @@ export interface ProcessChatFinalizationRuntime {
   threadId: string | number | null;
   prevCursor: string;
   recovery: { attemptsUsed?: number; recovered?: boolean; exhausted?: boolean; lastClassifier?: string | null } | null;
+  durableOperationCompleted?: boolean;
 }
 
 /** Finalise a successfully persisted terminal outcome, then resume persisted/queued work. */
@@ -42,7 +43,7 @@ export async function finalizeSuccessfulProcessChatRun(options: ProcessChatFinal
   const { channel, chatJid } = options;
   // Stale protected intent was removed atomically with terminal persistence.
   // This update only clears inflight/failed run state.
-  endChatRun(chatJid);
+  if (!options.durableOperationCompleted) endChatRun(chatJid);
   const cursorAfterEnd = getChatCursor(chatJid);
   const pendingSteerTimestamps = channel.consumePendingSteering(chatJid);
   const cursorAfterSteer = getChatCursor(chatJid);
@@ -65,6 +66,7 @@ export async function finalizeSuccessfulProcessChatRun(options: ProcessChatFinal
 
   const cursorNow = getChatCursor(chatJid);
   const remainingPersisted = getMessagesSince(chatJid, cursorNow, getIdentityConfig().assistantName);
+  const pendingDurableMessage = peekNextAcceptedChatSource(chatJid)?.sourceKind === "message";
   log.info("finalizeSuccessfulRun advanced cursor", {
     operation: "process_chat.finalize_successful_run",
     chatJid,
@@ -75,10 +77,11 @@ export async function finalizeSuccessfulProcessChatRun(options: ProcessChatFinal
     cursorAfterSteer,
     cursorNow,
     remainingCount: remainingPersisted.length,
+    pendingDurableMessage,
     remainingMessages: remainingPersisted.map((message) => `${message.id}@${message.timestamp}`),
   });
 
-  if (remainingPersisted.length > 0) {
+  if (remainingPersisted.length > 0 || pendingDurableMessage) {
     channel.resumeChat(chatJid);
     return;
   }

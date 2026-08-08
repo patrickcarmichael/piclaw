@@ -25,6 +25,7 @@ type WebChannelRuntimePublicSurfaceFollowupFacade = Pick<
   | "updateAgentStatus"
   | "getAgentStatus"
   | "replaceQueuedFollowupPlaceholder"
+  | "broadcastQueuedFollowupPlaceholderUpdate"
   | "getThreadRootId"
   | "resumeChat"
   | "skipFailedOnModelSwitch"
@@ -515,6 +516,8 @@ export class WebChannelRuntimePublicSurfaceService {
     contentBlocks: Array<Record<string, unknown>> | undefined,
     threadId?: number,
     isTerminalAgentReply?: boolean,
+    beforeBroadcast?: (interaction: InteractionRow) => boolean,
+    deferBroadcast?: boolean,
   ): InteractionRow | null {
     return this.channel.runtimeFollowupFacade.replaceQueuedFollowupPlaceholder(
       chatJid,
@@ -524,7 +527,13 @@ export class WebChannelRuntimePublicSurfaceService {
       contentBlocks,
       threadId,
       isTerminalAgentReply,
+      beforeBroadcast,
+      deferBroadcast,
     );
+  }
+
+  broadcastQueuedFollowupPlaceholderUpdate(interaction: InteractionRow): void {
+    this.channel.runtimeFollowupFacade.broadcastQueuedFollowupPlaceholderUpdate(interaction);
   }
 
   getThreadRootId(chatJid: string, messageId: string): number | null {

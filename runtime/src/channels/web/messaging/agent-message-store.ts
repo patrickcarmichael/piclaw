@@ -11,11 +11,13 @@
 import type { WebChannelLike } from "../core/web-channel-contracts.js";
 import type { AttachmentInfo } from "../../../agent-pool/attachments.js";
 import type { AgentEventEmitter } from "../sse/agent-events.js";
+import { getDb, type InteractionRow } from "../../../db.js";
 import { formatOutbound, type ChatChannel } from "../../../router.js";
 import { createLogger, debugSuppressedError } from "../../../utils/logger.js";
 import { sendStoredAgentReplyWebPushNotification } from "../push/web-push-service.js";
 
 const log = createLogger("web.agent-message-store");
+const TERMINAL_COMPLETION_REJECTED = Symbol("terminal-completion-rejected");
 const SVG_SOURCE_HINT = /(?:<svg[\s>]|&lt;svg[\s>]|&amp;lt;svg[\s>])/i;
 
 function buildAttachmentBlocks(attachments: AttachmentInfo[]): {
@@ -113,6 +115,8 @@ export function storeAgentTurn(
      *  callback are caught and logged but do not prevent the broadcast —
      *  message persistence wins over auxiliary writes. */
     onMessageStored?: (rowId: number) => void;
+    /** Operation completion fence invoked after persistence and before broadcast. */
+    commitTerminal?: (rowId: number) => boolean;
   }
 ): number | null {
   const { mediaIds, contentBlocks } = buildAttachmentBlocks(params.attachments);
@@ -144,20 +148,53 @@ export function storeAgentTurn(
       // Don't override the placeholder's thread_id — it was set correctly
       // when the /queue command created the placeholder (threaded under the
       // /queue message). Passing undefined preserves the original association.
-      const updated = channel.replaceQueuedFollowupPlaceholder(
-        params.chatJid,
-        placeholderId,
-        formatted,
-        mediaIds,
-        mergedContentBlocks.length > 0 ? mergedContentBlocks : undefined,
-        undefined,
-        params.isTerminalAgentReply
-      );
+      let updated: InteractionRow | null = null;
+      try {
+        if (params.commitTerminal) {
+          updated = getDb().transaction(() => {
+            const stored = channel.replaceQueuedFollowupPlaceholder(
+              params.chatJid,
+              placeholderId,
+              formatted,
+              mediaIds,
+              mergedContentBlocks.length > 0 ? mergedContentBlocks : undefined,
+              undefined,
+              false,
+              undefined,
+              true,
+            );
+            if (!stored) return null;
+            const resolvedRowId = typeof stored.id === "number" ? stored.id : placeholderId;
+            safeOnStored(resolvedRowId);
+            if (!params.commitTerminal!(resolvedRowId)) throw TERMINAL_COMPLETION_REJECTED;
+            (stored.data as unknown as Record<string, unknown>).is_terminal_agent_reply = true;
+            return stored;
+          }).immediate();
+        } else {
+          const beforeBroadcast = params.onMessageStored
+            ? (stored: InteractionRow): boolean => {
+                safeOnStored(typeof stored.id === "number" ? stored.id : placeholderId);
+                return true;
+              }
+            : undefined;
+          updated = channel.replaceQueuedFollowupPlaceholder(
+            params.chatJid,
+            placeholderId,
+            formatted,
+            mediaIds,
+            mergedContentBlocks.length > 0 ? mergedContentBlocks : undefined,
+            undefined,
+            params.isTerminalAgentReply,
+            beforeBroadcast,
+          );
+        }
+      } catch (error) {
+        if (error === TERMINAL_COMPLETION_REJECTED) return null;
+        throw error;
+      }
       if (updated) {
+        if (params.commitTerminal) channel.broadcastQueuedFollowupPlaceholderUpdate(updated);
         const resolvedRowId = typeof updated.id === "number" ? updated.id : placeholderId;
-        // Run auxiliary writes BEFORE broadcasting so clients that fetch
-        // related data on the broadcast event don't race the row creation.
-        safeOnStored(resolvedRowId);
         channel.broadcastEvent?.("agent_followup_consumed", {
           chat_jid: params.chatJid,
           thread_id: params.threadId ?? null,
@@ -171,20 +208,43 @@ export function storeAgentTurn(
     }
   }
 
-  const interaction = channel.storeMessage(params.chatJid, formatted, true, mediaIds, {
-    contentBlocks: mergedContentBlocks.length > 0 ? mergedContentBlocks : undefined,
-    threadId: resolvedThreadId,
-    isTerminalAgentReply: params.isTerminalAgentReply,
-    removeProtectedContinuationForSourceMessageId: params.removeProtectedContinuationForSourceMessageId,
-  });
-  if (interaction) {
-    const resolvedRowId = typeof interaction.id === "number" ? interaction.id : null;
-    if (resolvedRowId !== null) safeOnStored(resolvedRowId);
-    emitter.response(interaction);
-    if (params.isTerminalAgentReply) {
-      dispatchStoredReplyWebPush(interaction, params.dispatchWebPushNotification);
+  let interaction: InteractionRow | null = null;
+  try {
+    if (params.commitTerminal) {
+      interaction = getDb().transaction(() => {
+        const stored = channel.storeMessage(params.chatJid, formatted, true, mediaIds, {
+          contentBlocks: mergedContentBlocks.length > 0 ? mergedContentBlocks : undefined,
+          threadId: resolvedThreadId,
+          isTerminalAgentReply: false,
+          removeProtectedContinuationForSourceMessageId: params.removeProtectedContinuationForSourceMessageId,
+        });
+        if (!stored) return null;
+        const resolvedRowId = typeof stored.id === "number" ? stored.id : null;
+        if (resolvedRowId === null) throw TERMINAL_COMPLETION_REJECTED;
+        safeOnStored(resolvedRowId);
+        if (!params.commitTerminal!(resolvedRowId)) throw TERMINAL_COMPLETION_REJECTED;
+        (stored.data as unknown as Record<string, unknown>).is_terminal_agent_reply = true;
+        return stored;
+      }).immediate();
+    } else {
+      interaction = channel.storeMessage(params.chatJid, formatted, true, mediaIds, {
+        contentBlocks: mergedContentBlocks.length > 0 ? mergedContentBlocks : undefined,
+        threadId: resolvedThreadId,
+        isTerminalAgentReply: params.isTerminalAgentReply,
+        removeProtectedContinuationForSourceMessageId: params.removeProtectedContinuationForSourceMessageId,
+      });
+      if (interaction && typeof interaction.id === "number") safeOnStored(interaction.id);
     }
-    return resolvedRowId;
+  } catch (error) {
+    if (error === TERMINAL_COMPLETION_REJECTED) return null;
+    throw error;
   }
-  return null;
+  if (!interaction) return null;
+
+  const resolvedRowId = typeof interaction.id === "number" ? interaction.id : null;
+  emitter.response(interaction);
+  if (params.isTerminalAgentReply) {
+    dispatchStoredReplyWebPush(interaction, params.dispatchWebPushNotification);
+  }
+  return resolvedRowId;
 }
