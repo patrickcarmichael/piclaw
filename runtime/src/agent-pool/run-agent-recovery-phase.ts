@@ -84,6 +84,7 @@ export interface RunAgentRecoveryPhaseOptions {
   onInfo?: (message: string, data: Record<string, unknown>) => void;
   onWarn?: (message: string, data: Record<string, unknown>) => void;
   clearAttachments(chatJid: string): void;
+  isCancelled?: () => boolean;
   toolCallCap?: {
     exceeded: boolean;
     count: number;
@@ -461,6 +462,12 @@ export async function runAgentRecoveryPhase(options: RunAgentRecoveryPhaseOption
     recoveryBudgetAccumulatedMs += Math.max(0, Date.now() - recoveryBudgetStartedAt);
     recoveryBudgetStartedAt = null;
   };
+  const cancelledOutput = (): AgentOutput => ({
+    status: "error",
+    result: null,
+    error: "Operation cancelled.",
+    failureCategory: "aborted",
+  });
   const buildProtectedHandoff = (duration: number, detail: string, finalText: string | null = null): AgentOutput => {
     const error = `Protected recovery cannot authoritatively complete tool-dependent work: ${detail}`;
     lastClassifier = "tool_activity";
@@ -497,6 +504,7 @@ export async function runAgentRecoveryPhase(options: RunAgentRecoveryPhaseOption
     // throw + catch + retry from starving the event loop when the error
     // path never reaches an await that actually suspends.
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    if (options.isCancelled?.()) return cancelledOutput();
 
     // Generic tools-disabled retries cannot authoritatively complete work and
     // their output is intentionally discarded by the protected handoff. Do
@@ -640,6 +648,8 @@ export async function runAgentRecoveryPhase(options: RunAgentRecoveryPhaseOption
         });
       }
     }
+
+    if (options.isCancelled?.()) return cancelledOutput();
 
     // If the tool-call cap was hit, abort immediately without recovery.
     if (options.toolCallCap?.exceeded) {
@@ -891,6 +901,7 @@ export async function runAgentRecoveryPhase(options: RunAgentRecoveryPhaseOption
       });
       await sleep(retryDelayMs);
     }
+    if (options.isCancelled?.()) return cancelledOutput();
 
     // AgentSession persists the user message before invoking the provider.
     // Replaying the original text after a failed attempt duplicates the
@@ -909,12 +920,14 @@ export async function runAgentRecoveryPhase(options: RunAgentRecoveryPhaseOption
 
 
     if (effectiveDecision.strategy === "compact_then_retry") {
+      if (options.isCancelled?.()) return cancelledOutput();
       pauseRecoveryBudget();
       const compactionResult = await runRecoveryCompaction(activeSession, chatJid, runOptions, options);
       heartbeatTrackedPhase(chatJid, "preprompt_compaction", {
         eventType: "recovery_compaction",
         attempt: recoveryAttemptsUsed,
       });
+      if (options.isCancelled?.()) return cancelledOutput();
       if (!compactionResult.ok) {
         const compactionFailureCategory = classifyOpaqueAgentFailure(compactionResult.errorMessage);
         const compactDecision = decideAutomaticRecovery({

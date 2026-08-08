@@ -9,6 +9,7 @@ import {
   beginChatPreflight,
   blockChatOperation,
   clearChatPreflight,
+  getChatOperation,
   promoteChatOperation,
   promoteChatPreflightToInflight,
   type ChatOperationOwner,
@@ -147,6 +148,7 @@ export async function runProcessChatPreflight(options: {
 
 
 interface DurableOperationPreflightDeps {
+  getChatOperation: typeof getChatOperation;
   promoteChatOperation: typeof promoteChatOperation;
   blockChatOperation: typeof blockChatOperation;
   maybeAutoCompactSessionBeforePrompt: typeof maybeAutoCompactSessionBeforePrompt;
@@ -154,6 +156,7 @@ interface DurableOperationPreflightDeps {
 }
 
 const durableOperationPreflightDeps: DurableOperationPreflightDeps = {
+  getChatOperation,
   promoteChatOperation,
   blockChatOperation,
   maybeAutoCompactSessionBeforePrompt,
@@ -186,6 +189,11 @@ export async function runDurableOperationPreflight(options: {
 }): Promise<{ status: "continue"; operation: ChatOperationState } | { status: "deferred" }> {
   const deps = { ...durableOperationPreflightDeps, ...options.deps };
   let operation = options.operation;
+  const operationIsCancelled = (): boolean => {
+    const current = deps.getChatOperation(options.chatJid);
+    return current?.operationId !== operation.operationId || Boolean(current.cancellation);
+  };
+  if (operation.cancellation || operationIsCancelled()) return { status: "deferred" };
   if (operation.phase === "running") return { status: "continue", operation };
   if (operation.phase !== "pending" && operation.phase !== "preflight") return { status: "deferred" };
 
@@ -216,6 +224,7 @@ export async function runDurableOperationPreflight(options: {
 
   try {
   const rotateIfNeeded = async (source: "foreground" | "background"): Promise<boolean> => {
+    if (operationIsCancelled()) return false;
     const detail = options.compactionState.lastCompactionErrorMessage?.trim();
     if (!detail || isCompactionCancellationError(detail)) return false;
     const result = await options.channel.agentPool.emergencyRotateSession(options.chatJid, detail, {
@@ -256,6 +265,7 @@ export async function runDurableOperationPreflight(options: {
       void compactionPromise
         .then(() => rotateIfNeeded("background"))
         .then(() => {
+          if (operationIsCancelled()) return;
           const running = promoteRunning();
           if (running) options.enqueueResume(options.effectiveThreadRootId ?? undefined);
         })
@@ -282,6 +292,7 @@ export async function runDurableOperationPreflight(options: {
     return { status: "deferred" };
   }
 
+  if (operationIsCancelled()) return { status: "deferred" };
   const running = promoteRunning();
   if (!running) return { status: "deferred" };
   heartbeatTrackedPhase(options.chatJid, "prompt", { eventType: "operation_preflight_promoted" });

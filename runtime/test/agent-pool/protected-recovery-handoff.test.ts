@@ -36,6 +36,25 @@ test("protected recovery runs exactly one ordinary continuation at the AgentPool
   expect(final).toMatchObject({ status: "success", result: "finished with tools" });
 });
 
+test("cancellation at the handoff boundary prevents the protected continuation", async () => {
+  const prompts: string[] = [];
+  let cancelled = false;
+  const final = await runWithProtectedRecoveryHandoff(
+    "finish the task",
+    {},
+    async (prompt) => {
+      prompts.push(prompt);
+      cancelled = true;
+      return protectedOutput();
+    },
+    undefined,
+    () => cancelled,
+  );
+
+  expect(prompts).toEqual(["finish the task"]);
+  expect(final.requiresToolEnabledContinuation).toBeUndefined();
+});
+
 test("protected handoff preserves pre-tool progress but hides unauthoritative terminal prose", async () => {
   const delivered: string[] = [];
   const prompts: string[] = [];

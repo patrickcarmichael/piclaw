@@ -11,7 +11,7 @@ import {
   updateSessionStreaming,
   updateSessionModel,
 } from "../extensions/session-status.js";
-import { deleteSshConfig } from "../db.js";
+import { deleteSshConfig, getChatOperation } from "../db.js";
 import { clearLiveSshConfig } from "../extensions/ssh-core.js";
 
 import { getAutomaticRecoveryConfig } from "./automatic-recovery.js";
@@ -313,8 +313,9 @@ async function maybeAutoRotateSession(
   session: AgentSession,
   runtime: AgentSessionRuntime,
   chatJid: string,
-  options: Pick<RunAgentOrchestratorOptions, "onInfo" | "onWarn">,
+  options: Pick<RunAgentOrchestratorOptions, "onInfo" | "onWarn"> & { isCancelled?: () => boolean },
 ): Promise<AgentSession> {
+  if (options.isCancelled?.()) return session;
   const sessionStorageConfig = getSessionStorageConfig();
   if (!sessionStorageConfig.autoRotate) return session;
 
@@ -352,6 +353,7 @@ async function maybeAutoRotateSession(
     }
   }
 
+  if (options.isCancelled?.()) return session;
   const result = await rotateSession(session, runtime, {
     reason: "automatic",
     fallbackOnCompactionFailure: true,
@@ -899,6 +901,17 @@ export async function runAgentPrompt(
   options.clearAttachments(chatJid);
   updateSessionStreaming(chatJid, true);
   let modelLabel: string | null = null;
+  const isCancelled = (): boolean => {
+    if (!runOptions.operationOwner) return false;
+    const current = getChatOperation(chatJid);
+    return current?.operationId !== runOptions.operationOwner.operationId || Boolean(current.cancellation);
+  };
+  const cancelledOutput = (): AgentOutput => ({
+    status: "error",
+    result: null,
+    error: "Operation cancelled.",
+    failureCategory: "aborted",
+  });
 
   // Tool-cap and tool-ceiling state – declared outside try so cleanup
   // can run in finally regardless of how the try exits.
@@ -917,8 +930,10 @@ export async function runAgentPrompt(
     }
 
     const runtime = await options.getOrCreateRuntime(chatJid);
+    if (isCancelled()) return cancelledOutput();
     let session = runtime.session;
-    session = await maybeAutoRotateSession(session, runtime, chatJid, options);
+    session = await maybeAutoRotateSession(session, runtime, chatJid, { ...options, isCancelled });
+    if (isCancelled()) return cancelledOutput();
     // Protected recovery/finalization attempts deliberately clear tools. An
     // ordinary subsequent turn must never inherit that empty set: it is not a
     // user-selectable steady state and otherwise makes the agent appear broken
@@ -992,6 +1007,7 @@ export async function runAgentPrompt(
         }
         runOptions.onEvent?.(event);
       }, projectedPendingInputTokens);
+      if (isCancelled()) return cancelledOutput();
       if (prePromptCompactionFailure && !isCompactionCancellationError(prePromptCompactionFailure)) {
         const rotation = await rotateSession(session, runtime, {
           reason: "automatic",
@@ -1032,6 +1048,7 @@ export async function runAgentPrompt(
     } else {
       heartbeatTrackedPhase(chatJid, "prompt", { eventType: "preprompt_compaction_skipped" });
     }
+    if (isCancelled()) return cancelledOutput();
     pruneOrphanToolResults(session, chatJid);
     const forkBaseLeafId = typeof session.sessionManager?.getLeafId === "function"
       ? session.sessionManager.getLeafId()
@@ -1091,8 +1108,10 @@ export async function runAgentPrompt(
       onInfo: options.onInfo,
       onWarn: options.onWarn,
       clearAttachments: options.clearAttachments,
+      isCancelled,
       toolCallCap: toolCallCapRef,
       rotateAfterInsufficientCompaction: async (reason) => {
+        if (isCancelled()) return { ok: false, errorMessage: "Operation cancelled." };
         const rotation = await rotateSession(session, runtime, {
           reason: "automatic",
           skipCompaction: true,
@@ -1115,6 +1134,7 @@ export async function runAgentPrompt(
         return { ok: true, session, sessionCtrl };
       },
       rotateAfterCompactionFailure: async (reason) => {
+        if (isCancelled()) return { ok: false, errorMessage: "Operation cancelled." };
         const rotation = await rotateSession(session, runtime, {
           reason: "automatic",
           skipCompaction: true,
@@ -1150,7 +1170,7 @@ export async function runAgentPrompt(
       ),
     }));
 
-    if (runOptions.scheduleIdleAutoCompaction && (runResult.status === "success" || runResult.status === "tool_complete")) {
+    if (!isCancelled() && runOptions.scheduleIdleAutoCompaction && (runResult.status === "success" || runResult.status === "tool_complete")) {
       await maybeAutoCompactSessionAfterTurn(session, chatJid, options, (event) => {
         const eventAny = event as { type?: string };
         if (eventAny.type === "compaction_start") {

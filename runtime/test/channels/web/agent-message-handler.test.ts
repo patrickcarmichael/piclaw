@@ -1,6 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import "../../helpers.ts";
-import { beginChatRun, getChatCursor, getInflightMessageId, initDatabase } from "../../../src/db.js";
+import {
+  beginChatRun,
+  claimNextChatOperation,
+  getChatCursor,
+  getChatOperation,
+  getInflightMessageId,
+  initDatabase,
+  registerAcceptedChatSource,
+} from "../../../src/db.js";
 import { handleAgentMessage } from "../../../src/channels/web/handlers/agent.ts";
 
 describe("web agent message handler", () => {
@@ -189,6 +197,64 @@ describe("web agent message handler", () => {
     expect(applyCalls).toEqual([{ chatJid: "web:default", command: { type: "abort", raw: "/abort" } }]);
     expect(storeMessageCalls).toBe(0);
     expect(broadcasts.some((entry) => entry.event === "new_post")).toBe(false);
+  });
+
+  test("routes durable /abort through cancellation before physical session abort", async () => {
+    initDatabase();
+    const chatJid = "web:durable-local-abort";
+    registerAcceptedChatSource({
+      chatJid,
+      sourceClass: "prompt",
+      sourceKind: "queued_followup",
+      sourceId: "local-abort-source",
+      acceptedAt: "2026-08-08T09:00:00.000Z",
+      payloadRef: "followup:local-abort-source",
+    });
+    const operation = claimNextChatOperation(chatJid).operation;
+    if (!operation) throw new Error("expected operation");
+    const cancellationCalls: unknown[][] = [];
+    const resumes: string[] = [];
+    let legacyAbortCalls = 0;
+    const channel = {
+      agentPool: {
+        isStreaming: () => true,
+        isActive: () => true,
+        cancelOperationAndAbort: async (...args: unknown[]) => {
+          cancellationCalls.push(args);
+          return { status: "cancelled", physicallyAborted: true, operation: getChatOperation(chatJid) };
+        },
+        applyControlCommand: async () => {
+          legacyAbortCalls += 1;
+          return { status: "success", message: "legacy" };
+        },
+      },
+      resumeChat: (nextChatJid: string) => { resumes.push(nextChatJid); },
+      json: (payload: unknown, status = 200) => new Response(JSON.stringify(payload), {
+        status,
+        headers: { "Content-Type": "application/json" },
+      }),
+      enqueueQueuedFollowupItem: () => 0,
+      getQueuedFollowupCount: () => 0,
+      broadcastEvent: () => {},
+      storeMessage: () => null,
+      sendMessage: async () => {},
+    } as any;
+
+    const response = await handleAgentMessage(channel, new Request("https://example.com/agent/default/message", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content: "/abort" }),
+    }), "/agent/default/message", chatJid, "default");
+    const body = await response.json();
+
+    expect(cancellationCalls).toEqual([[chatJid, operation.operationId, "user_abort"]]);
+    expect(legacyAbortCalls).toBe(0);
+    expect(resumes).toEqual([chatJid]);
+    expect(body.command).toMatchObject({
+      status: "success",
+      cancellation_status: "cancelled",
+      physically_aborted: true,
+    });
   });
 
   test("runs /compact immediately while the current session is still active", async () => {

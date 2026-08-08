@@ -47,6 +47,30 @@ test("session_control requires exactly one target selector", async () => {
   expect(bothTargets.details.error).toContain("only one target");
 });
 
+test("session_control requires an expected operation for abort and unblock", async () => {
+  let calls = 0;
+  setSessionControlHandler(async (request) => {
+    calls += 1;
+    return {
+      ok: true,
+      action: request.action,
+      source_chat_jid: request.source_chat_jid,
+      target_chat_jid: request.target_chat_jid || "web:resolved",
+    };
+  });
+
+  const tool = makePi().tools.get("session_control");
+  for (const action of ["abort", "unblock"]) {
+    const result = await withChatContext("web:source", "web", () => tool.execute(`call-${action}`, {
+      action,
+      target_agent_name: "research",
+    }));
+    expect(result.details.ok).toBe(false);
+    expect(result.details.error).toContain("expected_operation_id");
+  }
+  expect(calls).toBe(0);
+});
+
 test("session_control dispatches inspect, switch_model, and unblock requests to the runtime handler", async () => {
   const calls: any[] = [];
   setSessionControlHandler(async (request) => {
@@ -83,9 +107,14 @@ test("session_control dispatches inspect, switch_model, and unblock requests to 
   const unblocked = await withChatContext("web:source", "web", () => tool.execute("call-5", {
     action: "unblock",
     target_chat_jid: "web:target",
+    expected_operation_id: "operation-1",
   }));
   expect(unblocked.details.ok).toBe(true);
-  expect(calls[2]).toMatchObject({ action: "unblock", target_chat_jid: "web:target" });
+  expect(calls[2]).toMatchObject({
+    action: "unblock",
+    target_chat_jid: "web:target",
+    expected_operation_id: "operation-1",
+  });
 });
 
 test("session_control dispatches every supported action name to the runtime handler", async () => {
@@ -109,6 +138,7 @@ test("session_control dispatches every supported action name to the runtime hand
     const result = await withChatContext("web:source", "web", () => tool.execute(`call-${action}`, {
       action,
       target_chat_jid: "web:target",
+      ...((action === "abort" || action === "unblock") ? { expected_operation_id: "operation-1" } : {}),
     }));
     expect(result.details.ok).toBe(true);
   }

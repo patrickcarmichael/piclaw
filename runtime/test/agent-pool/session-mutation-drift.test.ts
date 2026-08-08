@@ -75,7 +75,7 @@ const directMethodNames = new Set(
 );
 const directFunctionNames = new Set(["rotateSession", "maybeAutoCompactSessionBeforePrompt"]);
 const expectedGatewayMethodNames = new Set([
-  "runAgent", "applyControlCommand", "emergencyRotateSession", "runSessionMutation",
+  "runAgent", "applyControlCommand", "cancelOperationAndAbort", "emergencyRotateSession", "runSessionMutation",
   "restoreSessionPosition", "disposeChatSession", "getSessionForIntrospection", "renameChatBranch",
   "pruneChatBranch", "mergeChatBranchIntoParent", "renameChatJid", "restoreChatBranch",
   "permanentPurgeChatBranch", "queueStreamingMessage", "removeQueuedFollowupMessage", "applySlashCommand",
@@ -228,13 +228,13 @@ const expectedCallers: Inventory = {
   "channels/web/cards/adaptive-card-side-prompt-service.ts": { applyControlCommand: 1 },
   "channels/web/core/web-channel-runtime-public-surface-service.ts": { queueStreamingMessage: 1 },
   "channels/web/handlers/addons.ts": { applySlashCommand: 1 },
-  "channels/web/handlers/agent.ts": { applyControlCommand: 3, applySlashCommand: 1, queueStreamingMessage: 2, runAgent: 1 },
+  "channels/web/handlers/agent.ts": { applyControlCommand: 3, applySlashCommand: 1, cancelOperationAndAbort: 1, queueStreamingMessage: 2, runAgent: 1 },
   "channels/web/runtime/process-chat-control-runtime.ts": { applyControlCommand: 1 },
   "channels/web/runtime/process-chat-preflight-runtime.ts": { emergencyRotateSession: 2, runSessionMutation: 2 },
   "channels/web/runtime/queued-followup-lifecycle-service.ts": { removeQueuedFollowupMessage: 1 },
   "dream.ts": { applyControlCommand: 1, disposeChatSession: 1, runAgent: 1 },
   "runtime/message-loop.ts": { applyControlCommand: 1, applySlashCommand: 1, runAgent: 1 },
-  "runtime/startup.ts": { applyControlCommand: 5 },
+  "runtime/startup.ts": { applyControlCommand: 3, cancelOperationAndAbort: 2 },
   "task-scheduler.ts": { applyControlCommand: 1, restoreSessionPosition: 1, runAgent: 1 },
 };
 
@@ -260,6 +260,15 @@ describe("persistent session mutation drift", () => {
 
   test("snapshots every caller of a public persistent-session gateway entry", () => {
     expect(mutationInventory.callers).toEqual(expectedCallers);
+  });
+
+  test("keeps post-cancellation occupied-lane access inside the coupled gateway primitive", () => {
+    const callers: string[] = [];
+    for (const path of new Bun.Glob("**/*.ts").scanSync({ cwd: sourceRoot, absolute: true })) {
+      const source = readFileSync(path, "utf8");
+      if (source.includes(".cancelAndActAbort(")) callers.push(relative(sourceRoot, path).replaceAll("\\", "/"));
+    }
+    expect(callers).toEqual(["agent-pool.ts"]);
   });
 
   test("keeps web preflight and bound extension actions on the gateway", () => {

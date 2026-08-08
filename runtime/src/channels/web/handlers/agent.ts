@@ -35,6 +35,7 @@ import {
   completeChatOperation,
   getChatCursor,
   getChatOperation,
+  getChatOperationDisposition,
   getChatPreflight,
   getInflightMessageId,
   getMessageRowIdById,
@@ -143,6 +144,22 @@ function durableOperationOwner(operation: ChatOperationState): ChatOperationOwne
     phase: operation.phase,
     generation: operation.generation,
   };
+}
+
+function completeCancelledDurableOperation(
+  chatJid: string,
+  operation: ChatOperationState,
+  provenance: string,
+): boolean {
+  if (!operation.cancellation) return false;
+  const completed = completeChatOperation(chatJid, {
+    owner: durableOperationOwner(operation),
+    outcome: "cancelled",
+    cause: operation.cancellation.cause,
+    provenance,
+    createdAt: new Date().toISOString(),
+  });
+  return completed.status === "completed" || completed.status === "repeated";
 }
 
 function reserveContinuation(extensionId: string, chatJid: string, threadKey: string): boolean {
@@ -907,9 +924,32 @@ export async function handleAgentMessage(
 
   if (command?.type === "abort" && !hasAttachments) {
     const activeOperation = getChatOperation(chatJid);
-    const result = await channel.agentPool.applyControlCommand(chatJid, command, activeOperation
-      ? { operationOwner: durableOperationOwner(activeOperation) }
-      : {});
+    if (activeOperation) {
+      const result = await channel.agentPool.cancelOperationAndAbort(
+        chatJid,
+        activeOperation.operationId,
+        "user_abort",
+      );
+      if (result.status === "cancelled") channel.resumeChat(chatJid);
+      return channel.json(
+        {
+          thread_id: null,
+          command: {
+            status: result.status === "cancelled" ? "success" : "error",
+            message: result.status === "cancelled"
+              ? "Operation cancellation persisted."
+              : "The active operation changed before cancellation; no action was taken.",
+            cancellation_status: result.status,
+            physically_aborted: result.physicallyAborted,
+          },
+          ui_only: true,
+          immediate: isActive,
+        },
+        200,
+      );
+    }
+
+    const result = await channel.agentPool.applyControlCommand(chatJid, command);
     return channel.json(
       {
         thread_id: null,
@@ -1513,7 +1553,13 @@ export async function processChat(
     if (resumed.status !== "applied") return;
     durableOperation = resumed.operation;
   }
-  if (durableOperation?.phase === "blocked" || durableOperation?.cancellation) return;
+  if (durableOperation?.cancellation) {
+    if (completeCancelledDurableOperation(chatJid, durableOperation, "process_chat_cancelled_frontier")) {
+      channel.resumeChat(chatJid);
+    }
+    return;
+  }
+  if (durableOperation?.phase === "blocked") return;
 
   const activePreflight = durableOperation ? null : getChatPreflight(chatJid);
   if (activePreflight) {
@@ -1892,6 +1938,11 @@ export async function processChat(
       clearCommittedDraft();
     },
     onTurnComplete: (turn: { text: string; attachments: unknown[]; usage?: unknown; followedByToolUse?: boolean }) => {
+      const currentOperation = durableOperation ? getChatOperation(chatJid) : null;
+      if (currentOperation && currentOperation.operationId === durableOperation?.operationId && currentOperation.cancellation) {
+        clearCommittedDraft();
+        return;
+      }
       // Turn boundary: the first turn (index 0) is the original prompt's
       // response — skip placeholder consumption so it doesn't steal a
       // placeholder that belongs to a queued follow-up.
@@ -1931,6 +1982,25 @@ export async function processChat(
   });
 
   streamState.lastRecoveryMeta = output.recovery || null;
+
+  if (durableOperation) {
+    const currentOperation = getChatOperation(chatJid);
+    if (currentOperation && currentOperation.operationId === durableOperation.operationId && currentOperation.cancellation) {
+      if (completeCancelledDurableOperation(chatJid, currentOperation, "session_control_abort")) {
+        durableOperationCompleted = true;
+        clearCommittedDraft();
+        endTrackedPhase(chatJid);
+        channel.resumeChat(chatJid);
+      }
+      return;
+    }
+    const disposition = getChatOperationDisposition(durableOperation.sourceSeq);
+    if (disposition?.operationId === durableOperation.operationId && disposition.outcome === "cancelled") {
+      clearCommittedDraft();
+      endTrackedPhase(chatJid);
+      return;
+    }
+  }
 
   // A prior process may have persisted protected handoff intent before
   // crashing. Successful replay removes that source-tagged intent in the same

@@ -170,6 +170,31 @@ export class SessionMutationGateway {
     return await this.context.run({ chatJid, access }, action);
   }
 
+  /**
+   * Validate the durable owner, persist cancellation synchronously, then abort
+   * only the lane occupant that still has that exact pre-cancellation owner.
+   * The callback boundary prevents post-cancellation generation drift from
+   * becoming a reusable ownership-check bypass.
+   */
+  async cancelAndActAbort<T, C>(
+    chatJid: string,
+    access: SessionMutationAccess,
+    cancel: () => C,
+    cancellationApplied: (result: C) => boolean,
+    action: () => Promise<T> | T,
+  ): Promise<{ cancellation: C; acted: boolean; result?: T }> {
+    this.assertAccess(chatJid, "abort", access);
+    const cancellation = cancel();
+    if (!cancellationApplied(cancellation)) return { cancellation, acted: false };
+
+    const activeAccess = this.activeAccessByChat.get(chatJid);
+    if (!activeAccess || !this.isSameAccess(activeAccess, access)) {
+      return { cancellation, acted: false };
+    }
+    const result = await this.context.run({ chatJid, access }, action);
+    return { cancellation, acted: true, result };
+  }
+
   private isSameAccess(left: SessionMutationAccess, right: SessionMutationAccess): boolean {
     if (left.scope !== right.scope) return false;
     return left.scope === "legacy" || (right.scope === "operation" && sameOwner(left.owner, right.owner));

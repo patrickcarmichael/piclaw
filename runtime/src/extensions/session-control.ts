@@ -25,6 +25,7 @@ export interface SessionControlRequest {
   action: SessionControlAction;
   target_chat_jid?: string;
   target_agent_name?: string;
+  expected_operation_id?: string;
   model?: string;
   instructions?: string;
   force?: boolean;
@@ -68,6 +69,7 @@ const SessionControlSchema = Type.Object({
   ], { description: "Session-control action. Defaults to inspect." })),
   target_chat_jid: Type.Optional(Type.String({ description: "Target chat JID to inspect or control. Fallback only; prefer target_agent_name/@alias so the runtime can resolve the internal session tree." })),
   target_agent_name: Type.Optional(Type.String({ description: "Preferred target agent handle/alias, e.g. research or @research. Resolves through the internal session tree mapping." })),
+  expected_operation_id: Type.Optional(Type.String({ description: "Required for abort and unblock. Copy operation_id from a fresh inspect/assess result; stale or absent owners are no-ops." })),
   model: Type.Optional(Type.String({ description: "Model label for switch_model, e.g. github-copilot/gpt-5.4." })),
   instructions: Type.Optional(Type.String({ description: "Optional compaction instructions for compact." })),
   force: Type.Optional(Type.Boolean({ description: "Allow higher-risk control action variants where supported." })),
@@ -77,6 +79,7 @@ type SessionControlParams = {
   action?: SessionControlAction;
   target_chat_jid?: string;
   target_agent_name?: string;
+  expected_operation_id?: string;
   model?: string;
   instructions?: string;
   force?: boolean;
@@ -87,7 +90,7 @@ const HINT = [
   "Use session_control for operational control of another session: inspect, assess_stuck, compact, abort, switch_model, retry_failed, skip_failed, wake, or unblock.",
   "This is intentionally separate from the chat tool. chat relays messages; session_control mutates session runtime state.",
   "Prefer target_agent_name with an @alias over raw target_chat_jid/session IDs; aliases resolve through the internal Pi session-tree registry.",
-  "Prefer inspect or assess_stuck before mutating a target session unless the user explicitly asks you to unblock it.",
+  "Inspect or assess_stuck returns the resolved target and active operation identity. Pass that operation_id as expected_operation_id to abort or unblock; stale decisions are no-ops.",
 ].join("\n");
 
 function err(message: string, details: Record<string, unknown> = {}): AgentToolResult<Record<string, unknown>> {
@@ -131,6 +134,10 @@ export const sessionControl: ExtensionFactory = (pi: ExtensionAPI) => {
       const targetAgentName = normalizeTargetAgentName(params.target_agent_name);
       if (!targetChatJid && !targetAgentName) return err("Provide target_agent_name (@alias preferred) or target_chat_jid.");
       if (targetChatJid && targetAgentName) return err("Provide only one target selector: target_chat_jid or target_agent_name.");
+      const expectedOperationId = params.expected_operation_id?.trim() || "";
+      if ((action === "abort" || action === "unblock") && !expectedOperationId) {
+        return err(`${action} requires expected_operation_id from a fresh inspect or assess_stuck result.`);
+      }
       if (action === "switch_model" && !params.model?.trim()) return err("switch_model requires model.");
 
       if (!registeredSessionControlHandler) {
@@ -143,6 +150,7 @@ export const sessionControl: ExtensionFactory = (pi: ExtensionAPI) => {
           action,
           ...(targetChatJid ? { target_chat_jid: targetChatJid } : {}),
           ...(targetAgentName ? { target_agent_name: targetAgentName } : {}),
+          ...(expectedOperationId ? { expected_operation_id: expectedOperationId } : {}),
           ...(params.model?.trim() ? { model: params.model.trim() } : {}),
           ...(params.instructions?.trim() ? { instructions: params.instructions.trim() } : {}),
           ...(params.force !== undefined ? { force: Boolean(params.force) } : {}),

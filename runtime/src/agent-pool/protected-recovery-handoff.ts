@@ -20,6 +20,7 @@ export async function runWithProtectedRecoveryHandoff(
   options: RunAgentOptions,
   run: (nextPrompt: string, nextOptions: RunAgentOptions) => Promise<AgentOutput>,
   onOutput?: (output: AgentOutput) => void,
+  isCancelled?: () => boolean,
 ): Promise<AgentOutput> {
   const bufferedTurns: TurnOutput[] = [];
   const originalOnTurnComplete = options.onTurnComplete;
@@ -30,6 +31,11 @@ export async function runWithProtectedRecoveryHandoff(
     : options;
   const initial = await run(prompt, initialOptions);
   onOutput?.(initial);
+
+  if (isCancelled?.()) {
+    const { requiresToolEnabledContinuation: _cancelled, ...terminal } = initial;
+    return terminal;
+  }
 
   if (
     !initial.requiresToolEnabledContinuation
@@ -45,6 +51,10 @@ export async function runWithProtectedRecoveryHandoff(
   // runtime recovery now hands off before making a tools-disabled request.
   for (const turn of bufferedTurns) {
     if (turn.followedByToolUse) originalOnTurnComplete?.(turn);
+  }
+  if (isCancelled?.()) {
+    const { requiresToolEnabledContinuation: _cancelled, ...terminal } = initial;
+    return terminal;
   }
   const continuation = await run(TOOL_ENABLED_RECOVERY_CONTINUATION_PROMPT, {
     ...options,
