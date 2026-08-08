@@ -1,5 +1,5 @@
 import { getIdentityConfig } from "../../../core/config.js";
-import { endChatRun, getChatCursor, getMessagesSince, peekNextAcceptedChatSource } from "../../../db.js";
+import { endChatRun, getChatCursor, getMessagesSince, peekNextAcceptedChatSource, type ChatOperationOwner } from "../../../db.js";
 import { checkPendingShutdown } from "../../../runtime/shutdown-registry.js";
 import { createLogger } from "../../../utils/logger.js";
 import type { WebChannelLike } from "../core/web-channel-contracts.js";
@@ -101,6 +101,7 @@ export interface PersistIntermediateTurnOptions {
   skipPlaceholder: boolean;
   timingBlock: Record<string, unknown>;
   followedByToolUse?: boolean;
+  operationOwner?: ChatOperationOwner;
   clearCommittedDraft(): void;
 }
 
@@ -114,6 +115,7 @@ export function persistIntermediateProcessChatTurn(options: PersistIntermediateT
     threadId: options.threadId,
     skipPlaceholder: options.skipPlaceholder,
     extraContentBlocks: [options.timingBlock],
+    operationOwner: options.operationOwner,
     onMessageStored: options.followedByToolUse ? options.clearCommittedDraft : undefined,
   });
 }

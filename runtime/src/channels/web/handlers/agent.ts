@@ -1675,6 +1675,7 @@ export async function processChat(
   let turnCount = 0;
   let hadIntermediateOutput = false;
   let persistedIntermediateOutput = false;
+  let lastPersistedIntermediateRowId: number | null = null;
   let intermediatePersistFailed = false;
   const resolvedThreadRootId = resolveThreadRootId(channel, chatJid, currentMessage.id ?? "", effectiveThreadRootId);
 
@@ -1738,6 +1739,18 @@ export async function processChat(
         artifact: { messageId: message.id },
       });
       durableOperationCompleted = completed.status === "completed" || completed.status === "repeated";
+      if (!durableOperationCompleted) {
+        log.warn("Durable terminal completion lost operation ownership", {
+          operation: "process_chat.operation_completion_rejected",
+          chatJid,
+          operationId: durableOperation.operationId,
+          sourceSeq: durableOperation.sourceSeq,
+          phase: durableOperation.phase,
+          generation: durableOperation.generation,
+          reason: "reason" in completed ? completed.reason : "unknown",
+          observedOperation: "operation" in completed ? completed.operation : null,
+        });
+      }
       return durableOperationCompleted;
     } catch (error) {
       log.error("Durable terminal completion failed after message persistence", {
@@ -1963,6 +1976,7 @@ export async function processChat(
           skipPlaceholder: isFirstTurn,
           timingBlock: streamRuntime.buildAgentTimingBlock(turn.usage),
           followedByToolUse: turn.followedByToolUse,
+          operationOwner: durableOperation ? durableOperationOwner(durableOperation) : undefined,
           clearCommittedDraft,
         });
         if (!stored) {
@@ -1976,6 +1990,7 @@ export async function processChat(
           });
         } else {
           persistedIntermediateOutput = true;
+          lastPersistedIntermediateRowId = stored;
         }
       }
     },
@@ -2276,7 +2291,7 @@ export async function processChat(
     : hasDraftFallback
       ? publishDraftFallback("empty-final")
       : persistedIntermediateOutput
-        ? (durableOperation ? publishDraftFallback("empty-final") : true)
+        ? !durableOperation
         : publishDraftFallback("empty-final");
 
   if (!finalized && hasOutput) {
@@ -2303,8 +2318,17 @@ export async function processChat(
   if (!finalized && !hasOutput) {
     if (persistedIntermediateOutput) {
       // A prior turn in the same run was already persisted (e.g. auto-
-      // compaction produced a trailing empty turn). Treat this as success and
-      // do not emit the no-response warning.
+      // compaction produced a trailing empty turn). For durable ownership,
+      // promote that exact message to the terminal artifact in the same
+      // completion transaction instead of publishing a second synthetic row.
+      if (durableOperation && lastPersistedIntermediateRowId !== null) {
+        commitDurableTerminal(
+          lastPersistedIntermediateRowId,
+          "succeeded",
+          "intermediate_output_completed_run",
+          "web_process_chat_intermediate_completion",
+        );
+      }
       await finalizeSuccessfulRun();
       return;
     }

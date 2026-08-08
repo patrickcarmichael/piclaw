@@ -26,6 +26,7 @@ type RuntimeFollowupQueuedLifecycle = Pick<
   | "consumeQueuedFollowupItem"
   | "prependQueuedFollowupItem"
   | "replaceQueuedFollowupItem"
+  | "peekQueuedFollowupPlaceholder"
   | "consumeQueuedFollowupPlaceholder"
   | "getQueuedFollowupCount"
   | "getQueuedFollowupItems"
@@ -119,8 +120,12 @@ export class WebChannelRuntimeFollowupFacadeService {
     return this.deps.getQueuedFollowupLifecycle().replaceQueuedFollowupItem(chatJid, item);
   }
 
-  consumeQueuedFollowupPlaceholder(chatJid: string): number | null {
-    return this.deps.getQueuedFollowupLifecycle().consumeQueuedFollowupPlaceholder(chatJid);
+  peekQueuedFollowupPlaceholder(chatJid: string): number | null {
+    return this.deps.getQueuedFollowupLifecycle().peekQueuedFollowupPlaceholder(chatJid);
+  }
+
+  consumeQueuedFollowupPlaceholder(chatJid: string, expectedRowId?: number): number | null {
+    return this.deps.getQueuedFollowupLifecycle().consumeQueuedFollowupPlaceholder(chatJid, expectedRowId);
   }
 
   getQueuedFollowupCount(chatJid: string): number {

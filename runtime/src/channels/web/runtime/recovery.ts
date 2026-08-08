@@ -6,11 +6,14 @@ import {
   clearChatCompactionActive,
   clearChatPreflight,
   clearInflightMarker,
+  completeChatOperation,
+  getAcceptedChatSource,
   getActiveChatCompactions,
   getAgentReplyStateAfter,
   getAllChatCursors,
   getBlockedDurableChatJids,
   getChatCompactionBackoff,
+  getChatOperation,
   getDb,
   getDeferredQueuedFollowups,
   getInflightRuns,
@@ -23,14 +26,19 @@ import {
   rollbackInflightRun,
   setChatCompactionBackoff,
   storeMessage,
+  type AcceptedChatSource,
   type ActiveCompactionState,
   type AgentReplyState,
+  type ChatOperationCompletion,
+  type ChatOperationCompletionResult,
+  type ChatOperationState,
   type DeferredQueuedFollowupRecord,
   type InflightRun,
   type ManualCompactQuarantineRecord,
   type PreflightRun,
   type StalePreflightRecoveryRecord,
 } from "../../../db.js";
+import type { NewMessage } from "../../../types.js";
 import { createUuid } from "../../../utils/ids.js";
 import { createLogger } from "../../../utils/logger.js";
 import { getWebRecoveryConfig } from "../../../core/config.js";
@@ -70,6 +78,27 @@ export function buildInterruptedTurnOutcomeMarker(cause: InterruptedTurnCause): 
   };
 }
 
+function buildInterruptedTurnMessage(
+  chatJid: string,
+  sourceMessageId: string,
+  assistantName: string,
+  cause: InterruptedTurnCause,
+): NewMessage {
+  return {
+    id: createUuid("web"),
+    chat_jid: chatJid,
+    sender: "web-agent",
+    sender_name: assistantName,
+    content: "",
+    content_blocks: [buildInterruptedTurnOutcomeMarker(cause)],
+    thread_id: getMessageThreadRootIdById(chatJid, sourceMessageId) ?? undefined,
+    timestamp: new Date().toISOString(),
+    is_from_me: true,
+    is_bot_message: true,
+    is_terminal_agent_reply: true,
+  };
+}
+
 function persistInterruptedTurnOutcome(
   chatJid: string,
   inflight: InflightRun,
@@ -77,19 +106,7 @@ function persistInterruptedTurnOutcome(
   cause: InterruptedTurnCause = "service_restart",
 ): void {
   try {
-    storeMessage({
-      id: createUuid("web"),
-      chat_jid: chatJid,
-      sender: "web-agent",
-      sender_name: assistantName,
-      content: "",
-      content_blocks: [buildInterruptedTurnOutcomeMarker(cause)],
-      thread_id: getMessageThreadRootIdById(chatJid, inflight.messageId) ?? undefined,
-      timestamp: new Date().toISOString(),
-      is_from_me: true,
-      is_bot_message: true,
-      is_terminal_agent_reply: true,
-    });
+    storeMessage(buildInterruptedTurnMessage(chatJid, inflight.messageId, assistantName, cause));
   } catch (error) {
     log.warn("Failed to persist interrupted-turn outcome", {
       operation: "recover_inflight_runs.persist_interrupted_outcome",
@@ -101,22 +118,34 @@ function persistInterruptedTurnOutcome(
   }
 }
 
-function persistRecoveredDraft(chatJid: string, inflight: InflightRun, assistantName: string, draft: PersistedDraftRecoveryEntry): void {
+function buildRecoveredDraftMessage(
+  chatJid: string,
+  sourceMessageId: string,
+  assistantName: string,
+  draft: PersistedDraftRecoveryEntry,
+): NewMessage | null {
   const text = typeof draft?.text === "string" ? draft.text.trim() : "";
-  if (!text) return;
+  if (!text) return null;
+  return {
+    id: createUuid("web"),
+    chat_jid: chatJid,
+    sender: "web-agent",
+    sender_name: assistantName,
+    content: text,
+    thread_id: getMessageThreadRootIdById(chatJid, sourceMessageId) ?? undefined,
+    timestamp: new Date().toISOString(),
+    is_from_me: true,
+    is_bot_message: true,
+    is_terminal_agent_reply: true,
+  };
+}
+
+function persistRecoveredDraft(chatJid: string, inflight: InflightRun, assistantName: string, draft: PersistedDraftRecoveryEntry): void {
+  if (!draft?.text?.trim()) return;
   try {
-    storeMessage({
-      id: createUuid("web"),
-      chat_jid: chatJid,
-      sender: "web-agent",
-      sender_name: assistantName,
-      content: text,
-      thread_id: getMessageThreadRootIdById(chatJid, inflight.messageId) ?? undefined,
-      timestamp: new Date().toISOString(),
-      is_from_me: true,
-      is_bot_message: true,
-      is_terminal_agent_reply: true,
-    });
+    const message = buildRecoveredDraftMessage(chatJid, inflight.messageId, assistantName, draft);
+    if (!message) return;
+    storeMessage(message);
   } catch (error) {
     log.warn("Failed to persist recovered draft after restart", {
       operation: "recover_inflight_runs.persist_recovered_draft",
@@ -144,6 +173,16 @@ export interface WebRecoveryContext {
   sleep?: (ms: number) => Promise<unknown>;
 }
 
+export interface RecoverableDurableRun {
+  operation: ChatOperationState;
+  source: AcceptedChatSource;
+}
+
+export interface PersistedAgentReply {
+  messageId: string;
+  terminal: boolean;
+}
+
 /** Persistence contract used by web recovery helpers. */
 export interface WebRecoveryStore {
   getPreflightRuns?(): PreflightRun[];
@@ -163,6 +202,9 @@ export interface WebRecoveryStore {
   getKnownChatJids(): string[];
   getResumableDurableChatJids?(): string[];
   getBlockedDurableChatJids?(): string[];
+  getRecoverableDurableRuns?(): RecoverableDurableRun[];
+  getLatestAgentReplyForOperation?(chatJid: string, operationId: string): PersistedAgentReply | null;
+  completeChatOperation?(chatJid: string, request: ChatOperationCompletion): ChatOperationCompletionResult;
   getDeferredQueuedFollowups(chatJid: string): DeferredQueuedFollowupRecord[];
   getMessagesSince(chatJid: string, since: string, assistantName: string): unknown[];
 }
@@ -179,6 +221,28 @@ function getKnownChatJids(): string[] {
   return rows
     .map((row) => (typeof row.chat_jid === "string" ? row.chat_jid.trim() : ""))
     .filter((jid) => jid.length > 0);
+}
+
+function getRecoverableDurableRuns(): RecoverableDurableRun[] {
+  const runs: RecoverableDurableRun[] = [];
+  for (const chatJid of getResumableDurableChatJids()) {
+    const operation = getChatOperation(chatJid);
+    if (!operation || operation.phase !== "running" || operation.cancellation) continue;
+    const source = getAcceptedChatSource(operation.sourceSeq);
+    if (!source || source.operationId !== operation.operationId) continue;
+    runs.push({ operation, source });
+  }
+  return runs;
+}
+
+function getLatestAgentReplyForOperation(chatJid: string, operationId: string): PersistedAgentReply | null {
+  const row = getDb().prepare(`
+    SELECT id, COALESCE(is_terminal_agent_reply, 0) AS is_terminal_agent_reply
+    FROM messages
+    WHERE chat_jid = ? AND operation_id = ? AND is_bot_message = 1
+    ORDER BY timestamp DESC, rowid DESC LIMIT 1
+  `).get(chatJid, operationId) as { id: string; is_terminal_agent_reply: number } | undefined;
+  return row ? { messageId: row.id, terminal: row.is_terminal_agent_reply === 1 } : null;
 }
 
 const defaultStore: WebRecoveryStore = {
@@ -201,6 +265,9 @@ const defaultStore: WebRecoveryStore = {
   getKnownChatJids,
   getResumableDurableChatJids,
   getBlockedDurableChatJids,
+  getRecoverableDurableRuns,
+  getLatestAgentReplyForOperation,
+  completeChatOperation,
   getDeferredQueuedFollowups,
   getMessagesSince,
 };
@@ -317,6 +384,81 @@ export function recoverStaleInflightRun(
 
 function isAutomaticRetryCompactionReason(reason: string | null | undefined): boolean {
   return reason === "threshold" || reason === "idle" || reason === "recovery";
+}
+
+function recoverDurableRunningOperations(
+  ctx: WebRecoveryContext,
+  store: WebRecoveryStore,
+): void {
+  const runs = store.getRecoverableDurableRuns?.() ?? [];
+  if (runs.length === 0 || !store.getLatestAgentReplyForOperation || !store.completeChatOperation) return;
+
+  for (const { operation, source } of runs) {
+    const reply = store.getLatestAgentReplyForOperation(operation.chatJid, operation.operationId);
+    const draft = reply ? null : (ctx.getDraftRecovery?.(operation.chatJid) ?? null);
+    const sourceMessageId = source.frontierMessageId ?? source.sourceId;
+    const recoveryMessage = reply
+      ? null
+      : (draft?.text?.trim()
+          ? buildRecoveredDraftMessage(operation.chatJid, sourceMessageId, ctx.assistantName, draft)
+          : buildInterruptedTurnMessage(operation.chatJid, sourceMessageId, ctx.assistantName, "service_restart"));
+    const outcome = reply?.terminal ? "succeeded" : "interrupted";
+    const cause = reply?.terminal
+      ? "recovered_terminal_output"
+      : reply
+        ? "recovered_partial_output"
+        : draft?.text?.trim()
+          ? "recovered_draft_after_restart"
+          : "service_restart";
+
+    try {
+      const completed = store.completeChatOperation(operation.chatJid, {
+        owner: {
+          operationId: operation.operationId,
+          sourceSeq: operation.sourceSeq,
+          phase: operation.phase,
+          generation: operation.generation,
+        },
+        outcome,
+        cause,
+        provenance: "web_startup_recovery",
+        createdAt: new Date().toISOString(),
+        artifact: reply
+          ? { messageId: reply.messageId }
+          : recoveryMessage
+            ? { message: recoveryMessage }
+            : undefined,
+      });
+      if (completed.status !== "completed" && completed.status !== "repeated") {
+        log.info("Durable restart recovery lost operation ownership", {
+          operation: "recover_durable_operations.owner_rejected",
+          chatJid: operation.chatJid,
+          operationId: operation.operationId,
+          sourceSeq: operation.sourceSeq,
+          reason: "reason" in completed ? completed.reason : "unknown",
+        });
+        continue;
+      }
+      log.info("Durable operation settled from restart evidence", {
+        operation: "recover_durable_operations.completed",
+        chatJid: operation.chatJid,
+        operationId: operation.operationId,
+        sourceSeq: operation.sourceSeq,
+        replyState: reply?.terminal ? "terminal" : reply ? "partial" : "none",
+        outcome,
+        cause,
+      });
+      ctx.clearDraftRecovery?.(operation.chatJid);
+    } catch (error) {
+      log.error("Durable restart recovery failed; operation remains recoverable", {
+        operation: "recover_durable_operations.failed",
+        chatJid: operation.chatJid,
+        operationId: operation.operationId,
+        sourceSeq: operation.sourceSeq,
+        err: error,
+      });
+    }
+  }
 }
 
 /** Recover interrupted runs left inflight after a restart. */
@@ -511,6 +653,8 @@ export function recoverInflightRuns(
       return;
     }
   }
+
+  recoverDurableRunningOperations(ctx, store);
 
   const inflights = store.getInflightRuns();
   if (inflights.length === 0) return;

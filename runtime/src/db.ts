@@ -168,6 +168,7 @@ export {
   retryBlockedChatOperation,
   skipBlockedChatOperation,
   cancelChatOperation,
+  bindChatOperationMessage,
   completeChatOperation,
   getChatOperationDisposition,
   chatOperationTerminalArtifactPolicy,
@@ -189,6 +190,7 @@ export type {
   BlockedChatOperationSkip,
   ChatOperationCompletion,
   ChatOperationCompletionResult,
+  ChatOperationMessageBindResult,
   TerminalArtifactPolicy,
 } from "./db/chat-operations.js";
 export {

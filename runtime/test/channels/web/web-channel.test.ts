@@ -3871,6 +3871,70 @@ test("processChat publishes final draft fallback even after an intermediate turn
   expect(blocks.some((b: any) => b?.type === "turn_outcome_marker" && b?.label === "no reply")).toBe(true);
 });
 
+test("processChat atomically promotes intermediate-only durable output", async () => {
+  const ws = createTempWorkspace("piclaw-web-channel-");
+  cleanupWorkspace = ws.cleanup;
+  restoreEnv = setEnv({ PICLAW_WORKSPACE: ws.workspace, PICLAW_STORE: ws.store, PICLAW_DATA: ws.data });
+
+  const db = await import("../../../src/db.js");
+  db.initDatabase();
+  db.getDb().exec("DELETE FROM message_media; DELETE FROM messages; DELETE FROM chats; DELETE FROM chat_cursors;");
+  db.storeChatMetadata("web:default", new Date().toISOString(), "Web");
+
+  const source = db.storeAcceptedChatMessageSource({
+    id: `msg-${crypto.randomUUID()}`,
+    chat_jid: "web:default",
+    sender: "user",
+    sender_name: "User",
+    content: "finish one intermediate turn",
+    timestamp: new Date().toISOString(),
+    is_from_me: false,
+    is_bot_message: false,
+  }).source;
+
+  let bindingBeforeRunCompletion: string | null = null;
+  const webMod = await import("../../../src/channels/web.js");
+  const web = new (webMod.WebChannel as any)({
+    queue: { enqueue: () => {} },
+    agentPool: {
+      setSessionBinder: () => {},
+      runAgent: async (_prompt: string, _chatJid: string, options: any) => {
+        options.onTurnComplete?.({ text: "Persisted intermediate result", attachments: [] });
+        bindingBeforeRunCompletion = (db.getDb().prepare(`SELECT operation_id FROM messages
+          WHERE chat_jid = ? AND is_bot_message = 1 ORDER BY rowid DESC LIMIT 1`).get("web:default") as {
+            operation_id: string | null;
+          }).operation_id;
+        return { status: "success", result: null, attachments: [] };
+      },
+      getContextUsageForChat: async () => null,
+    },
+  });
+
+  await web.processChat("web:default", "default");
+
+  expect(db.getChatOperation("web:default")).toBeNull();
+  const disposition = db.getChatOperationDisposition(source.sourceSeq);
+  expect(disposition).toMatchObject({
+    outcome: "succeeded",
+    cause: "intermediate_output_completed_run",
+    provenance: "web_process_chat_intermediate_completion",
+  });
+  expect(bindingBeforeRunCompletion).toBe(disposition!.operationId);
+  const botRows = db.getDb().prepare(`SELECT id, content, is_terminal_agent_reply, operation_id
+    FROM messages WHERE chat_jid = ? AND is_bot_message = 1 ORDER BY rowid`).all("web:default") as Array<{
+      id: string;
+      content: string;
+      is_terminal_agent_reply: number;
+      operation_id: string | null;
+    }>;
+  expect(botRows).toEqual([{
+    id: disposition!.terminalMessageId,
+    content: "Persisted intermediate result",
+    is_terminal_agent_reply: 1,
+    operation_id: disposition!.operationId,
+  }]);
+});
+
 test("processChat publishes queued follow-up only after current turn completes", async () => {
   const ws = createTempWorkspace("piclaw-web-channel-");
   cleanupWorkspace = ws.cleanup;
