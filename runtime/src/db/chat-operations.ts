@@ -342,7 +342,8 @@ export function getResumableDurableChatJids(): string[] {
     FROM chat_accepted_sources source
     LEFT JOIN chat_operation_dispositions disposition ON disposition.source_seq = source.source_seq
     LEFT JOIN chat_cursors cursor ON cursor.chat_jid = source.chat_jid
-    WHERE source.source_kind = 'message' AND disposition.source_seq IS NULL AND cursor.operation_id IS NULL
+    WHERE source.source_kind = 'message' AND source.selectable = 1
+      AND disposition.source_seq IS NULL AND cursor.operation_id IS NULL
     ORDER BY 1
   `).all() as Array<{ chat_jid: string }>;
   return rows.map((row) => row.chat_jid);
