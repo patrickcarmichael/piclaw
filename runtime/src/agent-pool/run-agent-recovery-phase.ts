@@ -455,6 +455,7 @@ export async function runAgentRecoveryPhase(options: RunAgentRecoveryPhaseOption
   let attemptPrompt = prompt;
   let recoveryContinuationWithoutTools = false;
   let lastAttemptWasGenericProtected = false;
+  let successfulRecoveryCompaction = false;
   let turnToolExecutionCount = 0;
   let recoveryAttemptsUsed = 0;
   let lastClassifier: RecoveryClassifier | null = null;
@@ -524,6 +525,7 @@ export async function runAgentRecoveryPhase(options: RunAgentRecoveryPhaseOption
       failureCategory: "no_terminal_output",
       nextAction: "Continue automatically in one ordinary turn with the restored tool baseline.",
       requiresToolEnabledContinuation: true,
+      protectedRecoveryHandoff: { afterSuccessfulCompaction: successfulRecoveryCompaction },
       recovery,
     };
   };
@@ -1059,6 +1061,8 @@ export async function runAgentRecoveryPhase(options: RunAgentRecoveryPhaseOption
             ),
           };
         }
+      } else if (!compactionResult.stillOverThreshold) {
+        successfulRecoveryCompaction = true;
       } else if (compactionResult.stillOverThreshold) {
         const reason = "Recovery compaction completed but the session remains above the context threshold.";
         if (!options.rotateAfterInsufficientCompaction) {

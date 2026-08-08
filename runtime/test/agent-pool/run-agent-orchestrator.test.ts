@@ -2406,7 +2406,7 @@ test("runAgentPrompt recovers a timeout-before-finalization when compaction was 
   }
 });
 
-test("mid-turn tool-result context pressure gets one compaction and ordinary retry after prior protected recovery history", async () => {
+test("durable protected child survives cumulative ~200k tool output with one compaction and one internal ordinary resume", async () => {
   initDatabase();
   const restoreEnv = setEnv({
     PICLAW_TURN_AUTO_RECOVERY_ENABLED: "1",
@@ -2468,7 +2468,7 @@ test("mid-turn tool-result context pressure gets one compaction and ordinary ret
             toolCallId: "tool-large",
             toolName: "read",
             isError: false,
-            result: { content: [{ type: "text", text: "x".repeat(40_000) }] },
+            result: { content: [{ type: "text", text: "x".repeat(201_247) }] },
           });
         }
         return;
@@ -2505,6 +2505,7 @@ test("mid-turn tool-result context pressure gets one compaction and ordinary ret
       timeoutMs: 0,
       skipPrePromptCompaction: true,
       turnId: "turn-current-mid-turn-context-pressure",
+      protectedRecoveryHandoffMode: "durable_continuation" as const,
       onEvent: (event: any) => events.push(event),
     };
     const result = await runWithProtectedRecoveryHandoff(

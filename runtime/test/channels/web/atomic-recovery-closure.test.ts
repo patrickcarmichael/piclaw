@@ -223,7 +223,7 @@ describe("atomic durable restart recovery", () => {
     expect(message.operation_id).toBe(run.operation.operationId);
   });
 
-  for (const boundary of ["artifact", "disposition", "cursor", "release"] satisfies ChatOperationCompletionBoundary[]) {
+  for (const boundary of ["artifact", "successor", "disposition", "frontier", "release"] satisfies ChatOperationCompletionBoundary[]) {
     test(`rolls back recovered artifact and operation completion after the ${boundary} boundary`, () => {
       const chatJid = `web:recover-fault-${boundary}-${crypto.randomUUID()}`;
       const run = createRunningPrompt(chatJid);

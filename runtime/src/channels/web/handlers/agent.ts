@@ -17,6 +17,7 @@ import { parseControlCommand } from "../../../agent-control/index.js";
 import { isSlashCommandInvocation } from "../../../agent-pool/slash-command.js";
 import {
   RECOVERY_CONTINUATION_PROMPT,
+  TOOL_ENABLED_RECOVERY_CONTINUATION_PROMPT,
 } from "../../../agent-pool/context-pressure-retry.js";
 import { resolveProtectedRecoveryPrompt } from "../../../agent-pool/protected-recovery-control-intent.js";
 import { getExtensionKvStore } from "../../../extension-kv-registry.js";
@@ -36,8 +37,10 @@ import {
   getChatCursor,
   getChatOperation,
   getChatOperationDisposition,
+  getProtectedContinuationRootSource,
   getChatPreflight,
   getInflightMessageId,
+  getMessageByRowId,
   getMessageRowIdById,
   getDb,
   rollbackChatRunWithError,
@@ -1530,17 +1533,19 @@ export async function processChat(
     && selection.kind === "message"
     && selection.currentMessage.id !== nextAcceptedMessage.id
     && messagePrecedes(selection.currentMessage, nextAcceptedMessage);
-  const shouldClaimDurableMessage = Boolean(existingOperation)
+  const shouldClaimDurableSource = Boolean(existingOperation)
+    || Boolean(nextAcceptedSource?.sourceKind === "protected_continuation")
     || Boolean(nextAcceptedSource?.sourceKind === "message" && !earlierLegacyMessage);
-  const operationClaim = shouldClaimDurableMessage ? claimNextChatOperation(chatJid) : null;
+  const operationClaim = shouldClaimDurableSource ? claimNextChatOperation(chatJid) : null;
   let durableOperation = operationClaim?.status === "claimed" || operationClaim?.status === "existing"
     ? operationClaim.operation
     : null;
   const durableSource = operationClaim?.status === "claimed" || operationClaim?.status === "existing"
     ? operationClaim.source
     : null;
-  if (durableOperation && durableSource?.sourceKind !== "message") {
-    log.warn("Durable web-message consumer refused a non-message source", {
+  if (durableOperation && durableSource?.sourceKind !== "message"
+    && durableSource?.sourceKind !== "protected_continuation") {
+    log.warn("Durable prompt consumer refused an unsupported source", {
       operation: "process_chat.operation_source_not_supported",
       chatJid,
       sourceKind: durableSource?.sourceKind ?? null,
@@ -1598,12 +1603,55 @@ export async function processChat(
     return;
   }
 
-  const claimedMessage = durableSource ? loadDurableSourceMessage(chatJid, durableSource.sourceId) : null;
+  const protectedContinuationRoot = durableSource?.sourceKind === "protected_continuation"
+    ? getProtectedContinuationRootSource(durableSource)
+    : null;
+  const durableMessageId = durableSource?.sourceKind === "message"
+    ? durableSource.sourceId
+    : protectedContinuationRoot?.frontierMessageId;
+  const claimedMessage = durableMessageId ? loadDurableSourceMessage(chatJid, durableMessageId) : null;
   if (durableOperation && !claimedMessage) {
-    blockChatOperation(chatJid, durableOperationOwner(durableOperation));
-    log.error("Claimed durable source message is missing", {
+    if (durableSource?.sourceKind === "protected_continuation") {
+      const createdAt = new Date().toISOString();
+      const artifactId = createUuid("message");
+      const completed = completeChatOperation(chatJid, {
+        owner: durableOperationOwner(durableOperation),
+        outcome: "failed",
+        cause: "protected_continuation_invalid_lineage",
+        provenance: "web_process_chat_protected_refusal",
+        createdAt,
+        artifact: { message: {
+          id: artifactId,
+          chat_jid: chatJid,
+          sender: "web-agent",
+          sender_name: getIdentityConfig().assistantName,
+          content: "Protected recovery continuation could not be resumed because its source lineage is invalid. Retry the original request manually.",
+          timestamp: createdAt,
+          is_from_me: false,
+          is_bot_message: true,
+          is_terminal_agent_reply: true,
+          content_blocks: [buildTurnOutcomeMarker({
+            kind: "recovery",
+            label: "recovery",
+            title: "Protected continuation refused",
+            detail: "The immutable source lineage is missing or invalid. Retry the original request manually.",
+            severity: "error",
+          })],
+        } },
+      });
+      if (completed.status === "completed" || completed.status === "repeated") {
+        const rowId = getMessageRowIdById(chatJid, artifactId);
+        const interaction = rowId ? getMessageByRowId(chatJid, rowId) : null;
+        if (interaction) channel.broadcastEvent("new_post", interaction);
+        channel.resumeChat(chatJid);
+      }
+    } else {
+      blockChatOperation(chatJid, durableOperationOwner(durableOperation));
+    }
+    log.error("Claimed durable prompt source is missing or invalid", {
       operation: "process_chat.operation_source_missing",
       chatJid,
+      sourceKind: durableSource?.sourceKind ?? null,
       sourceSeq: durableSource?.sourceSeq ?? null,
       sourceId: durableSource?.sourceId ?? null,
     });
@@ -1656,7 +1704,10 @@ export async function processChat(
   }
 
   const channelName = detectChannel(chatJid);
-  const protectedRecoveryPrompt = resolveProtectedRecoveryPrompt(currentMessage);
+  const durableProtectedContinuation = durableSource?.sourceKind === "protected_continuation";
+  const protectedRecoveryPrompt = durableProtectedContinuation
+    ? TOOL_ENABLED_RECOVERY_CONTINUATION_PROMPT
+    : resolveProtectedRecoveryPrompt(currentMessage);
   const promptMessage = protectedRecoveryPrompt
     ? { ...currentMessage, content: protectedRecoveryPrompt }
     : currentMessage;
@@ -1724,6 +1775,7 @@ export async function processChat(
     outcome: ChatOperationOutcome,
     cause: string,
     provenance: string,
+    protectedSuccessorRootSourceSeq?: number,
   ): boolean => {
     if (!durableOperation) return true;
     const message = getDb().prepare("SELECT id FROM messages WHERE chat_jid = ? AND rowid = ?")
@@ -1737,6 +1789,9 @@ export async function processChat(
         provenance,
         createdAt: new Date().toISOString(),
         artifact: { messageId: message.id },
+        ...(protectedSuccessorRootSourceSeq
+          ? { successor: { sourceKind: "protected_continuation" as const, rootSourceSeq: protectedSuccessorRootSourceSeq } }
+          : {}),
       });
       durableOperationCompleted = completed.status === "completed" || completed.status === "repeated";
       if (!durableOperationCompleted) {
@@ -1774,6 +1829,7 @@ export async function processChat(
       outcome?: ChatOperationOutcome;
       cause?: string;
       provenance?: string;
+      protectedSuccessorRootSourceSeq?: number;
     } = {},
   ) => {
     // Capture thinking BEFORE broadcast via onMessageStored callback so a
@@ -1803,6 +1859,7 @@ export async function processChat(
             options.outcome ?? "succeeded",
             options.cause ?? "agent_completed",
             options.provenance ?? "web_process_chat",
+            options.protectedSuccessorRootSourceSeq,
           )
         : undefined,
     });
@@ -2204,7 +2261,10 @@ export async function processChat(
     ...(browserObservability?.clientId ? { clientId: browserObservability.clientId } : {}),
     skipPrePromptCompaction: true,
     scheduleIdleAutoCompaction: true,
-    protectedRecoveryContinuation: Boolean(protectedRecoveryPrompt),
+    protectedRecoveryContinuation: Boolean(protectedRecoveryPrompt) && !durableProtectedContinuation,
+    ...(durableOperation && (durableProtectedContinuation || !protectedRecoveryPrompt)
+      ? { protectedRecoveryHandoffMode: durableProtectedContinuation ? "durable_continuation" as const : "durable_externalize" as const }
+      : {}),
     onEvent: trackedStreamingHandler,
     onTurnDiscard: () => {
       clearCommittedDraft();
@@ -2230,6 +2290,50 @@ export async function processChat(
         });
         return false;
       }
+    },
+    onProtectedRecoveryHandoff: (handoffOutput) => {
+      terminalOutputHandledInPromptLane = true;
+      streamState.lastRecoveryMeta = handoffOutput.recovery || null;
+      clearCommittedDraft();
+      if (!durableOperation || durableProtectedContinuation) return false;
+      try {
+        const marker = buildTurnOutcomeMarker({
+          kind: "recovery",
+          label: "recovery",
+          title: "Recovery continuation scheduled",
+          detail: "The unfinished request will continue in one durable ordinary turn with execution tools restored.",
+          severity: "info",
+          attemptsUsed: handoffOutput.recovery?.attemptsUsed,
+          classifier: handoffOutput.recovery?.lastClassifier ?? null,
+        });
+        terminalOutputPersistedInPromptLane = Boolean(persistTerminalOutcome(
+          "Recovery continuation scheduled.",
+          marker,
+          {
+            outcome: "interrupted",
+            cause: "protected_recovery_continuation_registered",
+            provenance: "web_process_chat_protected_handoff",
+            protectedSuccessorRootSourceSeq: durableOperation.sourceSeq,
+          },
+        ));
+      } catch (error) {
+        terminalOutputPersistedInPromptLane = false;
+        log.error("Protected recovery handoff callback failed while prompt lane was held", {
+          operation: "process_chat.protected_handoff_callback_failed",
+          chatJid,
+          err: error,
+        });
+      }
+      if (!terminalOutputPersistedInPromptLane) {
+        blockFailedRun({
+          prevTs: prevCursor,
+          failedTs: lastMessage.timestamp,
+          messageId: lastMessage.id,
+          threadRootId: resolvedThreadRootId ?? null,
+          createdAt: new Date().toISOString(),
+        });
+      }
+      return terminalOutputPersistedInPromptLane;
     },
     onTurnComplete: (turn: { text: string; attachments: unknown[]; usage?: unknown; followedByToolUse?: boolean }) => {
       const currentOperation = durableOperation ? getChatOperation(chatJid) : null;
@@ -2434,20 +2538,39 @@ export async function processChat(
       }
     };
     if (output.requiresToolEnabledContinuation) {
-      // AgentPool owns protected recovery end-to-end and must consume its one
-      // internal continuation before returning. Never materialize an escaped
-      // handoff flag as a synthetic user or queued-followup message.
+      // A durable child has already spent its external handoff. It may consume
+      // only the one typed post-compaction internal resume owned by AgentPool.
       clearCommittedDraft();
+      const internalResumeExhausted = durableProtectedContinuation
+        && output.protectedRecoveryHandoff?.afterSuccessfulCompaction === true;
       const marker = buildTurnOutcomeMarker({
         kind: "recovery",
         label: "recovery",
-        title: "Internal recovery continuation failed",
-        detail: "The runtime did not complete its internal tool-restored continuation.",
+        title: durableProtectedContinuation
+          ? internalResumeExhausted
+            ? "Post-compaction recovery resume exhausted"
+            : "Protected continuation cannot be handed off again"
+          : "Internal recovery continuation failed",
+        detail: durableProtectedContinuation
+          ? internalResumeExhausted
+            ? "The bounded internal tool-enabled resume did not produce an authoritative terminal result. Retry the request manually."
+            : "The durable continuation already spent its external handoff and no successful compaction authorised an internal resume. Retry the request manually."
+          : "The runtime did not complete its internal tool-restored continuation.",
         severity: "error",
         attemptsUsed: output.recovery?.attemptsUsed,
         classifier: output.recovery?.lastClassifier ?? null,
       });
-      const persisted = persistVisibleFailureOutcome(marker);
+      const persisted = persistVisibleFailureOutcome(marker, undefined, {
+        outcome: "failed",
+        cause: durableProtectedContinuation
+          ? internalResumeExhausted
+            ? "protected_continuation_internal_resume_exhausted"
+            : "protected_continuation_external_handoff_refused"
+          : "protected_recovery_internal_handoff_invariant",
+        provenance: durableProtectedContinuation
+          ? "web_process_chat_protected_refusal"
+          : "web_process_chat_failure",
+      });
       if (persisted) {
         await finalizeSuccessfulRun();
       } else {
