@@ -547,6 +547,46 @@ export function clearChatPreflight(chatJid: string, owner?: Omit<PreflightRun, "
 }
 
 /**
+ * Atomically replace an exactly-owned legacy preflight with a blocked run.
+ * Stale physical callbacks cannot clear or block a replacement owner.
+ */
+export function blockChatPreflightOwned(
+  chatJid: string,
+  owner: Omit<PreflightRun, "chatJid">,
+  failed: FailedRunRecord,
+): boolean {
+  const db = getDb();
+  const result = db.prepare(`
+    UPDATE chat_cursors
+    SET cursor_ts            = ?,
+        preflight_prev_ts    = NULL,
+        preflight_message_id = NULL,
+        preflight_started_at = NULL,
+        failed_prev_ts       = ?,
+        failed_ts            = ?,
+        failed_message_id    = ?,
+        failed_thread_root   = ?,
+        failed_created_at    = ?
+    WHERE chat_jid = ?
+      AND preflight_prev_ts = ?
+      AND preflight_message_id = ?
+      AND preflight_started_at = ?
+  `).run(
+    failed.prevTs,
+    failed.prevTs,
+    failed.failedTs,
+    failed.messageId,
+    failed.threadRootId ?? null,
+    failed.createdAt,
+    chatJid,
+    owner.prevTs,
+    owner.messageId,
+    owner.startedAt,
+  );
+  return result.changes > 0;
+}
+
+/**
  * Promote a chat from preflight into normal inflight run state.
  *
  * The ownership comparison prevents a stale physical processor from consuming

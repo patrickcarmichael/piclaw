@@ -76,7 +76,7 @@ import { createUuid } from "../../../utils/ids.js";
 import { createLogger, debugSuppressedError } from "../../../utils/logger.js";
 import type { AttachmentInfo } from "../../../agent-pool/attachments.js";
 import type { NewMessage } from "../../../types.js";
-import type { AgentFailureCategory } from "../../../agent-pool/contracts.js";
+import type { AgentFailureCategory, AgentOutput } from "../../../agent-pool/contracts.js";
 import { classifyOpaqueAgentFailure } from "../../../agent-pool/automatic-recovery.js";
 import { cancelScheduledIdleAutoCompaction } from "../../../agent-pool/compaction.js";
 import { DEFAULT_BASE_RETRY_MS, getRetryAtIso } from "../../../queue/retry-policy.js";
@@ -1936,6 +1936,264 @@ export async function processChat(
     });
   };
 
+  let terminalOutputHandledInPromptLane = false;
+  let terminalOutputPersistedInPromptLane = false;
+  const persistSuccessfulOutputBeforeMaintenance = (terminalOutput: AgentOutput): boolean => {
+    terminalOutputHandledInPromptLane = true;
+    streamState.lastRecoveryMeta = terminalOutput.recovery || null;
+    shouldRemoveStaleProtectedContinuation = !terminalOutput.requiresToolEnabledContinuation;
+
+    if (durableOperation) {
+      const current = getChatOperation(chatJid);
+      if (!current || current.operationId !== durableOperation.operationId || current.cancellation) return false;
+    }
+
+    if (terminalOutput.status === "tool_complete") {
+      const draft = channel.getBuffer(turnId, "draft");
+      const draftText = typeof draft?.text === "string" ? draft.text.trim() : "";
+      const marker = buildTurnOutcomeMarker({
+        kind: "tool_complete",
+        label: "done",
+        title: "Completed via tools",
+        detail: draftText
+          ? "Turn finished after tool use — showing recovered draft."
+          : "Turn finished after tool use — no closing reply was emitted.",
+        severity: "info",
+        draftRecovered: Boolean(draftText),
+      });
+      const persisted = draftText
+        ? persistTerminalOutcome(draftText, marker, {
+            usage: terminalOutput.usage,
+            outcome: "tool_complete",
+            cause: "provider_tool_complete",
+            provenance: "web_process_chat",
+          })
+        : persistVisibleFailureOutcome(marker, undefined, {
+            outcome: "tool_complete",
+            cause: "provider_tool_complete",
+            provenance: "web_process_chat",
+          });
+      if (!persisted) {
+        blockFailedRun({
+          prevTs: prevCursor,
+          failedTs: lastMessage.timestamp,
+          messageId: lastMessage.id,
+          threadRootId: resolvedThreadRootId ?? null,
+          createdAt: new Date().toISOString(),
+        });
+      }
+      return Boolean(persisted);
+    }
+
+    const finalAttachments = terminalOutput.attachments ?? [];
+    const hasOutput = Boolean(terminalOutput.result || finalAttachments.length > 0);
+    if (hasOutput) {
+      const stored = storeAgentTurn(channel, emitter, {
+        chatJid,
+        text: terminalOutput.result || "",
+        attachments: finalAttachments as AttachmentInfo[],
+        channelName,
+        threadId: resolvedThreadRootId,
+        skipPlaceholder: shouldRemoveStaleProtectedContinuation || turnCount === 0,
+        isTerminalAgentReply: true,
+        removeProtectedContinuationForSourceMessageId: shouldRemoveStaleProtectedContinuation
+          ? String(lastMessage.id || "").trim() || null
+          : null,
+        extraContentBlocks: [
+          streamRuntime.buildAgentTimingBlock(terminalOutput.usage),
+          ...(buildRecoveryMarkerBlocks(terminalOutput.recovery) ?? []),
+          ...streamRuntime.buildThinkingRefBlocks(),
+        ],
+        onMessageStored: streamRuntime.persistThinkingForRow,
+        commitTerminal: durableOperation
+          ? (rowId) => commitDurableTerminal(rowId, "succeeded", "agent_completed", "web_process_chat")
+          : undefined,
+      });
+      if (stored) return true;
+
+      const errorText = "Agent completed but terminal response could not be persisted.";
+      blockFailedRun({
+        prevTs: prevCursor,
+        failedTs: lastMessage.timestamp,
+        messageId: lastMessage.id,
+        threadRootId: resolvedThreadRootId ?? null,
+        createdAt: new Date().toISOString(),
+      });
+      trackedEmitter.status({
+        thread_id: threadId,
+        agent_id: agentId,
+        type: "error",
+        title: errorText,
+        turn_id: turnId,
+      });
+      return false;
+    }
+
+    const finalDraft = channel.getBuffer(turnId, "draft");
+    const hasDraftFallback = typeof finalDraft?.text === "string" && finalDraft.text.trim().length > 0;
+    if (hasDraftFallback && publishDraftFallback("empty-final")) return true;
+
+    if (persistedIntermediateOutput) {
+      if (!durableOperation) return true;
+      if (lastPersistedIntermediateRowId !== null && commitDurableTerminal(
+        lastPersistedIntermediateRowId,
+        "succeeded",
+        "intermediate_output_completed_run",
+        "web_process_chat_intermediate_completion",
+      )) return true;
+      blockFailedRun({
+        prevTs: prevCursor,
+        failedTs: lastMessage.timestamp,
+        messageId: lastMessage.id,
+        threadRootId: resolvedThreadRootId ?? null,
+        createdAt: new Date().toISOString(),
+      });
+      return false;
+    }
+
+    if (hadIntermediateOutput && intermediatePersistFailed) {
+      const errorText = "Agent produced intermediate output but it could not be persisted.";
+      blockFailedRun({
+        prevTs: prevCursor,
+        failedTs: lastMessage.timestamp,
+        messageId: lastMessage.id,
+        threadRootId: resolvedThreadRootId ?? null,
+        createdAt: new Date().toISOString(),
+      });
+      trackedEmitter.status({
+        thread_id: threadId,
+        agent_id: agentId,
+        type: "error",
+        title: errorText,
+        turn_id: turnId,
+      });
+      return false;
+    }
+
+    if (hasDraftFallback) {
+      const errorText = "Agent completed but draft response could not be persisted.";
+      blockFailedRun({
+        prevTs: prevCursor,
+        failedTs: lastMessage.timestamp,
+        messageId: lastMessage.id,
+        threadRootId: resolvedThreadRootId ?? null,
+        createdAt: new Date().toISOString(),
+      });
+      trackedEmitter.status({
+        thread_id: threadId,
+        agent_id: agentId,
+        type: "error",
+        title: errorText,
+        turn_id: turnId,
+      });
+      return false;
+    }
+
+    const originalContent = currentMessage.content || "";
+    const preview = originalContent.length > 120
+      ? originalContent.slice(0, 120) + "…"
+      : originalContent;
+    const recoveryIntent = streamRuntime.getActiveRecoveryIntent();
+    const recoveryLooksStalled = Boolean(streamState.lastRecoveryMeta?.exhausted)
+      || streamState.lastRecoveryOutcome === "exhausted"
+      || streamState.sawCompactionEvent
+      || streamState.sawRecoveryEvent
+      || recoveryIntent !== null
+      || Boolean(streamState.lastCompactionErrorMessage);
+
+    if (recoveryLooksStalled) {
+      const title = streamState.lastRecoveryMeta?.exhausted || streamState.lastRecoveryOutcome === "exhausted"
+        ? "Automatic recovery exhausted"
+        : streamState.lastCompactionErrorMessage
+          ? "Context compaction failed"
+          : recoveryIntent === "compaction"
+            ? "Context compaction did not complete"
+            : "Context recovery did not complete";
+      const detail = streamState.lastCompactionErrorMessage
+        ? streamState.lastCompactionErrorMessage
+        : streamState.lastRecoveryMeta?.lastClassifier
+          ? `Last recovery classifier: ${streamState.lastRecoveryMeta.lastClassifier}.`
+          : "The turn ended without a persisted reply while compaction or automatic recovery was in flight.";
+      log.warn("Agent completed without output after compaction/recovery activity", {
+        operation: "process_chat.no_output_recovery_stalled",
+        chatJid,
+        title,
+        sawCompactionEvent: streamState.sawCompactionEvent,
+        sawRecoveryEvent: streamState.sawRecoveryEvent,
+        recoveryIntent,
+        lastCompactionErrorMessage: streamState.lastCompactionErrorMessage,
+        recovery: streamState.lastRecoveryMeta,
+      });
+      const marker = buildTurnOutcomeMarker({
+        kind: streamState.lastCompactionErrorMessage ? "context" : "recovery",
+        label: streamState.lastCompactionErrorMessage ? "context" : "recovery",
+        title,
+        detail,
+        severity: "warning",
+        attemptsUsed: streamState.lastRecoveryMeta?.attemptsUsed,
+        classifier: streamState.lastRecoveryMeta?.lastClassifier ?? null,
+      });
+      const persisted = persistVisibleFailureOutcome(marker);
+      if (!persisted) {
+        blockFailedRun({
+          prevTs: prevCursor,
+          failedTs: lastMessage.timestamp,
+          messageId: lastMessage.id,
+          threadRootId: resolvedThreadRootId ?? null,
+          createdAt: new Date().toISOString(),
+        });
+      }
+      trackedEmitter.status({
+        thread_id: threadId,
+        agent_id: agentId,
+        type: "error",
+        title,
+        detail,
+        turn_id: turnId,
+      });
+      return Boolean(persisted);
+    }
+
+    const title = "Agent produced no response";
+    const detail = "The model returned an empty reply before finalization.";
+    log.warn("Agent completed without output; marking run as failed", {
+      operation: "process_chat.no_output_blank_failed",
+      chatJid,
+      hadIntermediateOutput,
+      persistedIntermediateOutput,
+      hadDraft: false,
+      recovery: streamState.lastRecoveryMeta,
+    });
+    const marker = buildTurnOutcomeMarker({
+      kind: "blank_final",
+      label: "no reply",
+      title,
+      detail: preview ? `${detail} Prompt: ${preview}` : detail,
+      severity: "warning",
+      attemptsUsed: streamState.lastRecoveryMeta?.attemptsUsed,
+      classifier: streamState.lastRecoveryMeta?.lastClassifier ?? null,
+    });
+    const persisted = persistVisibleFailureOutcome(marker);
+    if (!persisted) {
+      blockFailedRun({
+        prevTs: prevCursor,
+        failedTs: lastMessage.timestamp,
+        messageId: lastMessage.id,
+        threadRootId: resolvedThreadRootId ?? null,
+        createdAt: new Date().toISOString(),
+      });
+    }
+    trackedEmitter.status({
+      thread_id: threadId,
+      agent_id: agentId,
+      type: "error",
+      title,
+      detail,
+      turn_id: turnId,
+    });
+    return Boolean(persisted);
+  };
+
   const output = await channel.agentPool.runAgent(prompt, chatJid, {
     ...(durableOperation ? { operationOwner: durableOperationOwner(durableOperation) } : {}),
     timeoutMs,
@@ -1949,6 +2207,28 @@ export async function processChat(
     onEvent: trackedStreamingHandler,
     onTurnDiscard: () => {
       clearCommittedDraft();
+    },
+    onTerminalOutput: (terminalOutput) => {
+      try {
+        terminalOutputPersistedInPromptLane = persistSuccessfulOutputBeforeMaintenance(terminalOutput);
+        return terminalOutputPersistedInPromptLane;
+      } catch (error) {
+        terminalOutputHandledInPromptLane = true;
+        terminalOutputPersistedInPromptLane = false;
+        log.error("Terminal output callback failed while prompt lane was held", {
+          operation: "process_chat.terminal_output_callback_failed",
+          chatJid,
+          err: error,
+        });
+        blockFailedRun({
+          prevTs: prevCursor,
+          failedTs: lastMessage.timestamp,
+          messageId: lastMessage.id,
+          threadRootId: resolvedThreadRootId ?? null,
+          createdAt: new Date().toISOString(),
+        });
+        return false;
+      }
     },
     onTurnComplete: (turn: { text: string; attachments: unknown[]; usage?: unknown; followedByToolUse?: boolean }) => {
       const currentOperation = durableOperation ? getChatOperation(chatJid) : null;
@@ -2025,45 +2305,13 @@ export async function processChat(
   const removeStaleProtectedContinuation = !output.requiresToolEnabledContinuation;
   shouldRemoveStaleProtectedContinuation = removeStaleProtectedContinuation;
 
-  if (output.status === "tool_complete") {
-    // Provider stopped cleanly after tool use with no closing text reply.
-    // This is not an error — emit a muted "done" pill and finalise normally.
-    // If there is a draft buffer (partial streamed text), surface it so the user
-    // sees the work that was done even though the model didn't emit a final reply.
-    const toolCompleteDraft = channel.getBuffer(turnId, "draft");
-    const toolCompleteDraftText = typeof toolCompleteDraft?.text === "string" ? toolCompleteDraft.text.trim() : "";
-    const marker = buildTurnOutcomeMarker({
-      kind: "tool_complete",
-      label: "done",
-      title: "Completed via tools",
-      detail: toolCompleteDraftText
-        ? "Turn finished after tool use — showing recovered draft."
-        : "Turn finished after tool use — no closing reply was emitted.",
-      severity: "info",
-      draftRecovered: Boolean(toolCompleteDraftText),
-    });
-    const persisted = toolCompleteDraftText
-      ? persistTerminalOutcome(toolCompleteDraftText, marker, {
-          usage: output.usage,
-          outcome: "tool_complete",
-          cause: "provider_tool_complete",
-          provenance: "web_process_chat",
-        })
-      : persistVisibleFailureOutcome(marker, undefined, {
-          outcome: "tool_complete",
-          cause: "provider_tool_complete",
-          provenance: "web_process_chat",
-        });
-    if (persisted) {
+  if (terminalOutputHandledInPromptLane || output.status !== "error") {
+    if (!terminalOutputHandledInPromptLane) {
+      terminalOutputPersistedInPromptLane = persistSuccessfulOutputBeforeMaintenance(output);
+    }
+    if (terminalOutputPersistedInPromptLane) {
       await finalizeSuccessfulRun();
-    } else {
-      blockFailedRun({
-        prevTs: prevCursor,
-        failedTs: lastMessage.timestamp,
-        messageId: lastMessage.id,
-        threadRootId: resolvedThreadRootId ?? null,
-        createdAt: new Date().toISOString(),
-      });
+      if (output.status === "success") endTrackedPhase(chatJid);
     }
     return;
   }
@@ -2255,244 +2503,4 @@ export async function processChat(
     });
     return;
   }
-
-  // Store the final turn's output. The same first-turn placeholder rule used
-  // during onTurnComplete() also applies here: the original response must not
-  // consume a queued follow-up placeholder, but later turns are allowed to.
-  //
-  // Exactly-once rule: never clear inflight state unless a terminal reply was
-  // actually persisted (either the final output itself or a draft fallback).
-  const finalAttachments = output.attachments ?? [];
-  const hasOutput = !!(output.result || finalAttachments.length > 0);
-  const finalDraft = channel.getBuffer(turnId, "draft");
-  const hasDraftFallback = typeof finalDraft?.text === "string" && finalDraft.text.trim().length > 0;
-  const finalized = hasOutput
-    ? storeAgentTurn(channel, emitter, {
-        chatJid,
-        text: output.result || "",
-        attachments: finalAttachments as AttachmentInfo[],
-        channelName,
-        threadId: resolvedThreadRootId,
-        skipPlaceholder: shouldRemoveStaleProtectedContinuation || turnCount === 0,
-        isTerminalAgentReply: true,
-        removeProtectedContinuationForSourceMessageId: shouldRemoveStaleProtectedContinuation
-          ? String(lastMessage.id || "").trim() || null
-          : null,
-        extraContentBlocks: [
-          streamRuntime.buildAgentTimingBlock(output.usage),
-          ...(buildRecoveryMarkerBlocks(output.recovery) ?? []),
-          ...streamRuntime.buildThinkingRefBlocks(),
-        ],
-        onMessageStored: streamRuntime.persistThinkingForRow,
-        commitTerminal: durableOperation
-          ? (rowId) => commitDurableTerminal(rowId, "succeeded", "agent_completed", "web_process_chat")
-          : undefined,
-      })
-    : hasDraftFallback
-      ? publishDraftFallback("empty-final")
-      : persistedIntermediateOutput
-        ? !durableOperation
-        : publishDraftFallback("empty-final");
-
-  if (!finalized && hasOutput) {
-    // The agent produced output but terminal persistence failed.
-    // Hold the user turn for an explicit retry/skip decision.
-    const errorText = "Agent completed but terminal response could not be persisted.";
-    blockFailedRun({
-      prevTs: prevCursor,
-      failedTs: lastMessage.timestamp,
-      messageId: lastMessage.id,
-      threadRootId: resolvedThreadRootId ?? null,
-      createdAt: new Date().toISOString(),
-    });
-    trackedEmitter.status({
-      thread_id: threadId,
-      agent_id: agentId,
-      type: "error",
-      title: errorText,
-      turn_id: turnId,
-    });
-    return;
-  }
-
-  if (!finalized && !hasOutput) {
-    if (persistedIntermediateOutput) {
-      // A prior turn in the same run was already persisted (e.g. auto-
-      // compaction produced a trailing empty turn). For durable ownership,
-      // promote that exact message to the terminal artifact in the same
-      // completion transaction instead of publishing a second synthetic row.
-      if (durableOperation && lastPersistedIntermediateRowId !== null) {
-        commitDurableTerminal(
-          lastPersistedIntermediateRowId,
-          "succeeded",
-          "intermediate_output_completed_run",
-          "web_process_chat_intermediate_completion",
-        );
-      }
-      await finalizeSuccessfulRun();
-      return;
-    }
-
-    if (hadIntermediateOutput && intermediatePersistFailed) {
-      const errorText = "Agent produced intermediate output but it could not be persisted.";
-      blockFailedRun({
-        prevTs: prevCursor,
-        failedTs: lastMessage.timestamp,
-        messageId: lastMessage.id,
-        threadRootId: resolvedThreadRootId ?? null,
-        createdAt: new Date().toISOString(),
-      });
-      trackedEmitter.status({
-        thread_id: threadId,
-        agent_id: agentId,
-        type: "error",
-        title: errorText,
-        turn_id: turnId,
-      });
-      return;
-    }
-
-    // Check if a draft buffer existed — if so, the agent DID produce content
-    // but persistence failed, which is a real error worth recording.
-    const draft = channel.getBuffer(turnId, "draft");
-    const hadDraft = !!(typeof draft?.text === "string" && draft.text.trim());
-    if (hadDraft) {
-      const errorText = "Agent completed but draft response could not be persisted.";
-      blockFailedRun({
-        prevTs: prevCursor,
-        failedTs: lastMessage.timestamp,
-        messageId: lastMessage.id,
-        threadRootId: resolvedThreadRootId ?? null,
-        createdAt: new Date().toISOString(),
-      });
-      trackedEmitter.status({
-        thread_id: threadId,
-        agent_id: agentId,
-        type: "error",
-        title: errorText,
-        turn_id: turnId,
-      });
-      return;
-    }
-
-    const originalContent = currentMessage.content || "";
-    const preview = originalContent.length > 120
-      ? originalContent.slice(0, 120) + "…"
-      : originalContent;
-    const recoveryIntent = streamRuntime.getActiveRecoveryIntent();
-    const recoveryLooksStalled = Boolean(streamState.lastRecoveryMeta?.exhausted)
-      || streamState.lastRecoveryOutcome === "exhausted"
-      || streamState.sawCompactionEvent
-      || streamState.sawRecoveryEvent
-      || recoveryIntent !== null
-      || !!streamState.lastCompactionErrorMessage;
-
-    if (recoveryLooksStalled) {
-      const title = streamState.lastRecoveryMeta?.exhausted || streamState.lastRecoveryOutcome === "exhausted"
-        ? "Automatic recovery exhausted"
-        : streamState.lastCompactionErrorMessage
-          ? "Context compaction failed"
-          : recoveryIntent === "compaction"
-            ? "Context compaction did not complete"
-            : "Context recovery did not complete";
-      const detail = streamState.lastCompactionErrorMessage
-        ? streamState.lastCompactionErrorMessage
-        : streamState.lastRecoveryMeta?.lastClassifier
-          ? `Last recovery classifier: ${streamState.lastRecoveryMeta.lastClassifier}.`
-          : "The turn ended without a persisted reply while compaction or automatic recovery was in flight.";
-
-      log.warn("Agent completed without output after compaction/recovery activity", {
-        operation: "process_chat.no_output_recovery_stalled",
-        chatJid,
-        title,
-        sawCompactionEvent: streamState.sawCompactionEvent,
-        sawRecoveryEvent: streamState.sawRecoveryEvent,
-        recoveryIntent,
-        lastCompactionErrorMessage: streamState.lastCompactionErrorMessage,
-        recovery: streamState.lastRecoveryMeta,
-      });
-
-      const marker = buildTurnOutcomeMarker({
-        kind: streamState.lastCompactionErrorMessage ? "context" : "recovery",
-        label: streamState.lastCompactionErrorMessage ? "context" : "recovery",
-        title,
-        detail,
-        severity: "warning",
-        attemptsUsed: streamState.lastRecoveryMeta?.attemptsUsed,
-        classifier: streamState.lastRecoveryMeta?.lastClassifier ?? null,
-      });
-      const persisted = persistVisibleFailureOutcome(marker);
-      if (persisted) {
-        await finalizeSuccessfulRun();
-      } else {
-        blockFailedRun({
-          prevTs: prevCursor,
-          failedTs: lastMessage.timestamp,
-          messageId: lastMessage.id,
-          threadRootId: resolvedThreadRootId ?? null,
-          createdAt: new Date().toISOString(),
-        });
-      }
-
-      trackedEmitter.status({
-        thread_id: threadId,
-        agent_id: agentId,
-        type: "error",
-        title,
-        detail,
-        turn_id: turnId,
-      });
-      return;
-    }
-
-    // Missing terminal output is a real failure. Consume the user turn with a
-    // compact bubble instead of replaying it through hidden failed-run state.
-    const title = "Agent produced no response";
-    const detail =
-      "The model returned an empty reply before finalization.";
-
-    log.warn("Agent completed without output; marking run as failed", {
-      operation: "process_chat.no_output_blank_failed",
-      chatJid,
-      hadIntermediateOutput,
-      persistedIntermediateOutput,
-      hadDraft,
-      recovery: streamState.lastRecoveryMeta,
-    });
-
-    const marker = buildTurnOutcomeMarker({
-      kind: "blank_final",
-      label: "no reply",
-      title,
-      detail: preview ? `${detail} Prompt: ${preview}` : detail,
-      severity: "warning",
-      attemptsUsed: streamState.lastRecoveryMeta?.attemptsUsed,
-      classifier: streamState.lastRecoveryMeta?.lastClassifier ?? null,
-    });
-    const persisted = persistVisibleFailureOutcome(marker);
-    if (persisted) {
-      await finalizeSuccessfulRun();
-    } else {
-      blockFailedRun({
-        prevTs: prevCursor,
-        failedTs: lastMessage.timestamp,
-        messageId: lastMessage.id,
-        threadRootId: resolvedThreadRootId ?? null,
-        createdAt: new Date().toISOString(),
-      });
-    }
-
-    trackedEmitter.status({
-      thread_id: threadId,
-      agent_id: agentId,
-      type: "error",
-      title,
-      detail,
-      turn_id: turnId,
-    });
-    return;
-  }
-
-  await finalizeSuccessfulRun();
-  endTrackedPhase(chatJid);
 }

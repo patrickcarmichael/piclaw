@@ -1,12 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import { runDurableOperationPreflight, runProcessChatPreflight } from "../../../../src/channels/web/runtime/process-chat-preflight-runtime.js";
 import {
+  beginChatPreflight,
   cancelChatOperation,
   claimNextChatOperation,
+  clearChatPreflight,
+  completeChatOperation,
   getChatCursor,
   getChatOperation,
   getChatPreflight,
+  getFailedRun,
   initDatabase,
+  promoteChatOperation,
   storeAcceptedChatMessageSource,
   storeChatMetadata,
 } from "../../../../src/db.js";
@@ -62,6 +67,47 @@ describe("process chat preflight runtime", () => {
       expect(rotations).toBe(1);
       expect(resumes).toBe(1);
       expect(getChatPreflight(chatJid)).toBeNull();
+    });
+  });
+
+  test("failed foreground emergency rotation blocks legacy preflight and emits one generic wake", async () => {
+    await withTempWorkspaceEnv("preflight-runtime-rotation-failed-", {}, async () => {
+      initDatabase();
+      const chatJid = "web:rotation-failed";
+      const prevCursor = "2026-01-01T00:00:00.000Z";
+      storeChatMetadata(chatJid, prevCursor, "Web");
+      let resumes = 0;
+
+      const result = await runProcessChatPreflight({
+        channel: {
+          agentPool: {
+            runSessionMutation: async (_chatJid: string, _mutation: string, _request: unknown, action: (session: object) => unknown) => action({}),
+            emergencyRotateSession: async () => ({ status: "error", message: "rotation failed" }),
+          },
+        } as any,
+        chatJid,
+        agentId: "default",
+        message: { id: "m-rotation-failed", timestamp: "2026-01-01T00:00:01.000Z" },
+        prevCursor,
+        effectiveThreadRootId: 42,
+        turnId: "turn-rotation-failed",
+        runStartedAt: "2026-01-01T00:00:02.000Z",
+        streamingHandler() {},
+        compactionState: { lastCompactionErrorMessage: "summary invalid", lastCompactionSuppressed: false },
+        enqueueResume(root) {
+          expect(root).toBeUndefined();
+          resumes += 1;
+        },
+        deps: {
+          getForegroundMs: () => 100,
+          maybeAutoCompactSessionBeforePrompt: async () => {},
+        } as any,
+      });
+
+      expect(result).toBe("deferred");
+      expect(resumes).toBe(1);
+      expect(getChatPreflight(chatJid)).toBeNull();
+      expect(getFailedRun(chatJid)).toMatchObject({ messageId: "m-rotation-failed", prevTs: prevCursor });
     });
   });
 
@@ -123,6 +169,61 @@ describe("process chat preflight runtime", () => {
     });
   });
 
+  test("legacy stale compare-clear preserves replacement owner and emits one generic wake", async () => {
+    await withTempWorkspaceEnv("preflight-runtime-replaced-", {}, async () => {
+      initDatabase();
+      const chatJid = "web:legacy-replaced";
+      const prevCursor = "2026-01-01T00:00:00.000Z";
+      const owner = {
+        prevTs: prevCursor,
+        messageId: "m-original",
+        startedAt: "2026-01-01T00:00:02.000Z",
+      };
+      const replacement = {
+        prevTs: prevCursor,
+        messageId: "m-replacement",
+        startedAt: "2026-01-01T00:00:03.000Z",
+      };
+      storeChatMetadata(chatJid, prevCursor, "Web");
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      let resumes = 0;
+
+      const result = await runProcessChatPreflight({
+        channel: {
+          agentPool: {
+            runSessionMutation: async (_chatJid: string, _mutation: string, _request: unknown, action: (session: object) => unknown) => action({}),
+            emergencyRotateSession: async () => ({ status: "error", message: "replacement must survive" }),
+          },
+        } as any,
+        chatJid,
+        agentId: "default",
+        message: { id: owner.messageId, timestamp: "2026-01-01T00:00:01.000Z" },
+        prevCursor,
+        effectiveThreadRootId: 42,
+        turnId: "turn-original",
+        runStartedAt: owner.startedAt,
+        streamingHandler() {},
+        compactionState: { lastCompactionErrorMessage: "summary invalid", lastCompactionSuppressed: false },
+        enqueueResume(root) {
+          expect(root).toBeUndefined();
+          resumes += 1;
+        },
+        deps: {
+          getForegroundMs: () => 0,
+          maybeAutoCompactSessionBeforePrompt: async () => { await gate; },
+        } as any,
+      });
+      expect(result).toBe("deferred");
+      expect(clearChatPreflight(chatJid, owner)).toBe(true);
+      expect(beginChatPreflight(chatJid, replacement)).toBe(true);
+
+      release();
+      await waitFor(() => resumes === 1, 250, 1);
+      expect(getChatPreflight(chatJid)).toEqual({ chatJid, ...replacement });
+    });
+  });
+
   test("promotes a durable accepted message from pending through preflight to running", async () => {
     await withTempWorkspaceEnv("durable-preflight-runtime-", {}, async () => {
       initDatabase();
@@ -164,7 +265,93 @@ describe("process chat preflight runtime", () => {
     });
   });
 
-  test("cancellation during deferred durable compaction prevents rotation, promotion, and resume", async () => {
+  test("lost foreground durable promotion emits one generic wake without changing ownership", async () => {
+    await withTempWorkspaceEnv("durable-preflight-lost-promotion-", {}, async () => {
+      initDatabase();
+      const chatJid = "web:durable-lost-promotion";
+      storeChatMetadata(chatJid, "", "Web");
+      storeAcceptedChatMessageSource({
+        chat_jid: chatJid,
+        id: "m-lost-promotion",
+        sender: "user",
+        sender_name: "User",
+        content: "lost promotion",
+        timestamp: "2026-01-01T00:00:01.000Z",
+      });
+      const claim = claimNextChatOperation(chatJid);
+      if (claim.status !== "claimed") throw new Error("expected durable claim");
+      let promotions = 0;
+      let resumes = 0;
+      let successor: ReturnType<typeof getChatOperation> = null;
+
+      const result = await runDurableOperationPreflight({
+        channel: {
+          agentPool: {
+            runSessionMutation: async (_chatJid: string, _mutation: string, _request: unknown, action: (session: object) => unknown) => action({}),
+            emergencyRotateSession: async () => ({ status: "success", message: "unused" }),
+          },
+        } as any,
+        chatJid,
+        agentId: "default",
+        message: { id: "m-lost-promotion", timestamp: "2026-01-01T00:00:01.000Z" },
+        operation: claim.operation,
+        effectiveThreadRootId: 42,
+        turnId: "turn-lost-promotion",
+        streamingHandler() {},
+        compactionState: { lastCompactionErrorMessage: null, lastCompactionSuppressed: false },
+        enqueueResume(root) {
+          expect(root).toBeUndefined();
+          resumes += 1;
+        },
+        deps: {
+          getForegroundMs: () => 100,
+          maybeAutoCompactSessionBeforePrompt: async () => {},
+          promoteChatOperation: (jid, owner, phase) => {
+            promotions += 1;
+            if (promotions === 1) return promoteChatOperation(jid, owner, phase);
+            const cancelled = cancelChatOperation(jid, owner, {
+              cause: "test_replace",
+              requestedAt: "2026-08-08T09:10:00.000Z",
+            });
+            if (cancelled.status !== "applied") throw new Error("expected cancellation");
+            const completed = completeChatOperation(jid, {
+              owner: {
+                operationId: cancelled.operation.operationId,
+                sourceSeq: cancelled.operation.sourceSeq,
+                phase: cancelled.operation.phase,
+                generation: cancelled.operation.generation,
+              },
+              outcome: "cancelled",
+              cause: "test_replace",
+              provenance: "preflight_test",
+              createdAt: "2026-08-08T09:10:01.000Z",
+            });
+            if (completed.status !== "completed") throw new Error("expected completion");
+            storeAcceptedChatMessageSource({
+              chat_jid: jid,
+              id: "m-lost-promotion-successor",
+              sender: "user",
+              sender_name: "User",
+              content: "successor",
+              timestamp: "2026-01-01T00:00:02.000Z",
+            });
+            const claimed = claimNextChatOperation(jid);
+            if (claimed.status !== "claimed") throw new Error("expected successor claim");
+            successor = claimed.operation;
+            return promoteChatOperation(jid, owner, phase);
+          },
+        },
+      });
+
+      expect(result.status).toBe("deferred");
+      expect(promotions).toBe(2);
+      expect(resumes).toBe(1);
+      expect(successor).not.toBeNull();
+      expect(getChatOperation(chatJid)).toEqual(successor);
+    });
+  });
+
+  test("cancellation during deferred durable compaction prevents mutation and emits one ownership-neutral wake", async () => {
     await withTempWorkspaceEnv("durable-preflight-cancelled-", {}, async () => {
       initDatabase();
       const chatJid = "web:durable-cancelled";
@@ -221,11 +408,146 @@ describe("process chat preflight runtime", () => {
       release();
       await Bun.sleep(20);
       expect(rotations).toBe(0);
-      expect(resumes).toBe(0);
+      expect(resumes).toBe(1);
       expect(getChatOperation(chatJid)).toMatchObject({
         operationId: claim.operation.operationId,
         phase: "preflight",
         cancellation: { cause: "remote_abort" },
+      });
+    });
+  });
+
+  test("replaced durable ownership during deferred work remains untouched and emits one generic wake", async () => {
+    await withTempWorkspaceEnv("durable-preflight-replaced-", {}, async () => {
+      initDatabase();
+      const chatJid = "web:durable-replaced";
+      storeChatMetadata(chatJid, "", "Web");
+      storeAcceptedChatMessageSource({
+        chat_jid: chatJid,
+        id: "m-replaced-first",
+        sender: "user",
+        sender_name: "User",
+        content: "first",
+        timestamp: "2026-01-01T00:00:01.000Z",
+      });
+      const claim = claimNextChatOperation(chatJid);
+      if (claim.status !== "claimed") throw new Error("expected durable claim");
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      let resumes = 0;
+
+      const result = await runDurableOperationPreflight({
+        channel: {
+          agentPool: {
+            runSessionMutation: async (_chatJid: string, _mutation: string, _request: unknown, action: (session: object) => unknown) => action({}),
+            emergencyRotateSession: async () => ({ status: "success", message: "unused" }),
+          },
+        } as any,
+        chatJid,
+        agentId: "default",
+        message: { id: "m-replaced-first", timestamp: "2026-01-01T00:00:01.000Z" },
+        operation: claim.operation,
+        effectiveThreadRootId: null,
+        turnId: "turn-replaced",
+        streamingHandler() {},
+        compactionState: { lastCompactionErrorMessage: null, lastCompactionSuppressed: false },
+        enqueueResume(root) {
+          expect(root).toBeUndefined();
+          resumes += 1;
+        },
+        deps: {
+          getForegroundMs: () => 0,
+          maybeAutoCompactSessionBeforePrompt: async () => { await gate; },
+        },
+      });
+      expect(result.status).toBe("deferred");
+      const preflight = getChatOperation(chatJid)!;
+      const cancelled = cancelChatOperation(chatJid, {
+        operationId: preflight.operationId,
+        sourceSeq: preflight.sourceSeq,
+        phase: preflight.phase,
+        generation: preflight.generation,
+      }, { cause: "test_replace", requestedAt: "2026-08-08T09:00:00.000Z" });
+      if (cancelled.status !== "applied") throw new Error("expected cancellation");
+      expect(completeChatOperation(chatJid, {
+        owner: {
+          operationId: cancelled.operation.operationId,
+          sourceSeq: cancelled.operation.sourceSeq,
+          phase: cancelled.operation.phase,
+          generation: cancelled.operation.generation,
+        },
+        outcome: "cancelled",
+        cause: "test_replace",
+        provenance: "preflight_test",
+        createdAt: "2026-08-08T09:00:01.000Z",
+      }).status).toBe("completed");
+      storeAcceptedChatMessageSource({
+        chat_jid: chatJid,
+        id: "m-replaced-second",
+        sender: "user",
+        sender_name: "User",
+        content: "second",
+        timestamp: "2026-01-01T00:00:02.000Z",
+      });
+      const successor = claimNextChatOperation(chatJid);
+      if (successor.status !== "claimed") throw new Error("expected successor claim");
+
+      release();
+      await waitFor(() => resumes === 1, 250, 1);
+      expect(getChatOperation(chatJid)).toEqual(successor.operation);
+    });
+  });
+
+  test("failed background durable rotation exact-owner blocks and emits one generic wake", async () => {
+    await withTempWorkspaceEnv("durable-preflight-rotation-failed-", {}, async () => {
+      initDatabase();
+      const chatJid = "web:durable-rotation-failed";
+      storeChatMetadata(chatJid, "", "Web");
+      storeAcceptedChatMessageSource({
+        chat_jid: chatJid,
+        id: "m-durable-rotation-failed",
+        sender: "user",
+        sender_name: "User",
+        content: "rotate",
+        timestamp: "2026-01-01T00:00:01.000Z",
+      });
+      const claim = claimNextChatOperation(chatJid);
+      if (claim.status !== "claimed") throw new Error("expected durable claim");
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      let resumes = 0;
+
+      const result = await runDurableOperationPreflight({
+        channel: {
+          agentPool: {
+            runSessionMutation: async (_chatJid: string, _mutation: string, _request: unknown, action: (session: object) => unknown) => action({}),
+            emergencyRotateSession: async () => ({ status: "error", message: "rotation failed" }),
+          },
+        } as any,
+        chatJid,
+        agentId: "default",
+        message: { id: "m-durable-rotation-failed", timestamp: "2026-01-01T00:00:01.000Z" },
+        operation: claim.operation,
+        effectiveThreadRootId: null,
+        turnId: "turn-durable-rotation-failed",
+        streamingHandler() {},
+        compactionState: { lastCompactionErrorMessage: "summary invalid", lastCompactionSuppressed: false },
+        enqueueResume(root) {
+          expect(root).toBeUndefined();
+          resumes += 1;
+        },
+        deps: {
+          getForegroundMs: () => 0,
+          maybeAutoCompactSessionBeforePrompt: async () => { await gate; },
+        },
+      });
+      expect(result.status).toBe("deferred");
+      release();
+      await waitFor(() => resumes === 1, 250, 1);
+      expect(getChatOperation(chatJid)).toMatchObject({
+        operationId: claim.operation.operationId,
+        phase: "blocked",
+        generation: 2,
       });
     });
   });
@@ -263,7 +585,7 @@ describe("process chat preflight runtime", () => {
         streamingHandler() {},
         compactionState: { lastCompactionErrorMessage: null, lastCompactionSuppressed: false },
         enqueueResume(root: number | undefined) {
-          expect(root).toBe(42);
+          expect(root).toBeUndefined();
           resumes += 1;
         },
         deps: {

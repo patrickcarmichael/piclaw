@@ -9,7 +9,7 @@ import { expect, test, afterEach } from "bun:test";
 import { readdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import type { AgentSessionRuntime } from "@earendil-works/pi-coding-agent";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_COMPACTION_SETTINGS, SessionManager } from "@earendil-works/pi-coding-agent";
 import { getAttachmentRegistry } from "../../src/agent-pool/attachments.js";
 import { createTempWorkspace, getTestWorkspace, importFresh, setEnv } from "../helpers.js";
 import { createAgentPoolModelOptions } from "../model-services-fixture.js";
@@ -49,6 +49,51 @@ function createRuntime(session: any, overrides: Partial<AgentSessionRuntime> = {
     },
     ...overrides,
   } as any;
+}
+
+function cleanupOperationTestChat(db: typeof import("../../src/db.js"), chatJid: string): void {
+  db.deleteChatOperationLifecycleState(chatJid);
+  db.getDb().prepare(`DELETE FROM message_media WHERE message_rowid IN
+    (SELECT rowid FROM messages WHERE chat_jid = ?)` ).run(chatJid);
+  db.getDb().prepare("DELETE FROM messages WHERE chat_jid = ?").run(chatJid);
+  db.getDb().prepare("DELETE FROM chat_cursors WHERE chat_jid = ?").run(chatJid);
+  db.getDb().prepare("DELETE FROM chats WHERE jid = ?").run(chatJid);
+}
+
+class PostTurnMaintenanceSession {
+  private listeners: Array<(event: any) => void> = [];
+  readonly calls: string[] = [];
+  compactImpl: (() => Promise<void>) | null = null;
+  sessionManager = {
+    getLeafId: () => "post-turn-leaf",
+    getEntries: () => [{ type: "message", message: { role: "user" } }],
+    buildSessionContext: () => ({ messages: [{ role: "user", content: "x".repeat(200) }] }),
+  };
+  settingsManager = {
+    getCompactionSettings: () => ({ ...DEFAULT_COMPACTION_SETTINGS, enabled: true, reserveTokens: 10 }),
+  };
+  model = { contextWindow: 20, provider: "test", id: "model" };
+  isStreaming = false;
+  isCompacting = false;
+  isRetrying = false;
+  subscribe(listener: (event: any) => void) {
+    this.listeners.push(listener);
+    return () => {
+      this.listeners = this.listeners.filter((entry) => entry !== listener);
+    };
+  }
+  async prompt() {
+    this.calls.push("prompt");
+    for (const listener of this.listeners) {
+      listener({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "done" } });
+    }
+  }
+  async compact() {
+    this.calls.push("compact");
+    await this.compactImpl?.();
+  }
+  async abort() {}
+  dispose() {}
 }
 
 afterEach(async () => {
@@ -111,6 +156,321 @@ test("agent pool aggregates streamed text and writes logs", async () => {
     .map((path) => readFileSync(path, "utf8"))
     .find((content) => content.includes("Hello world"));
   expect(matchingContent).toBeDefined();
+});
+
+test("real AgentPool awaits terminal output inside the prompt lane before ownerless maintenance", async () => {
+  const ws = getTestWorkspace();
+  restoreEnv = setEnv({
+    PICLAW_WORKSPACE: ws.workspace,
+    PICLAW_STORE: ws.store,
+    PICLAW_DATA: ws.data,
+    PICLAW_AUTO_COMPACTION_ENABLED: "1",
+  });
+  const db = await importFresh<typeof import("../src/db.js")>("../src/db.js");
+  db.initDatabase();
+  const { AgentPool } = await importFresh<typeof import("../src/agent-pool.js")>("../src/agent-pool.js");
+  const session = new PostTurnMaintenanceSession();
+  const pool = new AgentPool({
+    ...createAgentPoolModelOptions(),
+    createSession: async () => createRuntime(session) as any,
+  });
+  let releaseTerminalOutput!: () => void;
+  const terminalOutputGate = new Promise<void>((resolve) => { releaseTerminalOutput = resolve; });
+  let callbackStarted!: () => void;
+  const callbackStart = new Promise<void>((resolve) => { callbackStarted = resolve; });
+
+  const run = pool.runAgent("test", "web:terminal-order", {
+    timeoutMs: 0,
+    skipPrePromptCompaction: true,
+    scheduleIdleAutoCompaction: true,
+    onTerminalOutput: async () => {
+      expect((pool as any).mutationGateway.currentAccess("web:terminal-order")).toEqual({ scope: "legacy" });
+      session.calls.push("terminal-output-start");
+      callbackStarted();
+      await terminalOutputGate;
+      session.calls.push("terminal-output-end");
+      return true;
+    },
+  });
+
+  await callbackStart;
+  expect(session.calls).toEqual(["prompt", "terminal-output-start"]);
+  let competingMutationRan = false;
+  const competingMutation = pool.runSessionMutation("web:terminal-order", "queue", {}, async () => {
+    competingMutationRan = true;
+  });
+  await Bun.sleep(10);
+  expect(competingMutationRan).toBe(false);
+  releaseTerminalOutput();
+
+  expect((await run).status).toBe("success");
+  await competingMutation;
+  expect(competingMutationRan).toBe(true);
+  expect(session.calls).toEqual(["prompt", "terminal-output-start", "terminal-output-end", "compact"]);
+  expect((pool as any).mutationGateway.currentAccess("web:terminal-order")).toBeNull();
+  await pool.shutdown();
+  cleanupOperationTestChat(db, "web:terminal-order");
+});
+
+test("real AgentPool preserves callback-free fallback without accidental maintenance", async () => {
+  const ws = getTestWorkspace();
+  restoreEnv = setEnv({
+    PICLAW_WORKSPACE: ws.workspace,
+    PICLAW_STORE: ws.store,
+    PICLAW_DATA: ws.data,
+    PICLAW_AUTO_COMPACTION_ENABLED: "1",
+  });
+  const db = await importFresh<typeof import("../src/db.js")>("../src/db.js");
+  db.initDatabase();
+  const { AgentPool } = await importFresh<typeof import("../src/agent-pool.js")>("../src/agent-pool.js");
+  const session = new PostTurnMaintenanceSession();
+  const pool = new AgentPool({
+    ...createAgentPoolModelOptions(),
+    createSession: async () => createRuntime(session) as any,
+  });
+
+  const result = await pool.runAgent("test", "web:no-terminal-callback", {
+    timeoutMs: 0,
+    skipPrePromptCompaction: true,
+    scheduleIdleAutoCompaction: true,
+  });
+
+  expect(result.status).toBe("success");
+  expect(session.calls).toEqual(["prompt"]);
+  await pool.shutdown();
+  cleanupOperationTestChat(db, "web:no-terminal-callback");
+});
+
+test("real AgentPool suppresses maintenance when terminal output returns false or throws", async () => {
+  const ws = getTestWorkspace();
+  restoreEnv = setEnv({
+    PICLAW_WORKSPACE: ws.workspace,
+    PICLAW_STORE: ws.store,
+    PICLAW_DATA: ws.data,
+    PICLAW_AUTO_COMPACTION_ENABLED: "1",
+  });
+  const db = await importFresh<typeof import("../src/db.js")>("../src/db.js");
+  db.initDatabase();
+  const { AgentPool } = await importFresh<typeof import("../src/agent-pool.js")>("../src/agent-pool.js");
+  const falseSession = new PostTurnMaintenanceSession();
+  const falsePool = new AgentPool({
+    ...createAgentPoolModelOptions(),
+    createSession: async () => createRuntime(falseSession) as any,
+  });
+  const falseResult = await falsePool.runAgent("test", "web:false-terminal-callback", {
+    timeoutMs: 0,
+    skipPrePromptCompaction: true,
+    scheduleIdleAutoCompaction: true,
+    onTerminalOutput: () => false,
+  });
+  expect(falseResult.status).toBe("success");
+  expect(falseSession.calls).toEqual(["prompt"]);
+  await falsePool.shutdown();
+
+  const throwSession = new PostTurnMaintenanceSession();
+  const throwPool = new AgentPool({
+    ...createAgentPoolModelOptions(),
+    createSession: async () => createRuntime(throwSession) as any,
+  });
+  const failedRun = throwPool.runAgent("test", "web:throw-terminal-callback", {
+    timeoutMs: 0,
+    skipPrePromptCompaction: true,
+    scheduleIdleAutoCompaction: true,
+    onTerminalOutput: () => { throw new Error("terminal commit failed"); },
+  });
+  await expect(failedRun).rejects.toThrow("terminal commit failed");
+  expect(throwSession.calls).toEqual(["prompt"]);
+  await throwPool.shutdown();
+  cleanupOperationTestChat(db, "web:false-terminal-callback");
+  cleanupOperationTestChat(db, "web:throw-terminal-callback");
+});
+
+test("real AgentPool swallows successor legacy conflict only for post-turn maintenance", async () => {
+  const ws = getTestWorkspace();
+  restoreEnv = setEnv({
+    PICLAW_WORKSPACE: ws.workspace,
+    PICLAW_STORE: ws.store,
+    PICLAW_DATA: ws.data,
+    PICLAW_AUTO_COMPACTION_ENABLED: "1",
+  });
+  const db = await importFresh<typeof import("../src/db.js")>("../src/db.js");
+  db.initDatabase();
+  const { AgentPool } = await importFresh<typeof import("../src/agent-pool.js")>("../src/agent-pool.js");
+  const session = new PostTurnMaintenanceSession();
+  const pool = new AgentPool({
+    ...createAgentPoolModelOptions(),
+    createSession: async () => createRuntime(session) as any,
+  });
+  const chatJid = "web:maintenance-successor";
+
+  const result = await pool.runAgent("test", chatJid, {
+    timeoutMs: 0,
+    skipPrePromptCompaction: true,
+    scheduleIdleAutoCompaction: true,
+    onTerminalOutput: () => {
+      db.storeAcceptedChatMessageSource({
+        id: `msg-${crypto.randomUUID()}`,
+        chat_jid: chatJid,
+        sender: "user",
+        sender_name: "User",
+        content: "successor",
+        timestamp: new Date().toISOString(),
+        is_from_me: false,
+        is_bot_message: false,
+      });
+      expect(db.claimNextChatOperation(chatJid)).not.toBeNull();
+      return true;
+    },
+  });
+
+  expect(result.status).toBe("success");
+  expect(session.calls).toEqual(["prompt"]);
+  expect(db.getChatOperation(chatJid)).not.toBeNull();
+  await expect(pool.runSessionMutation(chatJid, "compaction", {}, async () => {}))
+    .rejects.toThrow("legacy_conflict");
+  await pool.shutdown();
+  cleanupOperationTestChat(db, chatJid);
+});
+
+test("maintenance failure after terminal commit preserves one durable terminal disposition", async () => {
+  const ws = getTestWorkspace();
+  restoreEnv = setEnv({
+    PICLAW_WORKSPACE: ws.workspace,
+    PICLAW_STORE: ws.store,
+    PICLAW_DATA: ws.data,
+    PICLAW_AUTO_COMPACTION_ENABLED: "1",
+  });
+  const db = await importFresh<typeof import("../src/db.js")>("../src/db.js");
+  db.initDatabase();
+  const { AgentPool } = await importFresh<typeof import("../src/agent-pool.js")>("../src/agent-pool.js");
+  const chatJid = "web:maintenance-failure-after-commit";
+  db.storeChatMetadata(chatJid, "", "Web");
+  const source = db.storeAcceptedChatMessageSource({
+    id: `msg-${crypto.randomUUID()}`,
+    chat_jid: chatJid,
+    sender: "user",
+    sender_name: "User",
+    content: "commit then maintenance fails",
+    timestamp: "2026-08-08T10:00:00.000Z",
+    is_from_me: false,
+    is_bot_message: false,
+  }).source;
+  const claim = db.claimNextChatOperation(chatJid);
+  if (claim.status !== "claimed") throw new Error("expected durable claim");
+  const session = new PostTurnMaintenanceSession();
+  const pool = new AgentPool({
+    ...createAgentPoolModelOptions(),
+    createSession: async () => createRuntime(session) as any,
+  });
+  const originalRunSessionMutation = pool.runSessionMutation.bind(pool);
+
+  const result = await pool.runAgent("test", chatJid, {
+    timeoutMs: 0,
+    skipPrePromptCompaction: true,
+    scheduleIdleAutoCompaction: true,
+    operationOwner: claim.operation,
+    onTerminalOutput: () => {
+      const completed = db.completeChatOperation(chatJid, {
+        owner: {
+          operationId: claim.operation.operationId,
+          sourceSeq: claim.operation.sourceSeq,
+          phase: claim.operation.phase,
+          generation: claim.operation.generation,
+        },
+        outcome: "succeeded",
+        cause: "normal",
+        provenance: "agent_pool_test",
+        createdAt: "2026-08-08T10:00:01.000Z",
+        artifact: {
+          message: {
+            id: `bot-${crypto.randomUUID()}`,
+            chat_jid: chatJid,
+            sender: "agent",
+            sender_name: "Agent",
+            content: "done",
+            timestamp: "2026-08-08T10:00:01.000Z",
+            is_from_me: true,
+            is_bot_message: true,
+            is_terminal_agent_reply: true,
+          },
+        },
+      });
+      expect(completed.status).toBe("completed");
+      (pool as any).runSessionMutation = async () => { throw new Error("maintenance exploded"); };
+      return true;
+    },
+  });
+  (pool as any).runSessionMutation = originalRunSessionMutation;
+
+  expect(result.status).toBe("success");
+  expect(db.getChatOperation(chatJid)).toBeNull();
+  expect(db.getChatOperationDisposition(source.sourceSeq)).toMatchObject({
+    outcome: "succeeded",
+    terminalMessageId: expect.any(String),
+  });
+  expect(db.getDb().prepare("SELECT COUNT(*) AS count FROM chat_operation_dispositions WHERE source_seq = ?")
+    .get(source.sourceSeq)).toEqual({ count: 1 });
+  await pool.shutdown();
+  cleanupOperationTestChat(db, chatJid);
+});
+
+test("durable successor accepted during ownerless maintenance remains queued until release", async () => {
+  const ws = getTestWorkspace();
+  restoreEnv = setEnv({
+    PICLAW_WORKSPACE: ws.workspace,
+    PICLAW_STORE: ws.store,
+    PICLAW_DATA: ws.data,
+    PICLAW_AUTO_COMPACTION_ENABLED: "1",
+  });
+  const db = await importFresh<typeof import("../src/db.js")>("../src/db.js");
+  db.initDatabase();
+  const { AgentPool } = await importFresh<typeof import("../src/agent-pool.js")>("../src/agent-pool.js");
+  const session = new PostTurnMaintenanceSession();
+  const pool = new AgentPool({
+    ...createAgentPoolModelOptions(),
+    createSession: async () => createRuntime(session) as any,
+  });
+  let maintenanceStarted!: () => void;
+  const maintenanceStart = new Promise<void>((resolve) => { maintenanceStarted = resolve; });
+  let releaseMaintenance!: () => void;
+  const maintenanceGate = new Promise<void>((resolve) => { releaseMaintenance = resolve; });
+  session.compactImpl = async () => {
+    maintenanceStarted();
+    await maintenanceGate;
+  };
+  const chatJid = "web:maintenance-queued-successor";
+  const run = pool.runAgent("test", chatJid, {
+    timeoutMs: 0,
+    skipPrePromptCompaction: true,
+    scheduleIdleAutoCompaction: true,
+    onTerminalOutput: () => true,
+  });
+  await maintenanceStart;
+
+  db.storeAcceptedChatMessageSource({
+    id: `msg-${crypto.randomUUID()}`,
+    chat_jid: chatJid,
+    sender: "user",
+    sender_name: "User",
+    content: "successor",
+    timestamp: new Date().toISOString(),
+    is_from_me: false,
+    is_bot_message: false,
+  });
+  expect(db.claimNextChatOperation(chatJid).status).toBe("legacy_conflict");
+
+  releaseMaintenance();
+  expect((await run).status).toBe("success");
+  const claim = db.claimNextChatOperation(chatJid);
+  if (claim.status !== "claimed") throw new Error("expected successor claim after maintenance");
+  let successorRan = false;
+  await pool.runSessionMutation(chatJid, "prompt", { operationOwner: claim.operation }, async () => {
+    successorRan = true;
+  });
+  expect(successorRan).toBe(true);
+  expect(session.calls).toEqual(["prompt", "compact"]);
+  await pool.shutdown();
+  cleanupOperationTestChat(db, chatJid);
 });
 
 test("agent pool aggregates recovery counters into memory instrumentation", async () => {

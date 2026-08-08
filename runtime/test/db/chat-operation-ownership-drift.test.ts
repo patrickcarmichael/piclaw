@@ -41,7 +41,7 @@ describe("chat operation ownership drift", () => {
     }
     expect(Object.fromEntries([...counts].sort(([left], [right]) => left.localeCompare(right)))).toEqual({
       "db/chat-branches.ts": 5,
-      "db/chat-cursors.ts": 14,
+      "db/chat-cursors.ts": 15,
       "db/chat-operation-lifecycle.ts": 1,
       "db/chat-operations.ts": 3,
       "dream.ts": 3,
@@ -58,7 +58,7 @@ describe("chat operation ownership drift", () => {
     }
 
     expect(Object.fromEntries([...counts].sort(([left], [right]) => left.localeCompare(right)))).toEqual({
-      "db/chat-cursors.ts": 12,
+      "db/chat-cursors.ts": 13,
       "db/chat-operations.ts": 1,
     });
   });
@@ -66,7 +66,7 @@ describe("chat operation ownership drift", () => {
   test("names the legacy ownership bridge scheduled for deletion", () => {
     const source = readFileSync(resolve(sourceRoot, "db/chat-cursors.ts"), "utf8");
     const legacyMutators = [
-      "beginChatPreflight", "clearChatPreflight", "promoteChatPreflightToInflight", "beginChatRun",
+      "beginChatPreflight", "clearChatPreflight", "blockChatPreflightOwned", "promoteChatPreflightToInflight", "beginChatRun",
       "endChatRun", "endChatRunWithError", "clearFailedRun", "rollbackChatRunWithError",
       "rollbackInflightRun", "rollbackInflightRunForCompactionConflict", "clearInflightMarker",
       "markChatCompactionActive", "clearChatCompactionActive", "setChatCursor",

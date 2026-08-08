@@ -8,6 +8,7 @@ import { getPrePromptCompactionForegroundMs } from "../../../core/config.js";
 import {
   beginChatPreflight,
   blockChatOperation,
+  blockChatPreflightOwned,
   clearChatPreflight,
   getChatOperation,
   promoteChatOperation,
@@ -29,6 +30,7 @@ function withMetadata(details: Record<string, unknown>, turnId: string, browser?
 interface ProcessChatPreflightDeps {
   beginChatPreflight: typeof beginChatPreflight;
   clearChatPreflight: typeof clearChatPreflight;
+  blockChatPreflightOwned: typeof blockChatPreflightOwned;
   promoteChatPreflightToInflight: typeof promoteChatPreflightToInflight;
   maybeAutoCompactSessionBeforePrompt: typeof maybeAutoCompactSessionBeforePrompt;
   getForegroundMs: typeof getPrePromptCompactionForegroundMs;
@@ -37,6 +39,7 @@ interface ProcessChatPreflightDeps {
 const defaultDeps: ProcessChatPreflightDeps = {
   beginChatPreflight,
   clearChatPreflight,
+  blockChatPreflightOwned,
   promoteChatPreflightToInflight,
   maybeAutoCompactSessionBeforePrompt,
   getForegroundMs: getPrePromptCompactionForegroundMs,
@@ -79,6 +82,17 @@ export async function runProcessChatPreflight(options: {
     if (released) endTrackedPhase(chatJid);
     return released;
   };
+  const blockOwner = (): boolean => {
+    const blocked = deps.blockChatPreflightOwned(chatJid, owner, {
+      prevTs: options.prevCursor,
+      failedTs: options.message.timestamp,
+      messageId: options.message.id,
+      threadRootId: options.effectiveThreadRootId,
+      createdAt: new Date().toISOString(),
+    });
+    if (blocked) endTrackedPhase(chatJid);
+    return blocked;
+  };
 
   if (typeof channel.agentPool.runSessionMutation !== "function") {
     const promoted = deps.promoteChatPreflightToInflight(chatJid, options.message.timestamp, owner);
@@ -93,12 +107,12 @@ export async function runProcessChatPreflight(options: {
     return "continue";
   }
 
-  const rotateIfNeeded = async (source: "foreground" | "background"): Promise<boolean> => {
+  const rotateIfNeeded = async (source: "foreground" | "background"): Promise<"not_needed" | "succeeded" | "failed"> => {
     const detail = options.compactionState.lastCompactionErrorMessage?.trim();
-    if (!detail || isCompactionCancellationError(detail)) return false;
+    if (!detail || isCompactionCancellationError(detail)) return "not_needed";
     const result = await channel.agentPool.emergencyRotateSession(chatJid, detail);
     log[result.status === "success" ? "info" : "warn"]("Emergency rotation after pre-prompt compaction", withMetadata({ operation: result.status === "success" ? "process_chat.preprompt_compaction_emergency_rotate_success" : "process_chat.preprompt_compaction_emergency_rotate_failed", chatJid, source, suppressed: options.compactionState.lastCompactionSuppressed, reason: result.message, archivePath: result.archivePath ?? null, newSessionFile: result.newSessionFile ?? null }, options.turnId, options.browserObservability));
-    return result.status === "success";
+    return result.status === "success" ? "succeeded" : "failed";
   };
 
   beginTrackedPhase(chatJid, "preprompt_compaction", { source: "web.process_chat.preflight", messageId: options.message.id });
@@ -117,9 +131,16 @@ export async function runProcessChatPreflight(options: {
     if (outcome === "defer") {
       void compactionPromise
         .then(() => rotateIfNeeded("background"))
-        .catch((error) => log.warn("Background pre-prompt compaction failed before chat resume", withMetadata({ operation: "process_chat.preprompt_compaction_deferred_failed", chatJid, messageId: options.message.id, err: error }, options.turnId, options.browserObservability)))
+        .then((rotation) => {
+          if (rotation === "failed") blockOwner();
+          else releaseOwner();
+        })
+        .catch((error) => {
+          log.warn("Background pre-prompt compaction failed before chat resume", withMetadata({ operation: "process_chat.preprompt_compaction_deferred_failed", chatJid, messageId: options.message.id, err: error }, options.turnId, options.browserObservability));
+          releaseOwner();
+        })
         .finally(() => {
-          if (releaseOwner()) options.enqueueResume(options.effectiveThreadRootId ?? undefined);
+          options.enqueueResume(undefined);
         });
       return "deferred";
     }
@@ -128,8 +149,11 @@ export async function runProcessChatPreflight(options: {
     throw error;
   }
 
-  if (await rotateIfNeeded("foreground")) {
-    if (releaseOwner()) options.enqueueResume(options.effectiveThreadRootId ?? undefined);
+  const rotation = await rotateIfNeeded("foreground");
+  if (rotation !== "not_needed") {
+    if (rotation === "failed") blockOwner();
+    else releaseOwner();
+    options.enqueueResume(undefined);
     return "deferred";
   }
 
@@ -140,6 +164,7 @@ export async function runProcessChatPreflight(options: {
       chatJid,
       messageId: options.message.id,
     }, options.turnId, options.browserObservability));
+    options.enqueueResume(undefined);
     return "deferred";
   }
   heartbeatTrackedPhase(chatJid, "prompt", { eventType: "preflight_promoted" });
@@ -223,10 +248,10 @@ export async function runDurableOperationPreflight(options: {
   let backgroundOwnsAttempt = false;
 
   try {
-  const rotateIfNeeded = async (source: "foreground" | "background"): Promise<boolean> => {
-    if (operationIsCancelled()) return false;
+  const rotateIfNeeded = async (source: "foreground" | "background"): Promise<"not_needed" | "succeeded" | "failed"> => {
+    if (operationIsCancelled()) return "not_needed";
     const detail = options.compactionState.lastCompactionErrorMessage?.trim();
-    if (!detail || isCompactionCancellationError(detail)) return false;
+    if (!detail || isCompactionCancellationError(detail)) return "not_needed";
     const result = await options.channel.agentPool.emergencyRotateSession(options.chatJid, detail, {
       operationOwner: operationOwner(operation),
     });
@@ -238,7 +263,7 @@ export async function runDurableOperationPreflight(options: {
       source,
       reason: result.message,
     }, options.turnId, options.browserObservability));
-    return result.status === "success";
+    return result.status === "success" ? "succeeded" : "failed";
   };
 
   beginTrackedPhase(options.chatJid, "preprompt_compaction", {
@@ -264,10 +289,13 @@ export async function runDurableOperationPreflight(options: {
       backgroundOwnsAttempt = true;
       void compactionPromise
         .then(() => rotateIfNeeded("background"))
-        .then(() => {
+        .then((rotation) => {
           if (operationIsCancelled()) return;
-          const running = promoteRunning();
-          if (running) options.enqueueResume(options.effectiveThreadRootId ?? undefined);
+          if (rotation === "failed") {
+            block();
+            return;
+          }
+          promoteRunning();
         })
         .catch((error) => {
           log.warn("Background durable pre-prompt compaction failed", withMetadata({
@@ -278,7 +306,10 @@ export async function runDurableOperationPreflight(options: {
           }, options.turnId, options.browserObservability));
           block();
         })
-        .finally(() => durablePreflightAttempts.delete(attemptKey));
+        .finally(() => {
+          durablePreflightAttempts.delete(attemptKey);
+          options.enqueueResume(undefined);
+        });
       return { status: "deferred" };
     }
   } catch (error) {
@@ -286,15 +317,27 @@ export async function runDurableOperationPreflight(options: {
     throw error;
   }
 
-  if (await rotateIfNeeded("foreground")) {
-    const running = promoteRunning();
-    if (running) options.enqueueResume(options.effectiveThreadRootId ?? undefined);
+  const rotation = await rotateIfNeeded("foreground");
+  if (rotation === "failed") {
+    block();
+    options.enqueueResume(undefined);
+    return { status: "deferred" };
+  }
+  if (rotation === "succeeded") {
+    if (!operationIsCancelled()) promoteRunning();
+    options.enqueueResume(undefined);
     return { status: "deferred" };
   }
 
-  if (operationIsCancelled()) return { status: "deferred" };
+  if (operationIsCancelled()) {
+    options.enqueueResume(undefined);
+    return { status: "deferred" };
+  }
   const running = promoteRunning();
-  if (!running) return { status: "deferred" };
+  if (!running) {
+    options.enqueueResume(undefined);
+    return { status: "deferred" };
+  }
   heartbeatTrackedPhase(options.chatJid, "prompt", { eventType: "operation_preflight_promoted" });
   return { status: "continue", operation: running };
   } finally {

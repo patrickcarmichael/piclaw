@@ -109,6 +109,7 @@ export {
   beginChatPreflight,
   getChatPreflight,
   clearChatPreflight,
+  blockChatPreflightOwned,
   promoteChatPreflightToInflight,
   beginChatRun,
   endChatRun,
