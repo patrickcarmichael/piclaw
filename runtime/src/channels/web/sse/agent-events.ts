@@ -1021,7 +1021,7 @@ export function createStreamingEventHandler(options: StreamingEventHandlerOption
     }
 
     if (customEventType === "recovery_end") {
-      const e = event as { outcome?: string; attemptsUsed?: number; classifier?: string | null; errorMessage?: string };
+      const e = event as { outcome?: string; attemptsUsed?: number; classifier?: string | null; errorMessage?: string; recoverySuppressedReason?: string };
       if (e.outcome === "recovered") {
         options.emitter.status({
           ...base,
@@ -1032,12 +1032,14 @@ export function createStreamingEventHandler(options: StreamingEventHandlerOption
           intent_key: "recovery",
         });
       } else if (e.outcome === "exhausted") {
+        const recoveryWasSuppressed = e.classifier === "recovery_suppressed";
         options.emitter.status({
           ...base,
           type: "error",
-          title: "Automatic recovery exhausted",
-          detail: e.errorMessage || undefined,
+          title: recoveryWasSuppressed ? "Automatic recovery suppressed" : "Automatic recovery exhausted",
+          detail: e.recoverySuppressedReason || e.errorMessage || undefined,
           classifier: e.classifier ?? null,
+          ...(e.recoverySuppressedReason ? { recovery_suppressed_reason: e.recoverySuppressedReason } : {}),
           intent_key: "recovery",
         });
       }

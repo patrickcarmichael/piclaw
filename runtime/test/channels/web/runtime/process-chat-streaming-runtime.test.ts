@@ -26,6 +26,32 @@ describe("process chat streaming runtime", () => {
     expect(events.some((event) => event.type === "agent_status" && event.payload.type === "thinking")).toBe(true);
   });
 
+  test("renders intentional zero-attempt recovery suppression distinctly from exhaustion", async () => {
+    const events: Array<{ type: string; payload: any }> = [];
+    const runtime = await createProcessChatStreamingRuntime({ channel: channel(events), chatJid: "web:test", agentId: "default", threadId: "thread-1", turnId: "turn-1", runStartedAt: "2026-01-01T00:00:00.000Z", sourceMessageId: "m1", withResolvedToolStatusHints: (_jid, payload) => payload, withAgentStatusProgressMetadata: (payload) => payload });
+    runtime.streamingHandler({
+      type: "recovery_end",
+      outcome: "exhausted",
+      attemptsUsed: 0,
+      classifier: "recovery_suppressed",
+      recoverySuppressedReason: "Repeated identical failures reached the loop-guard limit.",
+    });
+
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: "agent_status",
+        payload: expect.objectContaining({
+          type: "error",
+          title: "Automatic recovery suppressed",
+          detail: "Repeated identical failures reached the loop-guard limit.",
+          classifier: "recovery_suppressed",
+          recovery_suppressed_reason: "Repeated identical failures reached the loop-guard limit.",
+        }),
+      }),
+    ]));
+    expect(events.some((event) => event.payload?.title === "Automatic recovery exhausted")).toBe(false);
+  });
+
   test("captures full thought and draft deltas while panels are collapsed", async () => {
     const events: Array<{ type: string; payload: any }> = [];
     const runtime = await createProcessChatStreamingRuntime({ channel: channel(events), chatJid: "web:test", agentId: "default", threadId: "thread-1", turnId: "turn-1", runStartedAt: "2026-01-01T00:00:00.000Z", sourceMessageId: "m1", withResolvedToolStatusHints: (_jid, payload) => payload, withAgentStatusProgressMetadata: (payload) => payload });

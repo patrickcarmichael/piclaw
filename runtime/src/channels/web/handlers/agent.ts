@@ -1833,7 +1833,8 @@ export async function processChat(
       || markerClassifier === "budget_exhausted";
     const showDiagnosticWithoutDraft = (markerType === "timeout_marker"
       && markerClassifier === "budget_exhausted")
-      || markerKind === "context";
+      || markerKind === "context"
+      || markerClassifier === "recovery_suppressed";
     const text = buildFailureVisibleText({
       draftText,
       title,
@@ -2379,6 +2380,9 @@ export async function processChat(
       abortCause: output.abortCause,
       abortOperation: output.abortOperation,
     };
+    const recoverySuppressedReason = output.recovery?.lastClassifier === "recovery_suppressed"
+      ? output.recovery.diagnostics.slice().reverse().find((entry) => entry.classifier === "recovery_suppressed")?.reason || null
+      : null;
     const resolveContinuationThreadId = (): number | null => resolvedThreadRootId
       ?? getMessageRowIdById(chatJid, lastMessage.id ?? "");
     const queueToolBudgetContinuation = (): void => {
@@ -2457,6 +2461,45 @@ export async function processChat(
       }
       return;
     }
+    if (output.recovery?.lastClassifier === "recovery_suppressed") {
+      const detail = recoverySuppressedReason
+        ?? "Automatic recovery was intentionally suppressed because repeated identical failures reached the loop-guard limit.";
+      const marker = buildTurnOutcomeMarker({
+        kind: "recovery",
+        label: "recovery",
+        title: "Automatic recovery suppressed",
+        detail,
+        severity: "warning",
+        attemptsUsed: output.recovery.attemptsUsed,
+        classifier: "recovery_suppressed",
+      });
+      const persisted = persistVisibleFailureOutcome(marker);
+      if (persisted) {
+        await finalizeSuccessfulRun();
+      } else {
+        blockFailedRun({
+          prevTs: prevCursor,
+          failedTs: lastMessage.timestamp,
+          messageId: lastMessage.id,
+          threadRootId: resolvedThreadRootId ?? null,
+          createdAt: new Date().toISOString(),
+        });
+      }
+      trackedEmitter.status({
+        thread_id: threadId,
+        agent_id: agentId,
+        type: "error",
+        state: "recovery_suppressed",
+        classifier: "recovery_suppressed",
+        failure_category: output.failureCategory ?? "unknown",
+        title: "Automatic recovery suppressed",
+        detail,
+        recovery_suppressed_reason: detail,
+        turn_id: turnId,
+      });
+      return;
+    }
+
     const fallbackPublished = output.failureCategory === "timeout" || output.failureCategory === "stalled_work"
       ? publishDraftFallback("timeout", errorText, { markerOptions })
       : rateLimited
