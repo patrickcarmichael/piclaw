@@ -10,7 +10,7 @@ import {
   type WebAgentPeerMessageRelayService,
 } from "../agent/agent-peer-message-relay-service.js";
 import type { WebServerLifecycleGatewayService, WebSocketSessionData } from "../server-lifecycle-gateway-service.js";
-import type { AgentMessageAcceptanceHandler } from "../handlers/agent.js";
+import type { AgentMessageAcceptanceHandler } from "../messaging/agent-message-acceptance.js";
 import type { WebChannelLike } from "./web-channel-contracts.js";
 
 type WebChannelLifecycleSpecialSurfaceServerLifecycle = Pick<

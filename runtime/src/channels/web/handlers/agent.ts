@@ -9,6 +9,7 @@
  */
 
 import type { WebChannelLike } from "../core/web-channel-contracts.js";
+import type { AgentMessageAcceptanceHandler } from "../messaging/agent-message-acceptance.js";
 import {
   getIdentityConfig,
   getRoutingConfig,
@@ -657,16 +658,6 @@ function fallbackAgentHandle(chatJid: string): string {
 function shouldPersistSteerRequest(req: Request, payload: { persist_steer?: boolean } | undefined): boolean {
   return payload?.persist_steer === true || req.headers.get("X-Piclaw-Persist-Steer") === "1";
 }
-
-export interface AgentMessageAcceptance {
-  chat_jid: string;
-  row_id: number;
-  thread_id: number | null;
-  accepted_at: string;
-  created: true;
-}
-
-export type AgentMessageAcceptanceHandler = (acceptance: AgentMessageAcceptance) => void;
 
 /**
  * Handle a web `/agent/:agentId/message` request by storing user input and starting/queuing a run.

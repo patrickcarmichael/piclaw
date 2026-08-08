@@ -7,7 +7,7 @@
  */
 
 import type { AgentPool } from "../../../agent-pool.js";
-import type { AgentMessageAcceptanceHandler } from "../handlers/agent.js";
+import type { AgentMessageAcceptanceHandler } from "../messaging/agent-message-acceptance.js";
 import type { SendMessageOptions } from "../messaging/message-write-flows.js";
 import type { WorkspaceDispatchChannel } from "../http/dispatch-workspace.js";
 import type { MediaDispatchChannel } from "../http/dispatch-media.js";

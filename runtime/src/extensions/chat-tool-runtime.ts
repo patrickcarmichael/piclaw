@@ -7,7 +7,10 @@
  * chat with a structured reply-to descriptor.
  */
 import type { AgentPool } from "../agent-pool.js";
-import type { AgentMessageAcceptance, AgentMessageAcceptanceHandler } from "../channels/web/handlers/agent.js";
+import type {
+  AgentMessageAcceptance,
+  AgentMessageAcceptanceHandler,
+} from "../channels/web/messaging/agent-message-acceptance.js";
 import { getIdentityConfig } from "../core/config.js";
 import { getChatBranchByAgentName, getChatBranchByChatJid } from "../db.js";
 import { createLogger, debugSuppressedError } from "../utils/logger.js";

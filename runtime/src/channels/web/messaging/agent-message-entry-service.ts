@@ -6,10 +6,8 @@
  * agent-message handler path without changing router-facing WebChannel APIs.
  */
 
-import {
-  handleAgentMessage as handleAgentMessageRequest,
-  type AgentMessageAcceptanceHandler,
-} from "../handlers/agent.js";
+import { handleAgentMessage as handleAgentMessageRequest } from "../handlers/agent.js";
+import type { AgentMessageAcceptanceHandler } from "./agent-message-acceptance.js";
 import type { WebChannelLike } from "../core/web-channel-contracts.js";
 
 export interface WebAgentMessageEntryServiceOptions {
