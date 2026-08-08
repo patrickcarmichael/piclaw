@@ -49,7 +49,11 @@ import {
 import { runSidePrompt as runSidePromptInternal } from "./agent-pool/side-prompt-runner.js";
 import { runAgentPrompt } from "./agent-pool/run-agent-orchestrator.js";
 import { runWithProtectedRecoveryHandoff } from "./agent-pool/protected-recovery-handoff.js";
-import { clearCompactionFailureBackoff, resetCompactionSuccessCount } from "./agent-pool/compaction.js";
+import {
+  clearCompactionFailureBackoff,
+  maybeAutoCompactSessionAfterTurn,
+  resetCompactionSuccessCount,
+} from "./agent-pool/compaction.js";
 import { rotateSession, type SessionRotationResult } from "./session-rotation.js";
 import { type AgentRuntimeFacade, type AvailableModelsResult } from "./agent-pool/runtime-facade.js";
 import { createAgentPoolServices, type AgentPoolServices } from "./agent-pool/service-factory.js";
@@ -356,9 +360,44 @@ export class AgentPool {
 
   /** Run a prompt against the persistent session for `chatJid`. */
   async runAgent(prompt: string, chatJid: string, options: RunAgentOptions = {}): Promise<AgentOutput> {
-    return this.mutationGateway.run(chatJid, "prompt", sessionMutationAccess(options), () => (
-      this.runAgentOwned(prompt, chatJid, options)
-    ));
+    let terminalOutputCommitted = false;
+    const output = await this.mutationGateway.run(chatJid, "prompt", sessionMutationAccess(options), async () => {
+      const result = await this.runAgentOwned(prompt, chatJid, options);
+      if ((result.status === "success" || result.status === "tool_complete") && options.onTerminalOutput) {
+        terminalOutputCommitted = await options.onTerminalOutput(result);
+      }
+      return result;
+    });
+
+    if (terminalOutputCommitted && options.scheduleIdleAutoCompaction
+      && (output.status === "success" || output.status === "tool_complete")) {
+      await this.runPostTurnMaintenance(chatJid, options);
+    }
+    return output;
+  }
+
+  private async runPostTurnMaintenance(chatJid: string, options: RunAgentOptions): Promise<void> {
+    try {
+      await this.runSessionMutation(chatJid, "compaction", {}, (session) => (
+        maybeAutoCompactSessionAfterTurn(session, chatJid, {
+          onInfo: (message, details) => log.info(message, details),
+          onWarn: (message, details) => log.warn(message, details),
+        }, options.onEvent)
+      ));
+    } catch (error) {
+      if (error instanceof SessionMutationRejectedError && error.reason === "legacy_conflict") {
+        log.info("Skipped post-turn maintenance because durable successor owns the chat", {
+          operation: "run_agent.post_turn_maintenance_successor_owned",
+          chatJid,
+        });
+        return;
+      }
+      log.warn("Post-turn maintenance failed after terminal output commit", {
+        operation: "run_agent.post_turn_maintenance_failed",
+        chatJid,
+        err: error,
+      });
+    }
   }
 
   private async runAgentOwned(prompt: string, chatJid: string, options: RunAgentOptions): Promise<AgentOutput> {

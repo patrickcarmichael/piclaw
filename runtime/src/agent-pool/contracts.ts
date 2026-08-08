@@ -126,6 +126,12 @@ export interface RunAgentOptions {
   onTurnComplete?: (turn: TurnOutput) => void;
   /** Called when completed provider commentary must remain transient. */
   onTurnDiscard?: (discard: TurnDiscard) => void;
+  /**
+   * Persist the final successful output before the prompt mutation lane is
+   * released. Returning true authorises post-turn maintenance after that lane
+   * has closed; false leaves maintenance suppressed.
+   */
+  onTerminalOutput?: (output: AgentOutput) => boolean | Promise<boolean>;
   /** Stable runtime turn identifier for observability/correlation. */
   turnId?: string;
   /** Optional browser/user correlation identifier supplied by the caller. */

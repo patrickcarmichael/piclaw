@@ -1577,7 +1577,7 @@ test("runAgentPrompt clears compaction backoff after a successful compaction", a
   }
 });
 
-test("runAgentPrompt runs idle auto-compaction before returning after a successful turn when enabled", async () => {
+test("runAgentPrompt leaves successful post-turn maintenance to AgentPool", async () => {
   const restoreEnv = setEnv({
     PICLAW_IDLE_AUTO_COMPACTION_DELAY_MS: "5000",
   });
@@ -1639,17 +1639,14 @@ test("runAgentPrompt runs idle auto-compaction before returning after a successf
     });
 
     expect(result.status).toBe("success");
-    expect(session.calls).toEqual(["prompt", "compact"]);
-    expect(events).toEqual([
-      { type: "compaction_start", reason: "idle" },
-      { type: "compaction_end", reason: "idle" },
-    ]);
+    expect(session.calls).toEqual(["prompt"]);
+    expect(events).toEqual([]);
   } finally {
     restoreEnv();
   }
 });
 
-test("runAgentPrompt runs post-turn idle auto-compaction after terminal tool completion when enabled", async () => {
+test("runAgentPrompt leaves tool-complete post-turn maintenance to AgentPool", async () => {
   const restoreEnv = setEnv({
     PICLAW_IDLE_AUTO_COMPACTION_DELAY_MS: "5000",
   });
@@ -1724,17 +1721,14 @@ test("runAgentPrompt runs post-turn idle auto-compaction after terminal tool com
     });
 
     expect(result.status).toBe("tool_complete");
-    expect(session.calls).toEqual(["prompt", "compact"]);
-    expect(events).toEqual([
-      { type: "compaction_start", reason: "idle" },
-      { type: "compaction_end", reason: "idle" },
-    ]);
+    expect(session.calls).toEqual(["prompt"]);
+    expect(events).toEqual([]);
   } finally {
     restoreEnv();
   }
 });
 
-test("runAgentPrompt runs post-turn idle auto-compaction after each successful turn that still exceeds the threshold", async () => {
+test("runAgentPrompt never runs post-turn maintenance directly across repeated turns", async () => {
   const restoreEnv = setEnv({
     PICLAW_IDLE_AUTO_COMPACTION_DELAY_MS: "5000",
   });
@@ -1799,7 +1793,7 @@ test("runAgentPrompt runs post-turn idle auto-compaction after each successful t
     expect(first.status).toBe("success");
     expect(second.status).toBe("success");
     expect(session.promptCalls).toBe(2);
-    expect(session.compactCalls).toBe(2);
+    expect(session.compactCalls).toBe(0);
   } finally {
     restoreEnv();
   }

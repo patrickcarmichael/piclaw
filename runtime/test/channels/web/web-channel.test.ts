@@ -2153,7 +2153,7 @@ test("processChat publishes draft fallback when final result is missing", async 
   expect(last.data.content).toContain("draft only");
 });
 
-test("processChat surfaces draft as informational when tool-complete has no final prose", async () => {
+test("processChat commits tool-complete draft output in the terminal callback exactly once", async () => {
   const ws = createTempWorkspace("piclaw-web-channel-");
   cleanupWorkspace = ws.cleanup;
   restoreEnv = setEnv({ PICLAW_WORKSPACE: ws.workspace, PICLAW_STORE: ws.store, PICLAW_DATA: ws.data });
@@ -2188,7 +2188,9 @@ test("processChat surfaces draft as informational when tool-complete has no fina
           type: "message_update",
           assistantMessageEvent: { type: "text_delta", delta: "tool-backed draft" },
         });
-        return { status: "tool_complete", result: null, attachments: [] };
+        const output = { status: "tool_complete" as const, result: null, attachments: [] };
+        expect(await options.onTerminalOutput?.(output)).toBe(true);
+        return output;
       },
       getContextUsageForChat: async () => null,
     },
@@ -2204,6 +2206,7 @@ test("processChat surfaces draft as informational when tool-complete has no fina
     kind: "tool_complete",
     draft_recovered: true,
   }));
+  expect(timeline.filter((item: any) => item.data.type === "agent_response")).toHaveLength(1);
 });
 
 test("processChat final first turn does not consume a queued placeholder", async () => {
@@ -3871,7 +3874,7 @@ test("processChat publishes final draft fallback even after an intermediate turn
   expect(blocks.some((b: any) => b?.type === "turn_outcome_marker" && b?.label === "no reply")).toBe(true);
 });
 
-test("processChat atomically promotes intermediate-only durable output", async () => {
+test("processChat atomically promotes intermediate-only durable output in the terminal callback", async () => {
   const ws = createTempWorkspace("piclaw-web-channel-");
   cleanupWorkspace = ws.cleanup;
   restoreEnv = setEnv({ PICLAW_WORKSPACE: ws.workspace, PICLAW_STORE: ws.store, PICLAW_DATA: ws.data });
@@ -3893,6 +3896,7 @@ test("processChat atomically promotes intermediate-only durable output", async (
   }).source;
 
   let bindingBeforeRunCompletion: string | null = null;
+  let operationAfterTerminalCallback: unknown = undefined;
   const webMod = await import("../../../src/channels/web.js");
   const web = new (webMod.WebChannel as any)({
     queue: { enqueue: () => {} },
@@ -3904,7 +3908,10 @@ test("processChat atomically promotes intermediate-only durable output", async (
           WHERE chat_jid = ? AND is_bot_message = 1 ORDER BY rowid DESC LIMIT 1`).get("web:default") as {
             operation_id: string | null;
           }).operation_id;
-        return { status: "success", result: null, attachments: [] };
+        const output = { status: "success" as const, result: null, attachments: [] };
+        expect(await options.onTerminalOutput?.(output)).toBe(true);
+        operationAfterTerminalCallback = db.getChatOperation("web:default");
+        return output;
       },
       getContextUsageForChat: async () => null,
     },
@@ -3912,6 +3919,7 @@ test("processChat atomically promotes intermediate-only durable output", async (
 
   await web.processChat("web:default", "default");
 
+  expect(operationAfterTerminalCallback).toBeNull();
   expect(db.getChatOperation("web:default")).toBeNull();
   const disposition = db.getChatOperationDisposition(source.sourceSeq);
   expect(disposition).toMatchObject({
@@ -3933,6 +3941,106 @@ test("processChat atomically promotes intermediate-only durable output", async (
     is_terminal_agent_reply: 1,
     operation_id: disposition!.operationId,
   }]);
+});
+
+test("prompt-lane terminal commit failure rolls back, broadcasts nothing, blocks durable ownership, and suppresses maintenance", async () => {
+  const ws = createTempWorkspace("piclaw-web-channel-");
+  cleanupWorkspace = ws.cleanup;
+  restoreEnv = setEnv({ PICLAW_WORKSPACE: ws.workspace, PICLAW_STORE: ws.store, PICLAW_DATA: ws.data });
+
+  const db = await import("../../../src/db.js");
+  db.initDatabase();
+  db.getDb().exec("DELETE FROM message_media; DELETE FROM messages; DELETE FROM chats; DELETE FROM chat_cursors;");
+  db.storeChatMetadata("web:default", new Date().toISOString(), "Web");
+  db.storeAcceptedChatMessageSource({
+    id: `msg-${crypto.randomUUID()}`,
+    chat_jid: "web:default",
+    sender: "user",
+    sender_name: "User",
+    content: "force terminal transaction failure",
+    timestamp: new Date().toISOString(),
+    is_from_me: false,
+    is_bot_message: false,
+  });
+  db.getDb().exec(`CREATE TRIGGER fail_terminal_disposition
+    BEFORE INSERT ON chat_operation_dispositions
+    BEGIN SELECT RAISE(ABORT, 'forced terminal completion failure'); END;`);
+
+  let maintenanceAttempts = 0;
+  let broadcasts = 0;
+  const webMod = await import("../../../src/channels/web.js");
+  const web = new (webMod.WebChannel as any)({
+    queue: { enqueue: () => {} },
+    agentPool: {
+      setSessionBinder: () => {},
+      runAgent: async (_prompt: string, _chatJid: string, options: any) => {
+        const output = { status: "success" as const, result: "must roll back", attachments: [] };
+        const committed = await options.onTerminalOutput?.(output);
+        if (committed) maintenanceAttempts += 1;
+        return output;
+      },
+      getContextUsageForChat: async () => null,
+    },
+  });
+  (web as any).interactionBroadcaster.broadcastAgentResponse = () => { broadcasts += 1; };
+
+  await web.processChat("web:default", "default");
+
+  expect(maintenanceAttempts).toBe(0);
+  expect(broadcasts).toBe(0);
+  expect(db.getChatOperation("web:default")).toMatchObject({ phase: "blocked", generation: 3 });
+  expect(db.getDb().prepare(`SELECT COUNT(*) AS count FROM messages
+    WHERE chat_jid = ? AND is_bot_message = 1`).get("web:default")).toEqual({ count: 0 });
+  expect(db.getDb().prepare("SELECT COUNT(*) AS count FROM chat_operation_dispositions").get()).toEqual({ count: 0 });
+});
+
+test("tool-complete without a draft commits one prompt-lane marker", async () => {
+  const ws = createTempWorkspace("piclaw-web-channel-");
+  cleanupWorkspace = ws.cleanup;
+  restoreEnv = setEnv({ PICLAW_WORKSPACE: ws.workspace, PICLAW_STORE: ws.store, PICLAW_DATA: ws.data });
+
+  const db = await import("../../../src/db.js");
+  db.initDatabase();
+  db.getDb().exec("DELETE FROM message_media; DELETE FROM messages; DELETE FROM chats; DELETE FROM chat_cursors;");
+  db.storeChatMetadata("web:default", new Date().toISOString(), "Web");
+  const source = db.storeAcceptedChatMessageSource({
+    id: `msg-${crypto.randomUUID()}`,
+    chat_jid: "web:default",
+    sender: "user",
+    sender_name: "User",
+    content: "tool-only response",
+    timestamp: new Date().toISOString(),
+    is_from_me: false,
+    is_bot_message: false,
+  }).source;
+
+  const webMod = await import("../../../src/channels/web.js");
+  const web = new (webMod.WebChannel as any)({
+    queue: { enqueue: () => {} },
+    agentPool: {
+      setSessionBinder: () => {},
+      runAgent: async (_prompt: string, _chatJid: string, options: any) => {
+        const output = { status: "tool_complete" as const, result: null, attachments: [] };
+        expect(await options.onTerminalOutput?.(output)).toBe(true);
+        return output;
+      },
+      getContextUsageForChat: async () => null,
+    },
+  });
+
+  await web.processChat("web:default", "default");
+
+  const disposition = db.getChatOperationDisposition(source.sourceSeq);
+  expect(disposition).toMatchObject({ outcome: "tool_complete", cause: "provider_tool_complete" });
+  const botMessages = db.getTimeline("web:default", 10)
+    .filter((item: any) => item.data.type === "agent_response");
+  expect(botMessages).toHaveLength(1);
+  expect(String(botMessages[0].data.content || "")).toBe("");
+  expect(botMessages[0].data.content_blocks).toContainEqual(expect.objectContaining({
+    type: "turn_outcome_marker",
+    kind: "tool_complete",
+    draft_recovered: false,
+  }));
 });
 
 test("processChat publishes queued follow-up only after current turn completes", async () => {

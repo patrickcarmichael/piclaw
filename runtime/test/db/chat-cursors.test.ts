@@ -330,6 +330,41 @@ describe("chat preflight lifecycle", () => {
     expect(db.getChatPreflight(chatJid)).toBeNull();
   });
 
+  test("blocks only the processor that still owns legacy preflight", () => {
+    const chatJid = jid("preflight-compare-block");
+    const first = {
+      prevTs: "2024-03-22T00:00:00.000Z",
+      messageId: "msg-block-first",
+      startedAt: "2024-03-22T00:00:00.001Z",
+    };
+    const replacement = {
+      prevTs: first.prevTs,
+      messageId: "msg-block-replacement",
+      startedAt: "2024-03-22T00:00:00.002Z",
+    };
+    const failed = {
+      prevTs: first.prevTs,
+      failedTs: "2024-03-22T00:01:00.000Z",
+      messageId: first.messageId,
+      threadRootId: 42,
+      createdAt: "2024-03-22T00:01:01.000Z",
+    };
+
+    expect(db.beginChatPreflight(chatJid, first)).toBe(true);
+    expect(db.clearChatPreflight(chatJid, first)).toBe(true);
+    expect(db.beginChatPreflight(chatJid, replacement)).toBe(true);
+    expect(db.blockChatPreflightOwned(chatJid, first, failed)).toBe(false);
+    expect(db.getChatPreflight(chatJid)).toEqual({ chatJid, ...replacement });
+    expect(db.getFailedRun(chatJid)).toBeUndefined();
+
+    expect(db.blockChatPreflightOwned(chatJid, replacement, {
+      ...failed,
+      messageId: replacement.messageId,
+    })).toBe(true);
+    expect(db.getChatPreflight(chatJid)).toBeNull();
+    expect(db.getFailedRun(chatJid)).toMatchObject({ messageId: replacement.messageId, prevTs: replacement.prevTs });
+  });
+
   test("promotes only the processor that still owns preflight", () => {
     const chatJid = jid("preflight-compare-promote");
     const owner = {
