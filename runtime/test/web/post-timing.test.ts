@@ -67,7 +67,9 @@ test('terminal agent outcomes attach agent_timing content blocks', () => {
     resolve(repoRoot, 'runtime/src/channels/web/runtime/process-chat-streaming-runtime.ts'),
     'utf8',
   );
-  expect(handlerSource).toContain('streamRuntime.buildAgentTimingBlock(output.usage)');
+  expect(handlerSource).toContain('onTerminalOutput: (terminalOutput) =>');
+  expect(handlerSource).toContain('streamRuntime.buildAgentTimingBlock(terminalOutput.usage)');
+  expect(handlerSource).toContain('streamRuntime.buildAgentTimingBlock(options.usage)');
   expect(streamingRuntimeSource).toContain('type: "agent_timing"');
   expect(streamingRuntimeSource).toContain('buildAgentTimingBlock: (usage) =>');
 });
