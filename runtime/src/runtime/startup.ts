@@ -537,6 +537,8 @@ export function createSessionControlHandler(agentPool: AgentPool, web: WebChanne
       const steps: Record<string, unknown>[] = [];
       if (request.model?.trim()) {
         const resolved = agentPool.resolveModelInput(request.model.trim());
+        const modelNoOp = expectedNoOp();
+        if (modelNoOp) return modelNoOp;
         if (!resolved.model) throw new Error(resolved.error || `Invalid model: ${request.model}`);
         const { provider, modelId } = parseModelLabel(resolved.model);
         const result = await agentPool.applyControlCommand(target.chatJid, {

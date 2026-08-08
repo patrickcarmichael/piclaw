@@ -53,9 +53,12 @@ function createHarness(options: {
   agentName: string;
   active?: boolean;
   onSnapshot?: () => void;
+  onResolveModel?: () => void;
 }) {
   const abortCalls: Array<{ chatJid: string; expectedOperationId: string }> = [];
+  const modelCalls: Array<{ chatJid: string; command: unknown }> = [];
   const resumes: string[] = [];
+  let retryCalls = 0;
   let snapshotHook = options.onSnapshot;
   const agentPool = {
     async getAvailableModels() {
@@ -79,10 +82,18 @@ function createHarness(options: {
       const operation = getChatOperation(chatJid);
       return { status: "cancelled", operation, physicallyAborted: false };
     },
-    resolveModelInput() { return { model: null, error: "unused" }; },
+    resolveModelInput() {
+      options.onResolveModel?.();
+      return { model: "test/model" };
+    },
+    async applyControlCommand(chatJid: string, command: unknown) {
+      modelCalls.push({ chatJid, command });
+      return { status: "success", message: "model switched" };
+    },
   };
   const web = {
     retryFailedOnModelSwitch(chatJid: string) {
+      retryCalls += 1;
       const operation = getChatOperation(chatJid);
       if (!operation || operation.phase !== "blocked") return false;
       return retryBlockedChatOperation(chatJid, owner(operation)).status === "applied";
@@ -93,7 +104,9 @@ function createHarness(options: {
   return {
     handler: createSessionControlHandler(agentPool as any, web as any),
     abortCalls,
+    modelCalls,
     resumes,
+    get retryCalls() { return retryCalls; },
   };
 }
 
@@ -241,6 +254,84 @@ test("alias resolution cannot abort a successor that replaces the inspected oper
     target_agent_name: agentName,
   });
   expect(harness.abortCalls).toEqual([]);
+});
+
+test("unblock with a model cannot mutate after its alias is retargeted during model resolution", async () => {
+  const alias = `unblock-retarget-${serial + 1}`;
+  const original = createOperation(alias);
+  const replacement = createOperation(`unblock-replacement-${serial + 1}`);
+  const harness = createHarness({
+    chatJid: original.chatJid,
+    agentName: alias,
+    active: true,
+    onResolveModel() {
+      renameChatBranchIdentity({ chat_jid: original.chatJid, agent_name: `${alias}-old` });
+      renameChatBranchIdentity({ chat_jid: replacement.chatJid, agent_name: alias });
+    },
+  });
+
+  const result = await harness.handler({
+    action: "unblock",
+    source_chat_jid: "web:source",
+    target_agent_name: alias,
+    expected_operation_id: original.operation.operationId,
+    model: "test/model",
+  });
+
+  expect(result).toMatchObject({
+    status: "no_op",
+    reason: "target_changed",
+    observed_target_chat_jid: replacement.chatJid,
+  });
+  expect(harness.modelCalls).toEqual([]);
+  expect(harness.retryCalls).toBe(0);
+  expect(harness.abortCalls).toEqual([]);
+  expect(harness.resumes).toEqual([]);
+});
+
+test("unblock with a model cannot mutate after the expected operation is released or replaced", async () => {
+  for (const successor of [false, true]) {
+    const agentName = `unblock-owner-race-${serial + 1}`;
+    const current = createOperation(agentName, successor ? 2 : 1);
+    const harness = createHarness({
+      chatJid: current.chatJid,
+      agentName,
+      active: true,
+      onResolveModel() {
+        const cancelled = cancelChatOperation(current.chatJid, owner(current.operation), {
+          cause: "test_race",
+          requestedAt: "2026-08-08T09:10:00.000Z",
+        });
+        if (cancelled.status !== "applied") throw new Error("expected cancellation");
+        const completed = completeChatOperation(current.chatJid, {
+          owner: owner(cancelled.operation),
+          outcome: "cancelled",
+          cause: "test_race",
+          provenance: "test",
+          createdAt: "2026-08-08T09:10:01.000Z",
+        });
+        if (completed.status !== "completed") throw new Error("expected completion");
+        if (successor && !claimNextChatOperation(current.chatJid).operation) throw new Error("expected successor");
+      },
+    });
+
+    const result = await harness.handler({
+      action: "unblock",
+      source_chat_jid: "web:source",
+      target_agent_name: agentName,
+      expected_operation_id: current.operation.operationId,
+      model: "test/model",
+    });
+
+    expect(result).toMatchObject({
+      status: "no_op",
+      reason: successor ? "operation_mismatch" : "no_active_operation",
+    });
+    expect(harness.modelCalls).toEqual([]);
+    expect(harness.retryCalls).toBe(0);
+    expect(harness.abortCalls).toEqual([]);
+    expect(harness.resumes).toEqual([]);
+  }
 });
 
 test("unblock retries only the exact blocked operation and resumes it", async () => {
