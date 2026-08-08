@@ -36,12 +36,21 @@ describe("process chat preflight runtime", () => {
       storeChatMetadata(chatJid, prevCursor, "Web");
       let rotations = 0;
       let resumes = 0;
+      let sessionLaneHeld = false;
 
       const result = await runProcessChatPreflight({
         channel: {
           agentPool: {
-            runSessionMutation: async (_chatJid: string, _mutation: string, _request: unknown, action: (session: object) => unknown) => action({}),
+            runSessionMutation: async (_chatJid: string, _mutation: string, _request: unknown, action: (session: object) => unknown) => {
+              sessionLaneHeld = true;
+              try {
+                return await action({});
+              } finally {
+                sessionLaneHeld = false;
+              }
+            },
             emergencyRotateSession: async () => {
+              expect(sessionLaneHeld).toBe(true);
               rotations += 1;
               return { status: "success", message: "rotated" };
             },
@@ -122,11 +131,24 @@ describe("process chat preflight runtime", () => {
       let releaseCompaction!: () => void;
       const compactionGate = new Promise<void>((resolve) => { releaseCompaction = resolve; });
       let physicalCompactions = 0;
+      let rotations = 0;
       let resumes = 0;
+      let sessionLaneHeld = false;
       const channel = {
         agentPool: {
-          runSessionMutation: async (_chatJid: string, _mutation: string, _request: unknown, action: (session: object) => unknown) => action({}),
-          emergencyRotateSession: async () => ({ status: "success", message: "rotated" }),
+          runSessionMutation: async (_chatJid: string, _mutation: string, _request: unknown, action: (session: object) => unknown) => {
+            sessionLaneHeld = true;
+            try {
+              return await action({});
+            } finally {
+              sessionLaneHeld = false;
+            }
+          },
+          emergencyRotateSession: async () => {
+            expect(sessionLaneHeld).toBe(true);
+            rotations += 1;
+            return { status: "success", message: "rotated" };
+          },
         },
       } as any;
       const deps = {
@@ -145,7 +167,7 @@ describe("process chat preflight runtime", () => {
         effectiveThreadRootId: null,
         browserObservability: undefined,
         streamingHandler() {},
-        compactionState: { lastCompactionErrorMessage: null, lastCompactionSuppressed: false },
+        compactionState: { lastCompactionErrorMessage: "summary invalid", lastCompactionSuppressed: false },
         enqueueResume() { resumes += 1; },
         deps,
       };
@@ -164,12 +186,71 @@ describe("process chat preflight runtime", () => {
 
       releaseCompaction();
       await waitFor(() => resumes === 1, 250, 1);
+      expect(rotations).toBe(1);
       expect(getChatPreflight(chatJid)).toBeNull();
       expect(resumes).toBe(1);
     });
   });
 
-  test("legacy stale compare-clear preserves replacement owner and emits one generic wake", async () => {
+  test("foreground legacy replacement at compaction settlement prevents stale rotation and emits one generic wake", async () => {
+    await withTempWorkspaceEnv("preflight-runtime-foreground-replaced-", {}, async () => {
+      initDatabase();
+      const chatJid = "web:legacy-foreground-replaced";
+      const prevCursor = "2026-01-01T00:00:00.000Z";
+      const owner = {
+        prevTs: prevCursor,
+        messageId: "m-foreground-original",
+        startedAt: "2026-01-01T00:00:02.000Z",
+      };
+      const replacement = {
+        prevTs: prevCursor,
+        messageId: "m-foreground-replacement",
+        startedAt: "2026-01-01T00:00:03.000Z",
+      };
+      storeChatMetadata(chatJid, prevCursor, "Web");
+      let resumes = 0;
+      let rotations = 0;
+
+      const result = await runProcessChatPreflight({
+        channel: {
+          agentPool: {
+            runSessionMutation: async (_chatJid: string, _mutation: string, _request: unknown, action: (session: object) => unknown) => action({}),
+            emergencyRotateSession: async () => {
+              rotations += 1;
+              return { status: "success", message: "must not rotate" };
+            },
+          },
+        } as any,
+        chatJid,
+        agentId: "default",
+        message: { id: owner.messageId, timestamp: "2026-01-01T00:00:01.000Z" },
+        prevCursor,
+        effectiveThreadRootId: 42,
+        turnId: "turn-foreground-original",
+        runStartedAt: owner.startedAt,
+        streamingHandler() {},
+        compactionState: { lastCompactionErrorMessage: "summary invalid", lastCompactionSuppressed: false },
+        enqueueResume(root) {
+          expect(root).toBeUndefined();
+          resumes += 1;
+        },
+        deps: {
+          getForegroundMs: () => 100,
+          maybeAutoCompactSessionBeforePrompt: async () => {
+            expect(clearChatPreflight(chatJid, owner)).toBe(true);
+            expect(beginChatPreflight(chatJid, replacement)).toBe(true);
+          },
+        } as any,
+      });
+
+      expect(result).toBe("deferred");
+      expect(rotations).toBe(0);
+      expect(resumes).toBe(1);
+      expect(getChatPreflight(chatJid)).toEqual({ chatJid, ...replacement });
+    });
+  });
+
+  test("background legacy replacement prevents stale rotation and emits one generic wake", async () => {
     await withTempWorkspaceEnv("preflight-runtime-replaced-", {}, async () => {
       initDatabase();
       const chatJid = "web:legacy-replaced";
@@ -188,12 +269,16 @@ describe("process chat preflight runtime", () => {
       let release!: () => void;
       const gate = new Promise<void>((resolve) => { release = resolve; });
       let resumes = 0;
+      let rotations = 0;
 
       const result = await runProcessChatPreflight({
         channel: {
           agentPool: {
             runSessionMutation: async (_chatJid: string, _mutation: string, _request: unknown, action: (session: object) => unknown) => action({}),
-            emergencyRotateSession: async () => ({ status: "error", message: "replacement must survive" }),
+            emergencyRotateSession: async () => {
+              rotations += 1;
+              return { status: "error", message: "replacement must survive" };
+            },
           },
         } as any,
         chatJid,
@@ -220,6 +305,8 @@ describe("process chat preflight runtime", () => {
 
       release();
       await waitFor(() => resumes === 1, 250, 1);
+      expect(rotations).toBe(0);
+      expect(resumes).toBe(1);
       expect(getChatPreflight(chatJid)).toEqual({ chatJid, ...replacement });
     });
   });

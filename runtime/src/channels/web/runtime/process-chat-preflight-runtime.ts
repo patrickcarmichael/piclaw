@@ -11,6 +11,7 @@ import {
   blockChatPreflightOwned,
   clearChatPreflight,
   getChatOperation,
+  getChatPreflight,
   promoteChatOperation,
   promoteChatPreflightToInflight,
   type ChatOperationOwner,
@@ -31,6 +32,7 @@ interface ProcessChatPreflightDeps {
   beginChatPreflight: typeof beginChatPreflight;
   clearChatPreflight: typeof clearChatPreflight;
   blockChatPreflightOwned: typeof blockChatPreflightOwned;
+  getChatPreflight: typeof getChatPreflight;
   promoteChatPreflightToInflight: typeof promoteChatPreflightToInflight;
   maybeAutoCompactSessionBeforePrompt: typeof maybeAutoCompactSessionBeforePrompt;
   getForegroundMs: typeof getPrePromptCompactionForegroundMs;
@@ -40,6 +42,7 @@ const defaultDeps: ProcessChatPreflightDeps = {
   beginChatPreflight,
   clearChatPreflight,
   blockChatPreflightOwned,
+  getChatPreflight,
   promoteChatPreflightToInflight,
   maybeAutoCompactSessionBeforePrompt,
   getForegroundMs: getPrePromptCompactionForegroundMs,
@@ -77,6 +80,12 @@ export async function runProcessChatPreflight(options: {
     return "deferred";
   }
 
+  const ownerStillCurrent = (): boolean => {
+    const current = deps.getChatPreflight(chatJid);
+    return current?.prevTs === owner.prevTs
+      && current.messageId === owner.messageId
+      && current.startedAt === owner.startedAt;
+  };
   const releaseOwner = (): boolean => {
     const released = deps.clearChatPreflight(chatJid, owner);
     if (released) endTrackedPhase(chatJid);
@@ -116,23 +125,32 @@ export async function runProcessChatPreflight(options: {
   };
 
   beginTrackedPhase(chatJid, "preprompt_compaction", { source: "web.process_chat.preflight", messageId: options.message.id });
-  const compactionPromise = channel.agentPool.runSessionMutation(chatJid, "compaction", {}, (session) => (
-    deps.maybeAutoCompactSessionBeforePrompt(session, chatJid, {
+  let backgroundOwnsAttempt = false;
+  const compactionPromise = channel.agentPool.runSessionMutation(chatJid, "compaction", {}, async (session) => {
+    await deps.maybeAutoCompactSessionBeforePrompt(session, chatJid, {
       onInfo: (message, details) => log.info(message, withMetadata(details || {}, options.turnId, options.browserObservability)),
       onWarn: (message, details) => log.warn(message, withMetadata(details || {}, options.turnId, options.browserObservability)),
-    }, options.streamingHandler)
-  ));
+    }, options.streamingHandler);
+    if (!ownerStillCurrent()) return "ownership_lost" as const;
+    // emergencyRotateSession inherits this same gateway access, so the exact
+    // owner check and physical rotation stay inside one serialized lane.
+    return rotateIfNeeded(backgroundOwnsAttempt ? "background" : "foreground");
+  });
 
+  let rotation: "not_needed" | "succeeded" | "failed" | "ownership_lost";
   try {
     const outcome = await Promise.race([
-      compactionPromise.then(() => "done" as const),
-      Bun.sleep(deps.getForegroundMs()).then(() => "defer" as const),
+      compactionPromise.then((result) => ({ status: "done" as const, rotation: result })),
+      Bun.sleep(deps.getForegroundMs()).then(() => {
+        backgroundOwnsAttempt = true;
+        return { status: "defer" as const };
+      }),
     ]);
-    if (outcome === "defer") {
+    if (outcome.status === "defer") {
       void compactionPromise
-        .then(() => rotateIfNeeded("background"))
-        .then((rotation) => {
-          if (rotation === "failed") blockOwner();
+        .then((settledRotation) => {
+          if (settledRotation === "ownership_lost") return;
+          if (settledRotation === "failed") blockOwner();
           else releaseOwner();
         })
         .catch((error) => {
@@ -144,12 +162,16 @@ export async function runProcessChatPreflight(options: {
         });
       return "deferred";
     }
+    rotation = outcome.rotation;
   } catch (error) {
     releaseOwner();
     throw error;
   }
 
-  const rotation = await rotateIfNeeded("foreground");
+  if (rotation === "ownership_lost") {
+    options.enqueueResume(undefined);
+    return "deferred";
+  }
   if (rotation !== "not_needed") {
     if (rotation === "failed") blockOwner();
     else releaseOwner();
