@@ -658,6 +658,16 @@ function shouldPersistSteerRequest(req: Request, payload: { persist_steer?: bool
   return payload?.persist_steer === true || req.headers.get("X-Piclaw-Persist-Steer") === "1";
 }
 
+export interface AgentMessageAcceptance {
+  chat_jid: string;
+  row_id: number;
+  thread_id: number | null;
+  accepted_at: string;
+  created: true;
+}
+
+export type AgentMessageAcceptanceHandler = (acceptance: AgentMessageAcceptance) => void;
+
 /**
  * Handle a web `/agent/:agentId/message` request by storing user input and starting/queuing a run.
  * @param channel Web channel contract providing persistence, queueing, and broadcast helpers.
@@ -672,7 +682,8 @@ export async function handleAgentMessage(
   req: Request,
   pathname: string,
   chatJid: string,
-  defaultAgentId: string
+  defaultAgentId: string,
+  onAccepted?: AgentMessageAcceptanceHandler,
 ): Promise<Response> {
   const agentId = pathname.split("/")[2] || defaultAgentId;
   const browserObservability = getBrowserObservabilityContext(req);
@@ -768,7 +779,7 @@ export async function handleAgentMessage(
       }),
     });
 
-    const forwardRes = await handleAgentMessage(channel, forwardReq, pathname, mentionTarget.chat_jid, defaultAgentId);
+    const forwardRes = await handleAgentMessage(channel, forwardReq, pathname, mentionTarget.chat_jid, defaultAgentId, onAccepted);
     if (!forwardRes.ok) {
       return forwardRes;
     }
@@ -1123,6 +1134,15 @@ export async function handleAgentMessage(
   };
 
   let threadId = resolveThreadId(normalized.threadId, interaction.id);
+  onAccepted?.({
+    chat_jid: chatJid,
+    row_id: interaction.id,
+    // Busy steer handling may rethread this row onto the inflight root after
+    // acceptance, so do not expose the provisional self-root as final metadata.
+    thread_id: requestMode === "steer" ? null : threadId ?? null,
+    accepted_at: interaction.timestamp,
+    created: true,
+  });
 
   const identity = getIdentityConfig();
   const withAgentProfile = createAgentProfileBuilder(

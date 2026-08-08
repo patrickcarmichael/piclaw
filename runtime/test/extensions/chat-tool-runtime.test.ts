@@ -196,6 +196,234 @@ describe("direct chat tool runtime relay", () => {
     expect(result.source_agent_display_name).toBe("Smith");
   });
 
+  test("acknowledges a durable steer without waiting for the busy recipient handler to finish", async () => {
+    let releaseRecipient!: () => void;
+    const recipientGate = new Promise<void>((resolve) => { releaseRecipient = resolve; });
+    let handlerFinished = false;
+    const relay = createDirectChatToolRelayHandler(makeAgentPool(), {
+      handleAgentMessage: async (_req: Request, _pathname: string, onAccepted?: (value: unknown) => void) => {
+        onAccepted?.({ chat_jid: "web:target", row_id: 77, thread_id: 77, created: true });
+        await recipientGate;
+        handlerFinished = true;
+        return jsonResponse({ queued: "steer", row_id: 77, created: true }, 201);
+      },
+    } as any, {
+      ackTimeoutMs: 50,
+      getAgentDisplayName: () => "Smith",
+      getChatBranchByChatJid: () => null,
+      getChatBranchByAgentName: () => null,
+    } as any);
+
+    const result = await Promise.race([
+      relay({ source_chat_jid: "web:source", target_agent_name: "research", content: "act now", mode: "steer" }),
+      Bun.sleep(100).then(() => { throw new Error("sender stayed blocked"); }),
+    ]);
+    expect(result).toMatchObject({
+      status: "ok", relayed: true, target_chat_jid: "web:target", row_id: 77,
+      acknowledged: true, delivery_disposition: "accepted",
+    });
+    expect(handlerFinished).toBe(false);
+    releaseRecipient();
+    await Bun.sleep(0);
+  });
+
+  test("returns an explicit indeterminate result when durable acknowledgement times out", async () => {
+    const relay = createDirectChatToolRelayHandler(makeAgentPool(), {
+      handleAgentMessage: async () => await new Promise<Response>(() => {}),
+    }, {
+      ackTimeoutMs: 15,
+      getAgentDisplayName: () => "Smith",
+      getChatBranchByChatJid: () => null,
+      getChatBranchByAgentName: () => null,
+    } as any);
+
+    const result = await Promise.race([
+      relay({ source_chat_jid: "web:source", target_agent_name: "research", content: "uncertain", mode: "steer" }),
+      Bun.sleep(100).then(() => { throw new Error("relay timeout was unbounded"); }),
+    ]);
+    expect(result).toMatchObject({
+      status: "indeterminate", relayed: false, acknowledged: false, timed_out: true,
+      delivery_disposition: "indeterminate", target_chat_jid: "web:target",
+    });
+  });
+
+  test("deduplicates indeterminate retries by idempotency key and rejects conflicting reuse", async () => {
+    let handlerCalls = 0;
+    const relay = createDirectChatToolRelayHandler(makeAgentPool(), {
+      handleAgentMessage: async () => {
+        handlerCalls += 1;
+        return await new Promise<Response>(() => {});
+      },
+    }, {
+      ackTimeoutMs: 10,
+      getAgentDisplayName: () => "Smith",
+      getChatBranchByChatJid: () => null,
+      getChatBranchByAgentName: () => null,
+    } as any);
+    const request = {
+      source_chat_jid: "web:source", target_agent_name: "research", content: "once", mode: "steer",
+      idempotency_key: "relay-once",
+    } as any;
+
+    const first = await relay(request);
+    const retry = await relay(request);
+    expect(first).toMatchObject({ status: "indeterminate", timed_out: true });
+    expect(retry).toEqual(first);
+    expect(handlerCalls).toBe(1);
+    await expect(relay({ ...request, content: "different" })).rejects.toThrow("idempotency key");
+    expect(handlerCalls).toBe(1);
+  });
+
+  test("does not redeliver after acknowledged delivery later fails in recipient handling", async () => {
+    let handlerCalls = 0;
+    let rejectRecipient!: (error: Error) => void;
+    const relay = createDirectChatToolRelayHandler(makeAgentPool(), {
+      handleAgentMessage: async (_req, _pathname, onAccepted) => {
+        handlerCalls += 1;
+        onAccepted?.({ chat_jid: "web:target", row_id: 79, thread_id: 79, accepted_at: "now", created: true });
+        return await new Promise<Response>((_resolve, reject) => { rejectRecipient = reject; });
+      },
+    }, {
+      ackTimeoutMs: 10,
+      getAgentDisplayName: () => "Smith",
+      getChatBranchByChatJid: () => null,
+      getChatBranchByAgentName: () => null,
+    });
+    const request = {
+      source_chat_jid: "web:source", target_agent_name: "research", content: "accepted once", mode: "steer" as const,
+      idempotency_key: "accepted-then-failed",
+    };
+
+    const accepted = await relay(request);
+    rejectRecipient(new Error("recipient failed after persistence"));
+    await Bun.sleep(0);
+    expect(await relay(request)).toEqual(accepted);
+    expect(handlerCalls).toBe(1);
+  });
+
+  test("does not infer durable acceptance from an unacknowledged successful response", async () => {
+    const relay = createDirectChatToolRelayHandler(makeAgentPool(), {
+      handleAgentMessage: async () => jsonResponse({ row_id: 80, created: true }, 201),
+    }, {
+      ackTimeoutMs: 10,
+      getAgentDisplayName: () => "Smith",
+      getChatBranchByChatJid: () => null,
+      getChatBranchByAgentName: () => null,
+    });
+
+    const result = await relay({
+      source_chat_jid: "web:source", target_agent_name: "research", content: "no ack", mode: "steer",
+    });
+    expect(result).toMatchObject({
+      status: "indeterminate", relayed: false, acknowledged: false,
+      delivery_disposition: "indeterminate", row_id: 80,
+    });
+  });
+
+  test("allows an idempotent retry after deferred pre-acceptance failure", async () => {
+    let handlerCalls = 0;
+    let rejectFirst!: (error: Error) => void;
+    const relay = createDirectChatToolRelayHandler(makeAgentPool(), {
+      handleAgentMessage: async (_req, _pathname, onAccepted) => {
+        handlerCalls += 1;
+        if (handlerCalls === 1) {
+          return await new Promise<Response>((_resolve, reject) => { rejectFirst = reject; });
+        }
+        onAccepted?.({ chat_jid: "web:target", row_id: 80, thread_id: 80, accepted_at: "now", created: true });
+        return await new Promise<Response>(() => {});
+      },
+    }, {
+      ackTimeoutMs: 10,
+      getAgentDisplayName: () => "Smith",
+      getChatBranchByChatJid: () => null,
+      getChatBranchByAgentName: () => null,
+    });
+    const request = {
+      source_chat_jid: "web:source", target_agent_name: "research", content: "retry", mode: "steer" as const,
+      idempotency_key: "retry-after-failure",
+    };
+
+    expect(await relay(request)).toMatchObject({ status: "indeterminate", timed_out: true });
+    rejectFirst(new Error("failed before persistence"));
+    await Bun.sleep(0);
+    expect(await relay(request)).toMatchObject({
+      status: "ok", row_id: 80, acknowledged: true, delivery_disposition: "accepted",
+    });
+    expect(handlerCalls).toBe(2);
+  });
+
+  test("reconciles a late acknowledgement without redelivering an idempotent retry", async () => {
+    let handlerCalls = 0;
+    let accept!: (value: any) => void;
+    const relay = createDirectChatToolRelayHandler(makeAgentPool(), {
+      handleAgentMessage: async (_req, _pathname, onAccepted) => {
+        handlerCalls += 1;
+        accept = onAccepted!;
+        return await new Promise<Response>(() => {});
+      },
+    }, {
+      ackTimeoutMs: 10,
+      getAgentDisplayName: () => "Smith",
+      getChatBranchByChatJid: () => null,
+      getChatBranchByAgentName: () => null,
+    });
+    const request = {
+      source_chat_jid: "web:source", target_agent_name: "research", content: "once", mode: "steer" as const,
+      idempotency_key: "late-ack",
+    };
+
+    expect(await relay(request)).toMatchObject({ status: "indeterminate", timed_out: true });
+    accept({ chat_jid: "web:target", row_id: 81, thread_id: 81, accepted_at: "now", created: true });
+    expect(await relay(request)).toMatchObject({
+      status: "ok", row_id: 81, acknowledged: true, delivery_disposition: "accepted",
+    });
+    expect(handlerCalls).toBe(1);
+  });
+
+  test("keeps queue mode coupled to the recipient response", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const relay = createDirectChatToolRelayHandler(makeAgentPool(), {
+      handleAgentMessage: async (_req, _pathname, onAccepted) => {
+        onAccepted?.({ chat_jid: "web:target", row_id: 82, thread_id: 82, accepted_at: "now", created: true });
+        await gate;
+        return jsonResponse({ queued: "followup", row_id: 82, created: true }, 201);
+      },
+    }, {
+      ackTimeoutMs: 10,
+      getAgentDisplayName: () => "Smith",
+      getChatBranchByChatJid: () => null,
+      getChatBranchByAgentName: () => null,
+    });
+
+    const pending = relay({ source_chat_jid: "web:source", target_agent_name: "research", content: "later", mode: "queue" });
+    const returnedEarly = await Promise.race([pending.then(() => true), Bun.sleep(15).then(() => false)]);
+    expect(returnedEarly).toBe(false);
+    release();
+    expect(await pending).toMatchObject({ status: "ok", relayed: true, queued: "followup" });
+  });
+
+  test("reports cancellation before acknowledgement as indeterminate delivery", async () => {
+    const controller = new AbortController();
+    const relay = createDirectChatToolRelayHandler(makeAgentPool(), {
+      handleAgentMessage: async () => await new Promise<Response>(() => {}),
+    }, {
+      ackTimeoutMs: 100,
+      getAgentDisplayName: () => "Smith",
+      getChatBranchByChatJid: () => null,
+      getChatBranchByAgentName: () => null,
+    });
+    controller.abort();
+
+    const result = await relay({
+      source_chat_jid: "web:source", target_agent_name: "research", content: "cancel", mode: "steer",
+      signal: controller.signal,
+    });
+    expect(result).toMatchObject({
+      status: "cancelled", relayed: false, acknowledged: false, delivery_disposition: "cancelled",
+    });
+  });
+
   test("rejects unknown destinations instead of routing to unverified chats", async () => {
     const relay = createDirectChatToolRelayHandler(makeAgentPool({
       listKnownChats: () => [{ chat_jid: "web:source", agent_name: "source-handle" }],

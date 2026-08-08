@@ -173,6 +173,8 @@ describe("chat tool extension", () => {
       target_address: "@research",
       content: "hello",
       mode: "auto",
+      idempotency_key: " local-once ",
+      in_reply_to: " local-parent ",
     }));
 
     expect(calls).toEqual([{
@@ -180,6 +182,8 @@ describe("chat tool extension", () => {
       target_agent_name: "research",
       content: "hello",
       mode: "auto",
+      idempotency_key: "local-once",
+      in_reply_to: "local-parent",
     }]);
     expect(result.details).toMatchObject({
       relayed: true,
