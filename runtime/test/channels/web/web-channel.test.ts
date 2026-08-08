@@ -3030,6 +3030,86 @@ test("processChat persists orphan Responses output errors with visible session-r
   }));
 });
 
+test("processChat explains a zero-attempt loop-guard suppression instead of calling recovery exhausted", async () => {
+  const ws = createTempWorkspace("piclaw-web-channel-");
+  cleanupWorkspace = ws.cleanup;
+  restoreEnv = setEnv({ PICLAW_WORKSPACE: ws.workspace, PICLAW_STORE: ws.store, PICLAW_DATA: ws.data });
+
+  const db = await import("../../../src/db.js");
+  db.initDatabase();
+  db.getDb().exec("DELETE FROM message_media; DELETE FROM messages; DELETE FROM chats; DELETE FROM chat_cursors;");
+  db.storeChatMetadata("web:default", new Date().toISOString(), "Web");
+  db.storeMessage({
+    id: `msg-${Math.random()}`,
+    chat_jid: "web:default",
+    sender: "user",
+    sender_name: "User",
+    content: "continue",
+    timestamp: new Date().toISOString(),
+    is_from_me: false,
+    is_bot_message: false,
+  });
+
+  const suppressionReason = "Automatic recovery suppressed after 3 repeated failures within 10 minute(s).";
+  const webMod = await import("../../../src/channels/web.js");
+  const web = new (webMod.WebChannel as any)({
+    queue: { enqueue: () => {} },
+    agentPool: {
+      setSessionBinder: () => {},
+      runAgent: async () => ({
+        status: "error",
+        failureCategory: "context_pressure",
+        error: "The operation was aborted.",
+        result: null,
+        attachments: [],
+        recovery: {
+          attemptsUsed: 0,
+          totalElapsedMs: 1000,
+          recovered: false,
+          exhausted: true,
+          lastClassifier: "recovery_suppressed",
+          strategyHistory: [],
+          diagnostics: [{
+            phase: "attempt_failure",
+            attempt: 1,
+            classifier: "recovery_suppressed",
+            strategy: null,
+            reason: suppressionReason,
+            error: "The operation was aborted.",
+            elapsedMs: 1000,
+            hadToolActivity: true,
+            hadPartialOutput: false,
+            hadCompletedTurnOutput: false,
+            hadTerminalTurnOutput: false,
+            hasUnresolvedToolExecution: false,
+            sawCompactionIntent: true,
+            compactionErrorMessage: null,
+          }],
+        },
+      }),
+      getContextUsageForChat: async () => null,
+    },
+  });
+
+  await web.processChat("web:default", "default");
+
+  const timeline = db.getTimeline("web:default", 10);
+  const botMessages = timeline.filter((item: any) => item.data.type === "agent_response");
+  expect(botMessages).toHaveLength(1);
+  expect(botMessages[0].data.content).toContain("Automatic recovery suppressed");
+  expect(botMessages[0].data.content).toContain(suppressionReason);
+  expect(botMessages[0].data.content).not.toContain("Automatic recovery exhausted");
+  expect(JSON.stringify(botMessages[0].data.content_blocks)).not.toContain("Automatic recovery exhausted");
+  expect(botMessages[0].data.content_blocks).toContainEqual(expect.objectContaining({
+    type: "turn_outcome_marker",
+    kind: "recovery",
+    title: "Automatic recovery suppressed",
+    detail: suppressionReason,
+    attempts_used: 0,
+    classifier: "recovery_suppressed",
+  }));
+});
+
 test("processChat persists raw abort errors as visible outcome markers", async () => {
   const ws = createTempWorkspace("piclaw-web-channel-");
   cleanupWorkspace = ws.cleanup;

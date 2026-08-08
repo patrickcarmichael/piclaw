@@ -45,6 +45,8 @@ const RECOVERY_FINALIZATION_RESERVE_RATIO = 0.15;
 interface RecoveryFailureSignatureRecord {
   atMs: number;
   signature: string;
+  turnId: string | null;
+  grantedFirstRuntimeContextCompaction: boolean;
 }
 
 const recentRecoveryFailuresByChat = new Map<string, RecoveryFailureSignatureRecord[]>();
@@ -167,6 +169,9 @@ export function shouldSuppressRecoveryLoop(options: {
   failureCategory: AgentFailureCategory;
   classifier: RecoveryClassifier;
   strategy: RecoveryStrategy;
+  recoveryAttemptsUsed: number;
+  sawCompactionIntent: boolean;
+  turnId?: string | null;
   now?: number;
 }): { suppress: boolean; attemptsInWindow: number; windowMs: number } {
   const recoveryPolicy = getRecoveryPolicyConfig();
@@ -187,16 +192,40 @@ export function shouldSuppressRecoveryLoop(options: {
 
   const current = recentRecoveryFailuresByChat.get(options.chatJid) ?? [];
   const filtered = current.filter((entry) => (now - entry.atMs) <= windowMs);
-  filtered.push({ atMs: now, signature });
+  const turnId = options.turnId?.trim() || null;
+  const eligibleFirstRuntimeContextCompaction = turnId !== null
+    && options.recoveryAttemptsUsed === 0
+    && options.sawCompactionIntent
+    && options.failureCategory === "context_pressure"
+    && options.classifier === "context_pressure"
+    && options.strategy === "compact_then_retry";
+  const firstRuntimeContextCompactionAlreadyGranted = eligibleFirstRuntimeContextCompaction
+    && filtered.some((entry) => entry.turnId === turnId && entry.grantedFirstRuntimeContextCompaction);
+  const grantFirstRuntimeContextCompaction = eligibleFirstRuntimeContextCompaction
+    && !firstRuntimeContextCompactionAlreadyGranted;
+
+  filtered.push({
+    atMs: now,
+    signature,
+    turnId,
+    grantedFirstRuntimeContextCompaction: grantFirstRuntimeContextCompaction,
+  });
   recentRecoveryFailuresByChat.set(options.chatJid, filtered.slice(-200));
 
   const attemptsInWindow = filtered.filter((entry) => entry.signature === signature).length;
   const maxFailures = Math.max(1, recoveryPolicy.loopGuardMaxFailures);
   return {
-    suppress: attemptsInWindow >= maxFailures,
+    // A runtime-requested mid-turn compaction gets one recorded grace per
+    // stable turn. Later failures and one-shot protected continuations carry
+    // the same turn ID, so the ordinary cross-run threshold still bounds them.
+    suppress: !grantFirstRuntimeContextCompaction && attemptsInWindow >= maxFailures,
     attemptsInWindow,
     windowMs,
   };
+}
+
+export function resetRecoveryLoopGuardForTests(): void {
+  recentRecoveryFailuresByChat.clear();
 }
 
 export function shouldDisableToolsForRecoveryAttempt(
@@ -764,6 +793,9 @@ export async function runAgentRecoveryPhase(options: RunAgentRecoveryPhaseOption
         failureCategory,
         classifier: decision.classifier,
         strategy: decision.strategy,
+        recoveryAttemptsUsed,
+        sawCompactionIntent: Boolean(attempt.snapshot.sawCompactionIntent),
+        turnId: runOptions.turnId,
       });
       if (guard.suppress) {
         effectiveDecision = {
@@ -820,12 +852,16 @@ export async function runAgentRecoveryPhase(options: RunAgentRecoveryPhaseOption
         : null;
       writeAgentLog(options.logsDir, chatJid, duration, false, null, finalErrorText, recoveryMeta);
       if (recoveryAttemptsUsed > 0 || effectiveDecision.classifier === "recovery_suppressed") {
+        const recoverySuppressedReason = effectiveDecision.classifier === "recovery_suppressed"
+          ? effectiveDecision.reason
+          : null;
         emitAgentSessionEvent(runOptions.onEvent, {
           type: "recovery_end",
           outcome: "exhausted",
           attemptsUsed: recoveryAttemptsUsed,
           classifier: finalClassifier ?? effectiveDecision.classifier,
-          errorMessage: finalErrorText,
+          errorMessage: recoverySuppressedReason ?? finalErrorText,
+          ...(recoverySuppressedReason ? { recoverySuppressedReason } : {}),
         });
       }
       if (recoveryMeta) {

@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
-import "../helpers.js";
+import { setEnv } from "../helpers.js";
 
 import {
   buildRecoveryDiagnosticEntry,
+  resetRecoveryLoopGuardForTests,
   runAgentRecoveryPhase,
+  shouldSuppressRecoveryLoop,
   type PromptAttemptResult,
   type SessionWithToolControl,
 } from "../../src/agent-pool/run-agent-recovery-phase.js";
@@ -24,6 +26,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  resetRecoveryLoopGuardForTests();
   for (const chatJid of TEST_CHAT_JIDS) endTrackedPhase(chatJid);
 });
 
@@ -62,6 +65,59 @@ function recoveryConfig(overrides: Partial<Parameters<typeof runAgentRecoveryPha
     ...overrides,
   };
 }
+
+test("recovery loop guard grants one recorded runtime context compaction per stable turn", () => {
+  const restoreEnv = setEnv({
+    PICLAW_RECOVERY_LOOP_GUARD_ENABLED: "1",
+    PICLAW_RECOVERY_LOOP_GUARD_MAX_FAILURES: "2",
+    PICLAW_RECOVERY_LOOP_GUARD_WINDOW_MS: "600000",
+  });
+  const common = {
+    chatJid: "web:test-context-pressure-loop-guard",
+    modelLabel: "test/model",
+    failureCategory: "context_pressure" as const,
+    classifier: "context_pressure" as const,
+    strategy: "compact_then_retry" as const,
+    sawCompactionIntent: true,
+    now: 1_000,
+  };
+
+  try {
+    expect(shouldSuppressRecoveryLoop({
+      ...common,
+      turnId: "turn-previous-protected-handoff",
+      recoveryAttemptsUsed: 0,
+    })).toMatchObject({ suppress: false, attemptsInWindow: 1 });
+    expect(shouldSuppressRecoveryLoop({
+      ...common,
+      turnId: "turn-previous-protected-handoff",
+      recoveryAttemptsUsed: 1,
+      now: 1_001,
+    })).toMatchObject({ suppress: true, attemptsInWindow: 2 });
+
+    expect(shouldSuppressRecoveryLoop({
+      ...common,
+      turnId: "turn-new-mid-turn-pressure",
+      recoveryAttemptsUsed: 0,
+      now: 1_002,
+    })).toMatchObject({ suppress: false, attemptsInWindow: 3 });
+    expect(shouldSuppressRecoveryLoop({
+      ...common,
+      turnId: "turn-new-mid-turn-pressure",
+      recoveryAttemptsUsed: 0,
+      now: 1_003,
+    })).toMatchObject({ suppress: true, attemptsInWindow: 4 });
+    expect(shouldSuppressRecoveryLoop({
+      ...common,
+      turnId: "turn-provider-context-error",
+      recoveryAttemptsUsed: 0,
+      sawCompactionIntent: false,
+      now: 1_004,
+    })).toMatchObject({ suppress: true, attemptsInWindow: 5 });
+  } finally {
+    restoreEnv();
+  }
+});
 
 describe("runAgentRecoveryPhase", () => {
   test("does not begin or retry an attempt after operation cancellation", async () => {

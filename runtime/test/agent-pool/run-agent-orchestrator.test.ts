@@ -17,7 +17,12 @@ import {
   runAgentPrompt,
 } from "../../src/agent-pool/run-agent-orchestrator.js";
 import { getAgentAbortCause, recordAgentAbortCause, resetAgentAbortProvenanceForTests } from "../../src/agent-pool/abort-provenance.js";
-import { getRecoveryFinalizationReserveMs } from "../../src/agent-pool/run-agent-recovery-phase.js";
+import {
+  getRecoveryFinalizationReserveMs,
+  resetRecoveryLoopGuardForTests,
+  shouldSuppressRecoveryLoop,
+} from "../../src/agent-pool/run-agent-recovery-phase.js";
+import { runWithProtectedRecoveryHandoff } from "../../src/agent-pool/protected-recovery-handoff.js";
 import { RECOVERY_CONTINUATION_PROMPT } from "../../src/agent-pool/context-pressure-retry.js";
 import { getSshConfig, initDatabase, setChatAutoCompactionWindow, upsertSshConfig } from "../../src/db.js";
 import {
@@ -84,6 +89,7 @@ function createTestLogsDir(): string {
 afterEach(() => {
   resetProgressWatchdogForTests();
   resetAgentAbortProvenanceForTests();
+  resetRecoveryLoopGuardForTests();
   setSshConnectionResolverForTests(null);
   while (tempLogsDirs.length > 0) {
     const logsDir = tempLogsDirs.pop();
@@ -2395,6 +2401,140 @@ test("runAgentPrompt recovers a timeout-before-finalization when compaction was 
     expect(session.promptCalls).toBe(2);
     expect(session.compactCalls).toBe(1);
     expect(recoveryStarts).toEqual([{ classifier: "context_pressure", strategy: "compact_then_retry" }]);
+  } finally {
+    restoreEnv();
+  }
+});
+
+test("mid-turn tool-result context pressure gets one compaction and ordinary retry after prior protected recovery history", async () => {
+  initDatabase();
+  const restoreEnv = setEnv({
+    PICLAW_TURN_AUTO_RECOVERY_ENABLED: "1",
+    PICLAW_TURN_AUTO_RECOVERY_MAX_ATTEMPTS: "1",
+    PICLAW_TURN_AUTO_RECOVERY_TOTAL_BUDGET_MS: "30000",
+    PICLAW_RECOVERY_LOOP_GUARD_ENABLED: "1",
+    PICLAW_RECOVERY_LOOP_GUARD_MAX_FAILURES: "2",
+    PICLAW_RECOVERY_LOOP_GUARD_WINDOW_MS: "600000",
+    PICLAW_COMPACTION_THRESHOLD_PERCENT: "50",
+    PICLAW_COMPACTION_MAX_THRESHOLD_TOKENS: "0",
+  });
+  const chatJid = "web:mid-turn-context-pressure-after-protected-handoff";
+
+  class MidTurnContextPressureSession {
+    private listeners: Array<(event: any) => void> = [];
+    private usageTokens = 45_000;
+    private activeTools = ["read"];
+    sessionManager = {
+      getLeafId: () => "leaf-mid-turn-context-pressure",
+      buildSessionContext: () => ({ messages: [{ role: "user", content: "inspect a large result" }] }),
+    };
+    model = { provider: "test", id: "context-pressure", contextWindow: 100_000 };
+    isStreaming = false;
+    isCompacting = false;
+    isRetrying = false;
+    promptCalls = 0;
+    compactCalls = 0;
+    abortCalls = 0;
+    getContextUsage = () => ({ tokens: this.usageTokens });
+    getActiveToolNames = () => [...this.activeTools];
+    setActiveToolsByName = (names: string[]) => { this.activeTools = [...names]; };
+    subscribe(listener: (event: any) => void) {
+      this.listeners.push(listener);
+      return () => { this.listeners = this.listeners.filter((entry) => entry !== listener); };
+    }
+    async compact() {
+      this.compactCalls += 1;
+      this.usageTokens = 10_000;
+    }
+    async abort() {
+      this.abortCalls += 1;
+    }
+    async prompt() {
+      this.promptCalls += 1;
+      if (this.promptCalls === 1) {
+        for (const listener of this.listeners) {
+          listener({
+            type: "message_end",
+            message: {
+              role: "assistant",
+              content: [{ type: "toolCall", id: "tool-large", name: "read" }],
+              stopReason: "toolUse",
+              usage: { inputTokens: this.usageTokens },
+            },
+          });
+          listener({ type: "tool_execution_start", toolCallId: "tool-large", toolName: "read" });
+          listener({
+            type: "tool_execution_end",
+            toolCallId: "tool-large",
+            toolName: "read",
+            isError: false,
+            result: { content: [{ type: "text", text: "x".repeat(40_000) }] },
+          });
+        }
+        return;
+      }
+      const text = "ordinary continuation completed";
+      for (const listener of this.listeners) {
+        listener({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: text } });
+        listener({ type: "message_end", message: createAssistantMessage(text) });
+      }
+    }
+  }
+
+  try {
+    expect(shouldSuppressRecoveryLoop({
+      chatJid,
+      modelLabel: "test/context-pressure",
+      failureCategory: "context_pressure",
+      classifier: "context_pressure",
+      strategy: "compact_then_retry",
+      recoveryAttemptsUsed: 0,
+      sawCompactionIntent: true,
+      turnId: "turn-previous-protected-handoff",
+    })).toMatchObject({ suppress: false, attemptsInWindow: 1 });
+
+    const session = new MidTurnContextPressureSession();
+    const warnings: Array<Record<string, unknown>> = [];
+    const events: Array<Record<string, unknown>> = [];
+    const turnCoordinator = new AgentTurnCoordinator({
+      takeAttachments: () => [],
+      touchSession: () => {},
+      recordMessageUsage: () => {},
+    });
+    const options = {
+      timeoutMs: 0,
+      skipPrePromptCompaction: true,
+      turnId: "turn-current-mid-turn-context-pressure",
+      onEvent: (event: any) => events.push(event),
+    };
+    const result = await runWithProtectedRecoveryHandoff(
+      "inspect",
+      options,
+      (prompt, runOptions) => runAgentPrompt(prompt, chatJid, runOptions, {
+        getOrCreateRuntime: async () => createRuntime(session) as any,
+        turnCoordinator,
+        clearAttachments: () => {},
+        takeAttachments: () => [],
+        logsDir: createTestLogsDir(),
+        setActiveForkBaseLeaf: () => {},
+        clearActiveForkBaseLeaf: () => {},
+        onWarn: (_message, details) => warnings.push(details),
+      }),
+    );
+
+    expect(result).toMatchObject({ status: "success", result: "ordinary continuation completed" });
+    expect(session.promptCalls).toBe(2);
+    expect(session.compactCalls).toBe(1);
+    expect(session.abortCalls).toBe(1);
+    expect(warnings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ operation: "run_agent.mid_turn_context_pressure" }),
+    ]));
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "recovery_start", attempt: 1, classifier: "context_pressure", strategy: "compact_then_retry" }),
+    ]));
+    expect(events).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "recovery_end", classifier: "recovery_suppressed", attemptsUsed: 0 }),
+    ]));
   } finally {
     restoreEnv();
   }
