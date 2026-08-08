@@ -7,6 +7,10 @@
  * chat with a structured reply-to descriptor.
  */
 import type { AgentPool } from "../agent-pool.js";
+import type {
+  AgentMessageAcceptance,
+  AgentMessageAcceptanceHandler,
+} from "../channels/web/messaging/agent-message-acceptance.js";
 import { getIdentityConfig } from "../core/config.js";
 import { getChatBranchByAgentName, getChatBranchByChatJid } from "../db.js";
 import { createLogger, debugSuppressedError } from "../utils/logger.js";
@@ -36,7 +40,11 @@ type ChatBranchLike = {
 type ChatToolRelayAgentPool = Pick<AgentPool, "findChatByAgentName" | "getAgentHandleForChat" | "listActiveChats" | "listKnownChats">;
 
 type DirectChatToolRelayWeb = {
-  handleAgentMessage?: (req: Request, pathname: string) => Promise<Response>;
+  handleAgentMessage?: (
+    req: Request,
+    pathname: string,
+    onAccepted?: AgentMessageAcceptanceHandler,
+  ) => Promise<Response>;
   handleRequest?: (req: Request) => Promise<Response>;
 };
 
@@ -45,6 +53,10 @@ type DirectChatToolRelayOptions = {
   getAgentDisplayName?: () => string | null | undefined;
   getChatBranchByChatJid?: (chatJid: string) => ChatBranchLike | null;
   getChatBranchByAgentName?: (agentName: string) => ChatBranchLike | null;
+  ackTimeoutMs?: number;
+  idempotencyMaxEntries?: number;
+  idempotencyRetentionMs?: number;
+  now?: () => number;
 };
 
 function fallbackPeerAgentHandle(chatJid: string): string {
@@ -218,6 +230,26 @@ export function createDirectChatToolRelayHandler(
   options: DirectChatToolRelayOptions = {},
 ): (request: ChatRelayRequest) => Promise<ChatRelayResult> {
   const defaultAgentId = options.defaultAgentId || "default";
+  const ackTimeoutMs = Math.max(1, Math.floor(options.ackTimeoutMs ?? 5_000));
+  const idempotencyMaxEntries = Math.max(1, Math.floor(options.idempotencyMaxEntries ?? 1_024));
+  const idempotencyRetentionMs = Math.max(1, Math.floor(options.idempotencyRetentionMs ?? 10 * 60_000));
+  const now = options.now ?? Date.now;
+  type IdempotentAttempt = {
+    fingerprint: string;
+    promise: Promise<ChatRelayResult>;
+    latestResult?: ChatRelayResult;
+    settledAt?: number;
+  };
+  const idempotentAttempts = new Map<string, IdempotentAttempt>();
+  const pruneExpiredIdempotentAttempts = () => {
+    const cutoff = now() - idempotencyRetentionMs;
+    for (const [key, attempt] of idempotentAttempts) {
+      if (attempt.settledAt !== undefined && attempt.settledAt <= cutoff) {
+        idempotentAttempts.delete(key);
+      }
+    }
+  };
+
   return async (request) => {
     const displayName = getRuntimeAgentDisplayName(options);
     const source = resolveChatIdentity(agentPool, request.source_chat_jid, displayName, {
@@ -234,61 +266,316 @@ export function createDirectChatToolRelayHandler(
     }
     if (source.chat_jid === target.chat_jid) throw new Error("source_chat_jid and target chat must differ");
 
+    const mode = normalizeMode(request.mode);
     const content = request.content.trim();
-    const replyTo = buildReplyToDescriptor(source);
-    const contentBlocks = [buildPeerRelayBlock({ source, target, body: content })];
-    const pathname = `/agent/${defaultAgentId}/message`;
-    const headers = new Headers({
-      "Content-Type": "application/json",
-      "Reply-To": `@${source.agent_name} <jid:${source.chat_jid}>`,
-      "X-Piclaw-Source-Chat-Jid": source.chat_jid,
-      "X-Piclaw-Source-Agent-Name": source.agent_name,
-      "X-Piclaw-Reply-To-Chat-Jid": source.chat_jid,
-      "X-Piclaw-Persist-Steer": "1",
+    const idempotencyKey = request.idempotency_key?.trim() || "";
+    const cacheKey = idempotencyKey ? `${source.chat_jid}\0${idempotencyKey}` : "";
+    const fingerprint = JSON.stringify({
+      target_chat_jid: target.chat_jid,
+      content,
+      mode,
+      in_reply_to: request.in_reply_to?.trim() || null,
     });
-    const forwardReq = new Request(
-      `http://internal${pathname}?chat_jid=${encodeURIComponent(target.chat_jid)}`,
-      {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          content: buildForwardedContent(source, target, content),
-          content_blocks: contentBlocks,
-          mode: normalizeMode(request.mode),
-          persist_steer: true,
-        }),
-      },
-    );
-
-    const forwardRes = typeof web.handleAgentMessage === "function"
-      ? await web.handleAgentMessage(forwardReq, pathname)
-      : await web.handleRequest?.(forwardReq);
-    if (!forwardRes) throw new Error("Cross-session chat relay is unavailable in this runtime.");
-    if (!forwardRes.ok) {
-      const body = await forwardRes.json().catch(() => ({} as Record<string, unknown>));
-      const message = typeof body.error === "string" ? body.error : `Cross-session chat relay failed (${forwardRes.status}).`;
-      throw new Error(message);
+    if (cacheKey) pruneExpiredIdempotentAttempts();
+    const existing = cacheKey ? idempotentAttempts.get(cacheKey) : undefined;
+    if (existing) {
+      if (existing.fingerprint !== fingerprint) {
+        throw new Error(`The idempotency key "${idempotencyKey}" was already used for a different chat relay request.`);
+      }
+      return existing.latestResult ?? existing.promise;
+    }
+    if (cacheKey && idempotentAttempts.size >= idempotencyMaxEntries) {
+      log.warn("Cross-session chat idempotency capacity is exhausted.", {
+        operation: "chat_tool_relay.idempotency_capacity_exhausted",
+        sourceChatJid: source.chat_jid,
+        targetChatJid: target.chat_jid,
+        idempotencyMaxEntries,
+      });
+      throw new Error(
+        `Cross-session chat idempotency capacity (${idempotencyMaxEntries}) is exhausted; ` +
+        "retry an existing idempotency_key after unresolved deliveries settle.",
+      );
     }
 
-    const responseBody = await forwardRes.json().catch(() => ({} as Record<string, unknown>));
-    const rowId = readForwardedMessageRowId(responseBody);
-    const created = readForwardedCreated(responseBody);
-    return {
-      status: "ok",
-      ...responseBody,
-      ...(rowId ? { row_id: rowId } : {}),
-      ...(created !== undefined ? { created } : {}),
-      source_chat_jid: source.chat_jid,
-      source_agent_name: source.agent_name,
-      source_agent_display_name: source.agent_display_name,
-      target_chat_jid: target.chat_jid,
-      target_agent_name: target.agent_name,
-      target_agent_display_name: target.agent_display_name,
-      reply_to: replyTo,
-      source_session_tree: buildSessionTreeDescriptor(source),
-      target_session_tree: buildSessionTreeDescriptor(target),
-      relayed: true,
+    let entry: IdempotentAttempt | undefined;
+
+    const deliver = async (): Promise<ChatRelayResult> => {
+      const replyTo = buildReplyToDescriptor(source);
+      const resultIdentity = {
+        source_chat_jid: source.chat_jid,
+        source_agent_name: source.agent_name,
+        source_agent_display_name: source.agent_display_name,
+        target_chat_jid: target.chat_jid,
+        target_agent_name: target.agent_name,
+        target_agent_display_name: target.agent_display_name,
+        reply_to: replyTo,
+        source_session_tree: buildSessionTreeDescriptor(source),
+        target_session_tree: buildSessionTreeDescriptor(target),
+        ...(idempotencyKey ? { idempotency_key: idempotencyKey } : {}),
+      };
+      const contentBlocks = [buildPeerRelayBlock({ source, target, body: content })];
+      const pathname = `/agent/${defaultAgentId}/message`;
+      const headers = new Headers({
+        "Content-Type": "application/json",
+        "Reply-To": `@${source.agent_name} <jid:${source.chat_jid}>`,
+        "X-Piclaw-Source-Chat-Jid": source.chat_jid,
+        "X-Piclaw-Source-Agent-Name": source.agent_name,
+        "X-Piclaw-Reply-To-Chat-Jid": source.chat_jid,
+        "X-Piclaw-Persist-Steer": "1",
+      });
+      if (idempotencyKey) headers.set("X-Piclaw-Idempotency-Key", idempotencyKey);
+      const forwardReq = new Request(
+        `http://internal${pathname}?chat_jid=${encodeURIComponent(target.chat_jid)}`,
+        {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            content: buildForwardedContent(source, target, content),
+            content_blocks: contentBlocks,
+            mode,
+            persist_steer: true,
+          }),
+        },
+      );
+
+      const responseResult = async (forwardRes: Response): Promise<ChatRelayResult> => {
+        if (!forwardRes.ok) {
+          const body = await forwardRes.json().catch(() => ({} as Record<string, unknown>));
+          const message = typeof body.error === "string" ? body.error : `Cross-session chat relay failed (${forwardRes.status}).`;
+          log.warn("Cross-session chat relay was rejected before acceptance.", {
+            operation: "chat_tool_relay.rejected",
+            sourceChatJid: source.chat_jid,
+            targetChatJid: target.chat_jid,
+            status: forwardRes.status,
+            idempotencyKey: idempotencyKey || undefined,
+          });
+          throw new Error(message);
+        }
+
+        const responseBody = await forwardRes.json().catch(() => ({} as Record<string, unknown>));
+        const rowId = readForwardedMessageRowId(responseBody);
+        const created = readForwardedCreated(responseBody);
+        return {
+          status: "ok",
+          ...responseBody,
+          ...(rowId ? { row_id: rowId } : {}),
+          ...(created !== undefined ? { created } : {}),
+          ...resultIdentity,
+          relayed: true,
+        };
+      };
+
+      if (mode !== "steer") {
+        const forwardRes = typeof web.handleAgentMessage === "function"
+          ? await web.handleAgentMessage(forwardReq, pathname)
+          : await web.handleRequest?.(forwardReq);
+        if (!forwardRes) throw new Error("Cross-session chat relay is unavailable in this runtime.");
+        return await responseResult(forwardRes);
+      }
+
+      let terminalDisposition: "pending" | "accepted" | "indeterminate" | "cancelled" | "rejected" = "pending";
+      let resolveAcceptance!: (acceptance: AgentMessageAcceptance) => void;
+      const acceptancePromise = new Promise<AgentMessageAcceptance>((resolve) => {
+        resolveAcceptance = resolve;
+      });
+      const onAccepted: AgentMessageAcceptanceHandler = (acceptance) => {
+        const acceptedResult: ChatRelayResult = {
+          status: "ok",
+          ...resultIdentity,
+          row_id: acceptance.row_id,
+          thread_id: acceptance.thread_id,
+          accepted_at: acceptance.accepted_at,
+          created: acceptance.created,
+          relayed: true,
+          acknowledged: true,
+          delivery_disposition: "accepted",
+        };
+        if (entry) {
+          entry.latestResult = acceptedResult;
+          entry.settledAt ??= now();
+        }
+        log.info("Cross-session steer received durable target acceptance.", {
+          operation: terminalDisposition === "pending"
+            ? "chat_tool_relay.acknowledged"
+            : "chat_tool_relay.late_acknowledged",
+          sourceChatJid: source.chat_jid,
+          targetChatJid: target.chat_jid,
+          rowId: acceptance.row_id,
+          idempotencyKey: idempotencyKey || undefined,
+        });
+        resolveAcceptance(acceptance);
+      };
+
+      if (typeof web.handleAgentMessage !== "function") {
+        throw new Error("Cross-session steer requires the trusted durable-acceptance entry point in this runtime.");
+      }
+      const forwardPromise = web.handleAgentMessage(forwardReq, pathname, onAccepted);
+
+      const responsePromise = forwardPromise.then(
+        (response) => ({ kind: "response" as const, response }),
+        (error) => ({ kind: "error" as const, error }),
+      );
+      const observeDeferredCompletion = (initialDisposition: "accepted" | "indeterminate" | "cancelled") => {
+        void responsePromise.then((completion) => {
+          if (completion.kind === "error" || !completion.response.ok) {
+            if (entry && !entry.latestResult && cacheKey && idempotentAttempts.get(cacheKey) === entry) {
+              idempotentAttempts.delete(cacheKey);
+            }
+            log.error("Cross-session steer failed after the sender stopped waiting.", {
+              operation: "chat_tool_relay.deferred_delivery_failed",
+              sourceChatJid: source.chat_jid,
+              targetChatJid: target.chat_jid,
+              initialDisposition,
+              idempotencyKey: idempotencyKey || undefined,
+              ...(completion.kind === "error"
+                ? { err: completion.error }
+                : { status: completion.response.status }),
+            });
+            return;
+          }
+          log.info("Cross-session steer recipient handling completed after sender acknowledgement.", {
+            operation: "chat_tool_relay.deferred_delivery_completed",
+            sourceChatJid: source.chat_jid,
+            targetChatJid: target.chat_jid,
+            initialDisposition,
+            idempotencyKey: idempotencyKey || undefined,
+          });
+        });
+      };
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      const timeoutPromise = new Promise<{ kind: "timeout" }>((resolve) => {
+        timeout = setTimeout(() => resolve({ kind: "timeout" }), ackTimeoutMs);
+      });
+      let abortHandler: (() => void) | undefined;
+      const abortPromise = request.signal
+        ? new Promise<{ kind: "cancelled" }>((resolve) => {
+            if (request.signal?.aborted) {
+              resolve({ kind: "cancelled" });
+              return;
+            }
+            abortHandler = () => resolve({ kind: "cancelled" });
+            request.signal?.addEventListener("abort", abortHandler, { once: true });
+          })
+        : new Promise<never>(() => {});
+      const outcome = await Promise.race([
+        acceptancePromise.then((acceptance) => ({ kind: "accepted" as const, acceptance })),
+        responsePromise,
+        timeoutPromise,
+        abortPromise,
+      ]);
+      if (timeout) clearTimeout(timeout);
+      if (abortHandler) request.signal?.removeEventListener("abort", abortHandler);
+
+      if (outcome.kind === "accepted") {
+        terminalDisposition = "accepted";
+        observeDeferredCompletion("accepted");
+        return entry?.latestResult ?? {
+          status: "ok",
+          ...resultIdentity,
+          row_id: outcome.acceptance.row_id,
+          thread_id: outcome.acceptance.thread_id,
+          accepted_at: outcome.acceptance.accepted_at,
+          created: true,
+          relayed: true,
+          acknowledged: true,
+          delivery_disposition: "accepted",
+        };
+      }
+      if (outcome.kind === "response") {
+        try {
+          const result = await responseResult(outcome.response);
+          terminalDisposition = "indeterminate";
+          log.warn("Cross-session steer completed without durable acceptance acknowledgement.", {
+            operation: "chat_tool_relay.acknowledgement_missing",
+            sourceChatJid: source.chat_jid,
+            targetChatJid: target.chat_jid,
+            idempotencyKey: idempotencyKey || undefined,
+          });
+          return {
+            ...result,
+            status: "indeterminate",
+            relayed: false,
+            acknowledged: false,
+            delivery_disposition: "indeterminate",
+          };
+        } catch (error) {
+          terminalDisposition = "rejected";
+          throw error;
+        }
+      }
+      if (outcome.kind === "error") {
+        terminalDisposition = "rejected";
+        log.warn("Cross-session chat relay failed before durable acceptance.", {
+          operation: "chat_tool_relay.rejected",
+          sourceChatJid: source.chat_jid,
+          targetChatJid: target.chat_jid,
+          idempotencyKey: idempotencyKey || undefined,
+          err: outcome.error,
+        });
+        throw outcome.error;
+      }
+      if (outcome.kind === "cancelled") {
+        terminalDisposition = "cancelled";
+        observeDeferredCompletion("cancelled");
+        log.warn("Cross-session steer was cancelled before durable acknowledgement.", {
+          operation: "chat_tool_relay.cancelled",
+          sourceChatJid: source.chat_jid,
+          targetChatJid: target.chat_jid,
+          idempotencyKey: idempotencyKey || undefined,
+        });
+        return {
+          status: "cancelled",
+          ...resultIdentity,
+          relayed: false,
+          acknowledged: false,
+          delivery_disposition: "cancelled",
+        };
+      }
+
+      terminalDisposition = "indeterminate";
+      observeDeferredCompletion("indeterminate");
+      log.warn("Cross-session steer acknowledgement timed out; delivery is indeterminate.", {
+        operation: "chat_tool_relay.timed_out",
+        sourceChatJid: source.chat_jid,
+        targetChatJid: target.chat_jid,
+        ackTimeoutMs,
+        idempotencyKey: idempotencyKey || undefined,
+      });
+      return {
+        status: "indeterminate",
+        ...resultIdentity,
+        relayed: false,
+        acknowledged: false,
+        delivery_disposition: "indeterminate",
+        timed_out: true,
+      };
     };
+
+    if (cacheKey) {
+      // Reserve capacity before delivery starts so a synchronous acceptance
+      // callback can reconcile this exact entry without a registration gap.
+      entry = {
+        fingerprint,
+        promise: Promise.resolve(undefined as never),
+      };
+      idempotentAttempts.set(cacheKey, entry);
+    }
+    const promise = deliver().then((result) => {
+      if (entry && result.acknowledged && result.delivery_disposition === "accepted") {
+        entry.latestResult = result;
+        entry.settledAt ??= now();
+      } else if (entry && mode !== "steer") {
+        entry.settledAt ??= now();
+      }
+      return result;
+    }).catch((error) => {
+      if (cacheKey && (!entry || idempotentAttempts.get(cacheKey) === entry)) {
+        idempotentAttempts.delete(cacheKey);
+      }
+      throw error;
+    });
+    if (entry) entry.promise = promise;
+    return await promise;
   };
 }
 

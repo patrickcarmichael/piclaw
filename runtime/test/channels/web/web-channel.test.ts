@@ -542,6 +542,8 @@ test("direct chat tool relay persists steering rows when the target session is s
   ];
   const events: Array<{ type: string; data: any }> = [];
   const queuedSteers: Array<{ chatJid: string; text: string; behavior: string }> = [];
+  let releaseSteer!: () => void;
+  const steerGate = new Promise<void>((resolve) => { releaseSteer = resolve; });
 
   const webMod = await import("../../../src/channels/web.js");
   const agentPool = {
@@ -553,6 +555,7 @@ test("direct chat tool relay persists steering rows when the target session is s
     isActive: (chatJid: string) => chatJid === "web:target",
     queueStreamingMessage: async (chatJid: string, text: string, behavior: string) => {
       queuedSteers.push({ chatJid, text, behavior });
+      await steerGate;
       return { queued: true };
     },
     getContextUsageForChat: async () => null,
@@ -567,21 +570,28 @@ test("direct chat tool relay persists steering rows when the target session is s
 
   const { createDirectChatToolRelayHandler } = await import("../../../src/extensions/chat-tool-runtime.js");
   const relay = createDirectChatToolRelayHandler(agentPool as any, {
-    handleAgentMessage: (req, pathname) => (web as any).handleAgentMessage(req, pathname),
+    handleAgentMessage: (req, pathname, onAccepted) => (web as any).handleAgentMessage(req, pathname, onAccepted),
   }, {
     getAgentDisplayName: () => "Smith",
     getChatBranchByChatJid: (chatJid) => knownChats.find((chat) => chat.chat_jid === chatJid) ?? null,
     getChatBranchByAgentName: (agentName) => knownChats.find((chat) => chat.agent_name === agentName) ?? null,
+    ackTimeoutMs: 50,
   });
 
-  const result = await relay({
-    source_chat_jid: "web:source",
-    target_agent_name: "@target",
-    content: "Please adjust the active direct run.",
-    mode: "steer",
-  });
+  const result = await Promise.race([
+    relay({
+      source_chat_jid: "web:source",
+      target_agent_name: "@target",
+      content: "Please adjust the active direct run.",
+      mode: "steer",
+    }),
+    Bun.sleep(100).then(() => { throw new Error("sender remained blocked behind the recipient steer queue"); }),
+  ]);
 
-  expect(result.queued).toBe("steer");
+  expect(result.queued).toBeUndefined();
+  expect(result.delivery_disposition).toBe("accepted");
+  expect(result.acknowledged).toBe(true);
+  expect(result.thread_id).toBeNull();
   expect(result.relayed).toBe(true);
   expect(result.created).toBe(true);
   expect(result.row_id).toBeTruthy();
@@ -589,6 +599,9 @@ test("direct chat tool relay persists steering rows when the target session is s
   expect(queuedSteers[0].chatJid).toBe("web:target");
   expect(queuedSteers[0].behavior).toBe("steer");
   expect(events.some((event) => event.type === "new_post" && event.data?.chat_jid === "web:target")).toBe(true);
+
+  releaseSteer();
+  await Bun.sleep(0);
 
   const timeline = db.getTimeline("web:target", 10);
   expect(timeline).toHaveLength(1);

@@ -23,6 +23,9 @@ export type ChatRelayRequest = {
   target_agent_name?: string;
   content: string;
   mode: ChatRelayMode;
+  idempotency_key?: string;
+  in_reply_to?: string;
+  signal?: AbortSignal;
 };
 
 export type ChatRelayResult = {
@@ -41,6 +44,11 @@ export type ChatRelayResult = {
   queued?: string;
   thread_id?: number | null;
   created?: boolean;
+  acknowledged?: boolean;
+  delivery_disposition?: "accepted" | "indeterminate" | "cancelled";
+  timed_out?: boolean;
+  accepted_at?: string;
+  idempotency_key?: string;
 };
 
 export type ChatToolRelayFn = (request: ChatRelayRequest) => Promise<ChatRelayResult>;
@@ -63,6 +71,9 @@ export function setChatToolRelayFn(fn: ChatToolRelayFn | undefined): void {
           : { target_agent_name: request.address.target }),
         content: request.content,
         mode: request.mode,
+        ...(request.idempotency_key ? { idempotency_key: request.idempotency_key } : {}),
+        ...(request.in_reply_to ? { in_reply_to: request.in_reply_to } : {}),
+        ...(request.signal ? { signal: request.signal } : {}),
       });
       return result;
     },
@@ -101,7 +112,7 @@ const HINT = [
   "@aliases are resolved through the internal Pi chat-branch/session-tree registry before delivery; do not use opaque session IDs when an alias is available.",
   "Sender identity is derived from the current chat session and cannot be supplied by the caller; destination identity is resolved before delivery.",
   "The destination receives the message through its normal inbound-message path with structured reply-to metadata.",
-  "Messages steer the target immediately by default. Use mode='queue' to enqueue behind active work, or mode='auto' for standard request behavior.",
+  "Messages steer the target immediately by default. A local steer returns after durable target acceptance; an acknowledgement timeout reports indeterminate delivery, so retry with the same idempotency_key. Use mode='queue' to enqueue behind active work, or mode='auto' for standard request behavior.",
 ].join("\n");
 
 function err(message: string): AgentToolResult<Record<string, unknown>> {
@@ -140,7 +151,7 @@ export const chatTool: ExtensionFactory = (pi: ExtensionAPI) => {
     description: "Send a message from the current session to another local session or a destination handled by an installed chat transport.",
     promptSnippet: "chat: relay a message to a local @alias or a one-hop transport address. Prefer target_agent_name='@alias' for local sessions.",
     parameters: ChatSchema,
-    async execute(_toolCallId, params: ChatToolParams) {
+    async execute(_toolCallId, params: ChatToolParams, signal) {
       const sourceChatJid = getChatJid("").trim();
       if (!sourceChatJid) return err("Cannot determine the source chat. The chat tool requires an active chat context.");
 
@@ -169,12 +180,19 @@ export const chatTool: ExtensionFactory = (pi: ExtensionAPI) => {
           mode: params.mode || "steer",
           ...(params.idempotency_key?.trim() ? { idempotency_key: params.idempotency_key.trim() } : {}),
           ...(params.in_reply_to?.trim() ? { in_reply_to: params.in_reply_to.trim() } : {}),
+          ...(signal ? { signal } : {}),
         }, { annotate: Boolean(targetAddress) });
 
         const target = describeTarget(result);
-        const statusText = result.queued === "followup"
-          ? `Relayed to ${target} and queued as a follow-up.`
-          : `Relayed to ${target}.`;
+        const statusText = result.delivery_disposition === "indeterminate"
+          ? result.timed_out === true
+            ? `Delivery to ${target} is indeterminate because durable acknowledgement timed out. Retry only with the same idempotency_key.`
+            : `Delivery to ${target} is indeterminate because durable acceptance was not acknowledged. Retry only with the same idempotency_key.`
+          : result.delivery_disposition === "cancelled"
+            ? `Delivery to ${target} was cancelled before durable acknowledgement; delivery is indeterminate.`
+            : result.queued === "followup"
+              ? `Relayed to ${target} and queued as a follow-up.`
+              : `Relayed to ${target}.`;
 
         return {
           content: [{ type: "text", text: statusText }],

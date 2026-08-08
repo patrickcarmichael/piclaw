@@ -11,6 +11,7 @@ export interface ChatTransportRequest {
   mode: ChatTransportMode;
   idempotency_key?: string;
   in_reply_to?: string;
+  signal?: AbortSignal;
 }
 
 export interface ChatTransportResult {
