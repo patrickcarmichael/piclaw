@@ -238,9 +238,10 @@ describe("web runtime state service", () => {
     ]);
   });
 
-  test("chat-run control delegation preserves thread-root lookup and failed-run skip behavior", () => {
+  test("chat-run control delegation preserves thread-root lookup and wakes after failed-run skip", () => {
     const setCalls: Array<{ chatJid: string; ts: string }> = [];
     const clearCalls: string[] = [];
+    const wakeKeys: string[] = [];
     const store: ChatRunControlStore = {
       getThreadRootId: (chatJid, messageId) => (chatJid === "web:1" && messageId === "m1" ? 42 : null),
       getFailedRun: () => ({ failedTs: "2026-03-27T20:10:00.000Z" }),
@@ -257,7 +258,7 @@ describe("web runtime state service", () => {
       {
         getAssistantName: () => "Pi",
         getChatCursor: () => "cursor",
-        enqueue: async () => {},
+        enqueue: async (_task, key) => { wakeKeys.push(key); },
         processChat: async () => {},
       },
       {
@@ -271,5 +272,6 @@ describe("web runtime state service", () => {
 
     expect(setCalls).toEqual([{ chatJid: "web:1", ts: "2026-03-27T20:10:00.000Z" }]);
     expect(clearCalls).toEqual(["web:1"]);
+    expect(wakeKeys).toEqual(["resume:web:1:wake"]);
   });
 });

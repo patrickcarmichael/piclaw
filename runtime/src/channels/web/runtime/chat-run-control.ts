@@ -5,10 +5,14 @@
 import {
   clearFailedRun,
   getChatCursor,
+  getChatOperation,
   getFailedRun,
   getMessageThreadRootIdById,
+  retryBlockedChatOperation,
   setChatCursor,
+  skipBlockedChatOperation,
 } from "../../../db.js";
+import type { ChatOperationState } from "../../../db.js";
 
 interface FailedRunLike {
   prevTs: string;
@@ -22,6 +26,9 @@ export interface ChatRunControlStore {
   getChatCursor(chatJid: string): string;
   setChatCursor(chatJid: string, ts: string): void;
   clearFailedRun(chatJid: string): void;
+  getChatOperation?(chatJid: string): ChatOperationState | null;
+  retryBlockedChatOperation?: typeof retryBlockedChatOperation;
+  skipBlockedChatOperation?: typeof skipBlockedChatOperation;
 }
 
 /** Runtime callbacks required to resume a queued chat run. */
@@ -37,6 +44,9 @@ const defaultStore: ChatRunControlStore = {
   getChatCursor,
   setChatCursor,
   clearFailedRun,
+  getChatOperation,
+  retryBlockedChatOperation,
+  skipBlockedChatOperation,
 };
 
 /** Resolve a persisted thread root id for a chat/message pair. */
@@ -87,6 +97,22 @@ export function skipFailedOnModelSwitch(
   chatJid: string,
   store: ChatRunControlStore = defaultStore
 ): boolean {
+  const operation = store.getChatOperation?.(chatJid) ?? null;
+  if (operation) {
+    if (operation.phase !== "blocked" || !store.skipBlockedChatOperation) return false;
+    const result = store.skipBlockedChatOperation(chatJid, {
+      operationId: operation.operationId,
+      sourceSeq: operation.sourceSeq,
+      phase: operation.phase,
+      generation: operation.generation,
+    }, {
+      cause: "operator_skip_failed",
+      provenance: "web_chat_run_control",
+      createdAt: new Date().toISOString(),
+    });
+    return result.status === "completed" || result.status === "repeated";
+  }
+
   const failed = store.getFailedRun(chatJid);
   if (!failed) return false;
 
@@ -103,6 +129,18 @@ export function retryFailedOnModelSwitch(
   chatJid: string,
   store: ChatRunControlStore = defaultStore
 ): boolean {
+  const operation = store.getChatOperation?.(chatJid) ?? null;
+  if (operation) {
+    if (operation.phase !== "blocked" || !store.retryBlockedChatOperation) return false;
+    const result = store.retryBlockedChatOperation(chatJid, {
+      operationId: operation.operationId,
+      sourceSeq: operation.sourceSeq,
+      phase: operation.phase,
+      generation: operation.generation,
+    });
+    return result.status === "applied";
+  }
+
   const failed = store.getFailedRun(chatJid);
   if (!failed) return false;
 

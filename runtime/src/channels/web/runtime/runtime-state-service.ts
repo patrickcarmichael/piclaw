@@ -145,7 +145,9 @@ export class WebChannelRuntimeStateService {
   }
 
   skipFailedOnModelSwitch(chatJid: string, store?: ChatRunControlStore): boolean {
-    return skipFailedOnModelSwitchForChat(chatJid, store);
+    const skipped = skipFailedOnModelSwitchForChat(chatJid, store);
+    if (skipped) this.resumeChat(chatJid);
+    return skipped;
   }
 
   retryFailedOnModelSwitch(chatJid: string, store?: ChatRunControlStore): boolean {
