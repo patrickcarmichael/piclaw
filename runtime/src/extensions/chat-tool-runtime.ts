@@ -433,9 +433,6 @@ export function createDirectChatToolRelayHandler(
             });
             return;
           }
-          if (entry && cacheKey && idempotentAttempts.get(cacheKey) === entry) {
-            entry.settledAt ??= now();
-          }
           log.info("Cross-session steer recipient handling completed after sender acknowledgement.", {
             operation: "chat_tool_relay.deferred_delivery_completed",
             sourceChatJid: source.chat_jid,
@@ -567,10 +564,7 @@ export function createDirectChatToolRelayHandler(
       if (entry && result.acknowledged && result.delivery_disposition === "accepted") {
         entry.latestResult = result;
         entry.settledAt ??= now();
-      } else if (entry && (
-        mode !== "steer"
-        || (result.delivery_disposition === "indeterminate" && result.timed_out !== true)
-      )) {
+      } else if (entry && mode !== "steer") {
         entry.settledAt ??= now();
       }
       return result;
