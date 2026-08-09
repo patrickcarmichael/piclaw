@@ -41,6 +41,7 @@ export interface SessionControlResult {
   status?: string;
   message?: string;
   assessment?: string;
+  operation_id?: string | null;
   before?: Record<string, unknown>;
   after?: Record<string, unknown>;
   error?: string;
@@ -104,13 +105,21 @@ function normalizeTargetAgentName(value: string | undefined): string {
   return String(value || "").trim().replace(/^@+/, "").trim();
 }
 
+function formatOperationIdentity(result: SessionControlResult): string {
+  const operationId = typeof result.operation_id === "string" ? result.operation_id.trim() : "";
+  if (!operationId) return "No active operation_id is available.";
+  return `operation_id: ${operationId}. Pass it as expected_operation_id to abort or unblock.`;
+}
+
 function formatResult(result: SessionControlResult): string {
   if (!result.ok) return result.error || result.message || "Session control failed.";
   const target = result.target_agent_name
     ? `@${result.target_agent_name} (${result.target_chat_jid})`
     : result.target_chat_jid;
-  if (result.action === "inspect") return `Inspected ${target}.`;
-  if (result.action === "assess_stuck") return `Assessment for ${target}: ${result.assessment || "unknown"}.`;
+  if (result.action === "inspect") return `Inspected ${target}. ${formatOperationIdentity(result)}`;
+  if (result.action === "assess_stuck") {
+    return `Assessment for ${target}: ${result.assessment || "unknown"}. ${formatOperationIdentity(result)}`;
+  }
   return result.message || `${result.action} completed for ${target}.`;
 }
 
@@ -136,7 +145,7 @@ export const sessionControl: ExtensionFactory = (pi: ExtensionAPI) => {
       if (targetChatJid && targetAgentName) return err("Provide only one target selector: target_chat_jid or target_agent_name.");
       const expectedOperationId = params.expected_operation_id?.trim() || "";
       if ((action === "abort" || action === "unblock") && !expectedOperationId) {
-        return err(`${action} requires expected_operation_id from a fresh inspect or assess_stuck result.`);
+        return err(`${action} requires expected_operation_id. Run session_control inspect or assess_stuck for the same target, then copy the visible operation_id into expected_operation_id.`);
       }
       if (action === "switch_model" && !params.model?.trim()) return err("switch_model requires model.");
 
