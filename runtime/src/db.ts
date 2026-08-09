@@ -178,6 +178,7 @@ export {
   waitChatOperation,
   resumeChatOperation,
   blockChatOperation,
+  blockChatOperationSettlement,
   retryBlockedChatOperation,
   skipBlockedChatOperation,
   cancelChatOperation,

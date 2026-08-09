@@ -59,7 +59,8 @@ export type ChatOperationMismatch =
   | "phase_mismatch"
   | "generation_mismatch";
 
-export type ChatOperationRejection = ChatOperationMismatch | "invalid_transition" | "operation_cancelled";
+export type ChatOperationRejection = ChatOperationMismatch | "invalid_transition" | "operation_cancelled"
+  | "operation_settling" | "settlement_fence_mismatch";
 
 export interface ChatOperationDisposition {
   sourceSeq: number;
@@ -777,17 +778,62 @@ export function claimNextChatOperation(chatJid: string): ChatOperationClaimResul
 function applyTransition(chatJid: string, expected: ChatOperationOwner, phase: ChatOperationPhase): ChatOperationTransitionResult {
   const current = getChatOperation(chatJid);
   if (!current) return { status: "rejected", reason: "no_operation", operation: null };
+  const comparison = compareChatOperationOwner(current, expected);
+  if (!comparison.ok) return { status: "rejected", reason: comparison.reason, operation: current };
+  if (getChatOperationSettlementFence(chatJid)) {
+    return { status: "rejected", reason: "operation_settling", operation: current };
+  }
   const planned = transitionChatOperationState(current, expected, phase);
   if (planned.status === "rejected") return planned;
   const next = planned.operation;
-  const result = getDb().prepare(`UPDATE chat_cursors SET operation_phase = ?, operation_generation = ?,
-    operation_settling_fence_id = NULL, operation_settling_fenced_at = NULL
-    WHERE chat_jid = ? AND operation_id = ? AND operation_source_seq = ? AND operation_phase = ? AND operation_generation = ?`)
+  const result = getDb().prepare(`UPDATE chat_cursors SET operation_phase = ?, operation_generation = ?
+    WHERE chat_jid = ? AND operation_id = ? AND operation_source_seq = ? AND operation_phase = ? AND operation_generation = ?
+      AND operation_settling_fence_id IS NULL`)
     .run(next.phase, next.generation, chatJid, expected.operationId, expected.sourceSeq, expected.phase, expected.generation);
   if (result.changes === 1) return planned;
   const observed = getChatOperation(chatJid);
   const mismatch = compareChatOperationOwner(observed, expected);
-  return { status: "rejected", reason: mismatch.ok ? "generation_mismatch" : mismatch.reason, operation: observed };
+  if (!mismatch.ok) return { status: "rejected", reason: mismatch.reason, operation: observed };
+  return {
+    status: "rejected",
+    reason: getChatOperationSettlementFence(chatJid) ? "operation_settling" : "generation_mismatch",
+    operation: observed,
+  };
+}
+
+/**
+ * Abort an in-progress settlement checkpoint by blocking only its exact owner
+ * under the matching persisted fence. Cancellation always wins this race.
+ */
+export function blockChatOperationSettlement(
+  chatJid: string,
+  expected: ChatOperationOwner,
+  settlementFenceId: string,
+): ChatOperationTransitionResult {
+  if (!settlementFenceId.trim()) throw new Error("Settlement fence id must be non-empty");
+  const current = getChatOperation(chatJid);
+  if (!current) return { status: "rejected", reason: "no_operation", operation: null };
+  const comparison = compareChatOperationOwner(current, expected);
+  if (!comparison.ok) return { status: "rejected", reason: comparison.reason, operation: current };
+  const fence = getChatOperationSettlementFence(chatJid);
+  if (fence?.fenceId !== settlementFenceId) {
+    return { status: "rejected", reason: "settlement_fence_mismatch", operation: current };
+  }
+  const planned = transitionChatOperationState(current, expected, "blocked");
+  if (planned.status === "rejected") return planned;
+  const next = planned.operation;
+  const result = getDb().prepare(`UPDATE chat_cursors SET operation_phase = ?, operation_generation = ?,
+      operation_settling_fence_id = NULL, operation_settling_fenced_at = NULL
+    WHERE chat_jid = ? AND operation_id = ? AND operation_source_seq = ? AND operation_phase = ? AND operation_generation = ?
+      AND operation_cancel_cause IS NULL AND operation_settling_fence_id = ?`)
+    .run(next.phase, next.generation, chatJid, expected.operationId, expected.sourceSeq, expected.phase,
+      expected.generation, settlementFenceId);
+  if (result.changes === 1) return planned;
+  const observed = getChatOperation(chatJid);
+  const mismatch = compareChatOperationOwner(observed, expected);
+  if (!mismatch.ok) return { status: "rejected", reason: mismatch.reason, operation: observed };
+  if (observed?.cancellation) return { status: "rejected", reason: "operation_cancelled", operation: observed };
+  return { status: "rejected", reason: "settlement_fence_mismatch", operation: observed };
 }
 
 export const promoteChatOperation = (chatJid: string, owner: ChatOperationOwner, phase: "preflight" | "running") =>

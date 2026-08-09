@@ -702,6 +702,12 @@ describe("durable accepted-input operations", () => {
       fenceId: `other-fence-${serial}`,
       fencedAt: fenced.fence.fencedAt,
     })).toEqual({ status: "rejected", reason: "operation_already_settling" });
+    expect(op.promoteChatOperation(chatJid, owner(claimed), "preflight")).toMatchObject({
+      status: "rejected",
+      reason: "operation_settling",
+      operation: claimed,
+    });
+    expect(op.getChatOperationSettlementFence(chatJid)).toEqual(fenced.fence);
 
     const lateId = `settlement-late-${serial}`;
     const lateAt = "2026-08-09T10:00:04.000Z";
@@ -757,6 +763,48 @@ describe("durable accepted-input operations", () => {
       .toEqual([first.source.sourceId, secondId]);
     expect(late.source.sourceSeq).toBeLessThan(successor.source_seq);
     expect(op.getChatOperationSettlementFence(chatJid)).toBeNull();
+  });
+
+  test("only the exact matching settlement failure path can block a fenced owner", () => {
+    const chatJid = jid("fenced-block");
+    register(chatJid, "root");
+    const claimed = op.claimNextChatOperation(chatJid).operation!;
+    const fenced = op.fenceChatOperationSettlement(chatJid, owner(claimed), {
+      fenceId: `block-fence-${serial}`, fencedAt: "2026-08-09T10:00:06.000Z",
+    });
+    if (fenced.status === "rejected") throw new Error(`fence rejected: ${fenced.reason}`);
+    expect(op.blockChatOperation(chatJid, owner(claimed))).toMatchObject({
+      status: "rejected", reason: "operation_settling",
+    });
+    expect(op.blockChatOperationSettlement(chatJid, owner(claimed), `wrong-${serial}`)).toMatchObject({
+      status: "rejected", reason: "settlement_fence_mismatch",
+    });
+    expect(op.blockChatOperationSettlement(chatJid, owner(claimed), fenced.fence.fenceId)).toMatchObject({
+      status: "applied",
+      operation: { phase: "blocked", generation: claimed.generation + 1 },
+    });
+    expect(op.getChatOperationSettlementFence(chatJid)).toBeNull();
+
+    const cancelledChatJid = jid("fenced-block-cancelled");
+    register(cancelledChatJid, "root");
+    const cancelledClaim = op.claimNextChatOperation(cancelledChatJid).operation!;
+    const cancelledFence = op.fenceChatOperationSettlement(cancelledChatJid, owner(cancelledClaim), {
+      fenceId: `cancelled-block-fence-${serial}`, fencedAt: "2026-08-09T10:00:07.000Z",
+    });
+    if (cancelledFence.status === "rejected") throw new Error(`fence rejected: ${cancelledFence.reason}`);
+    const cancellation = op.cancelChatOperation(cancelledChatJid, owner(cancelledClaim), {
+      cause: "user_abort", requestedAt: "2026-08-09T10:00:08.000Z",
+    });
+    if (cancellation.status === "rejected") throw new Error(`cancellation rejected: ${cancellation.reason}`);
+    expect(op.blockChatOperationSettlement(cancelledChatJid, owner(cancellation.operation), cancelledFence.fence.fenceId))
+      .toMatchObject({ status: "rejected", reason: "operation_cancelled" });
+    expect(op.getChatOperationSettlementFence(cancelledChatJid)).toMatchObject({
+      fenceId: cancelledFence.fence.fenceId,
+      operationId: cancellation.operation.operationId,
+      sourceSeq: cancellation.operation.sourceSeq,
+      phase: cancellation.operation.phase,
+      generation: cancellation.operation.generation,
+    });
   });
 
   test("settlement and late-steer faults are rollback-safe at every deterministic boundary", () => {

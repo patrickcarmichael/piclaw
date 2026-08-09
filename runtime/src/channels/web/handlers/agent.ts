@@ -38,6 +38,7 @@ import { getServerUiMetersConfig, setServerUiMetersConfig, setServerUiThemeConfi
 import {
   acceptStoredChatMessageSource,
   blockChatOperation,
+  blockChatOperationSettlement,
   claimNextChatOperation,
   completeChatOperation,
   disposeChatOperationIntent,
@@ -1983,14 +1984,19 @@ export async function processChat(
 
   let shouldRemoveStaleProtectedContinuation = false;
   let durableOperationCompleted = false;
-  const blockFailedRun = (failed: Parameters<typeof rollbackChatRunWithError>[1]): void => {
+  const blockFailedRun = (
+    failed: Parameters<typeof rollbackChatRunWithError>[1],
+    settlementFenceId?: string,
+  ): void => {
     if (!durableOperation) {
       rollbackChatRunWithError(chatJid, failed);
       return;
     }
     const current = getChatOperation(chatJid);
     if (!current || current.operationId !== durableOperation.operationId) return;
-    const blocked = blockChatOperation(chatJid, durableOperationOwner(current));
+    const blocked = settlementFenceId
+      ? blockChatOperationSettlement(chatJid, durableOperationOwner(current), settlementFenceId)
+      : blockChatOperation(chatJid, durableOperationOwner(current));
     if (blocked.status === "applied") durableOperation = blocked.operation;
   };
   const deferDurableRetry = (legacyRollback: () => void): void => {
@@ -2545,6 +2551,11 @@ export async function processChat(
           goalDeadlineCheckpoint: {
             reserveMs: goalDeadlineReserveMs,
             tryLatch: (latch: import("../../../agent-pool/contracts.js").GoalDeadlineCheckpointLatch) => {
+              // An admitted queue mutation owns the pre-fence side of the boundary
+              // through its SDK effect. Refuse to latch until that mutation drains;
+              // a later admission will instead observe the persisted fence.
+              if (typeof channel.agentPool.hasPendingStreamingQueue === "function"
+                && channel.agentPool.hasPendingStreamingQueue(chatJid)) return false;
               const current = getChatOperation(chatJid);
               if (!current || current.operationId !== durableOperation?.operationId || current.cancellation) return false;
               const lease = goalDeadlineProvider.tryLatch({
@@ -2599,7 +2610,7 @@ export async function processChat(
                   messageId: lastMessage.id,
                   threadRootId: resolvedThreadRootId ?? null,
                   createdAt: new Date().toISOString(),
-                });
+                }, settlementFence.fenceId);
               }
               trackedEmitter.status({
                 thread_id: threadId,
@@ -2758,7 +2769,7 @@ export async function processChat(
                     messageId: lastMessage.id,
                     threadRootId: resolvedThreadRootId ?? null,
                     createdAt: new Date().toISOString(),
-                  });
+                  }, settlementFence.fenceId);
                 }
               }
               if (terminalOutputPersistedInPromptLane && initialResolution.action !== "suppress") {
@@ -2782,7 +2793,7 @@ export async function processChat(
                   messageId: lastMessage.id,
                   threadRootId: resolvedThreadRootId ?? null,
                   createdAt: new Date().toISOString(),
-                });
+                }, settlementFence.fenceId);
               }
               return false;
             } finally {

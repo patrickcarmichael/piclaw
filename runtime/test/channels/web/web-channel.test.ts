@@ -3447,7 +3447,7 @@ test("real AgentPool committed Goal checkpoint finalizes and wakes its durable s
   }
 });
 
-test("non-idle Goal deadline evidence blocks the durable owner without completing or scheduling it", async () => {
+test("Goal deadline latch waits for an admitted queue mutation before non-idle evidence blocks the owner", async () => {
   const ws = createTempWorkspace("piclaw-web-channel-");
   cleanupWorkspace = ws.cleanup;
   restoreEnv = setEnv({ PICLAW_WORKSPACE: ws.workspace, PICLAW_STORE: ws.store, PICLAW_DATA: ws.data });
@@ -3460,8 +3460,13 @@ test("non-idle Goal deadline evidence blocks the durable owner without completin
     id: `msg-${crypto.randomUUID()}`, chat_jid: "web:default", sender: "user", sender_name: "User",
     content: "do not overlap tools", timestamp: new Date().toISOString(), is_from_me: false, is_bot_message: false,
   }).source;
+  let queueMutationPending = true;
+  let providerLatchCalls = 0;
   const provider = {
-    tryLatch: (input: any) => ({ ...input, goalId: "goal-non-idle", objective: "Do not overlap", planFingerprint: "plan", expiresAt: new Date(Date.now() + 60_000).toISOString() }),
+    tryLatch: (input: any) => {
+      providerLatchCalls += 1;
+      return { ...input, goalId: "goal-non-idle", objective: "Do not overlap", planFingerprint: "plan", expiresAt: new Date(Date.now() + 60_000).toISOString() };
+    },
     revalidate: (lease: any) => ({ action: "continue" as const, goalId: lease.goalId, objective: lease.objective, planFingerprint: "plan", visibleText: "Must not persist", continuationText: "Continue" }),
     markScheduled: () => { throw new Error("non-idle checkpoint must not schedule"); }, release() {},
     resolveContinuation: () => ({ status: "suppress" as const }),
@@ -3473,11 +3478,19 @@ test("non-idle Goal deadline evidence blocks the durable owner without completin
       queue: { enqueue: () => {} },
       agentPool: {
         setSessionBinder: () => {},
+        hasPendingStreamingQueue: () => queueMutationPending,
         runAgent: async (_prompt: string, _chatJid: string, options: any) => {
-          const checkpointId = `checkpoint-${crypto.randomUUID()}`;
           const deadlineAt = new Date().toISOString();
+          expect(options.goalDeadlineCheckpoint.tryLatch({ checkpointId: `pending-${crypto.randomUUID()}`,
+            oldTurnId: options.turnId, timeoutMs: 100, reserveMs: options.goalDeadlineCheckpoint.reserveMs,
+            deadlineAt, triggeredAt: deadlineAt })).toBe(false);
+          expect(providerLatchCalls).toBe(0);
+          expect(db.getChatOperationSettlementFence("web:default")).toBeNull();
+          queueMutationPending = false;
+          const checkpointId = `checkpoint-${crypto.randomUUID()}`;
           expect(options.goalDeadlineCheckpoint.tryLatch({ checkpointId, oldTurnId: options.turnId, timeoutMs: 100,
             reserveMs: options.goalDeadlineCheckpoint.reserveMs, deadlineAt, triggeredAt: deadlineAt })).toBe(true);
+          expect(providerLatchCalls).toBe(1);
           expect(await options.onGoalDeadlineCheckpoint({
             checkpointId, oldTurnId: options.turnId, timeoutMs: 100, reserveMs: options.goalDeadlineCheckpoint.reserveMs,
             deadlineAt, triggeredAt: deadlineAt, settledAt: deadlineAt, settlement: "abort_failed",
