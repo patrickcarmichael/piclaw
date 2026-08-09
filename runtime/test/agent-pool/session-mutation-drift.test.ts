@@ -228,7 +228,7 @@ const expectedCallers: Inventory = {
   "channels/web/cards/adaptive-card-side-prompt-service.ts": { applyControlCommand: 1 },
   "channels/web/core/web-channel-runtime-public-surface-service.ts": { queueStreamingMessage: 1 },
   "channels/web/handlers/addons.ts": { applySlashCommand: 1 },
-  "channels/web/handlers/agent.ts": { applyControlCommand: 3, applySlashCommand: 1, cancelOperationAndAbort: 1, hasPendingStreamingQueue: 1, queueStreamingMessage: 2, runAgent: 1 },
+  "channels/web/handlers/agent.ts": { applyControlCommand: 3, applySlashCommand: 1, cancelOperationAndAbort: 1, hasPendingStreamingQueue: 2, queueStreamingMessage: 2, runAgent: 1 },
   "channels/web/runtime/process-chat-control-runtime.ts": { applyControlCommand: 1 },
   "channels/web/runtime/process-chat-preflight-runtime.ts": { emergencyRotateSession: 2, runSessionMutation: 2 },
   "channels/web/runtime/queued-followup-lifecycle-service.ts": { removeQueuedFollowupMessage: 1 },
