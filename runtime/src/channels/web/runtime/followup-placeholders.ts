@@ -20,7 +20,7 @@ export class FollowupPlaceholderStore {
     queuedContent: string,
     threadId?: number | null,
     queuedAt?: string,
-    extras?: Pick<QueuedFollowupItem, "mediaIds" | "contentBlocks" | "linkPreviews" | "screenHint" | "source" | "queuedBy">
+    extras?: Pick<QueuedFollowupItem, "mediaIds" | "contentBlocks" | "linkPreviews" | "screenHint" | "source" | "queuedBy" | "durable">
   ): void {
     const existing = this.queuedFollowupPlaceholders.get(chatJid) ?? [];
     existing.push(projectQueuedFollowupItem({

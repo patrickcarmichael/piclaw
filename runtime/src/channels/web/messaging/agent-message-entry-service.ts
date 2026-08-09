@@ -8,6 +8,7 @@
 
 import { handleAgentMessage as handleAgentMessageRequest } from "../handlers/agent.js";
 import type { AgentMessageAcceptanceHandler } from "./agent-message-acceptance.js";
+import type { AgentMessageRequestContext } from "./agent-message-provenance.js";
 import type { WebChannelLike } from "../core/web-channel-contracts.js";
 
 export interface WebAgentMessageEntryServiceOptions {
@@ -19,6 +20,7 @@ export interface WebAgentMessageEntryServiceOptions {
     chatJid: string,
     agentId: string,
     onAccepted?: AgentMessageAcceptanceHandler,
+    context?: AgentMessageRequestContext,
   ): Promise<Response>;
 }
 
@@ -29,8 +31,8 @@ export function createWebAgentMessageEntryService(
   return new WebAgentMessageEntryService({
     defaultChatJid: defaults.defaultChatJid,
     defaultAgentId: defaults.defaultAgentId,
-    forwardAgentMessageRequest: (req, pathname, chatJid, agentId, onAccepted) =>
-      handleAgentMessageRequest(channel, req, pathname, chatJid, agentId, onAccepted),
+    forwardAgentMessageRequest: (req, pathname, chatJid, agentId, onAccepted, context) =>
+      handleAgentMessageRequest(channel, req, pathname, chatJid, agentId, onAccepted, context),
   });
 }
 
@@ -48,9 +50,10 @@ export class WebAgentMessageEntryService {
     req: Request,
     pathname: string,
     onAccepted?: AgentMessageAcceptanceHandler,
+    context?: AgentMessageRequestContext,
   ): Promise<Response> {
     const chatJid = this.resolveChatJid(req);
-    return this.options.forwardAgentMessageRequest(req, pathname, chatJid, this.options.defaultAgentId, onAccepted);
+    return this.options.forwardAgentMessageRequest(req, pathname, chatJid, this.options.defaultAgentId, onAccepted, context);
   }
 
   private resolveChatJid(req: Request): string {

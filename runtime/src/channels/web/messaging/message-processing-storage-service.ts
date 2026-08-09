@@ -25,6 +25,7 @@ export interface WebChannelStoreMessageOptions {
   isTerminalAgentReply?: boolean;
   isSteeringMessage?: boolean;
   removeProtectedContinuationForSourceMessageId?: string | null;
+  acceptDurableSource?: boolean;
   consumeDeferredFollowupRowId?: number | null;
 }
 
@@ -97,6 +98,7 @@ export class WebMessageProcessingStorageService {
         isTerminalAgentReply: options.isTerminalAgentReply,
         isSteeringMessage: options.isSteeringMessage,
         removeProtectedContinuationForSourceMessageId: options.removeProtectedContinuationForSourceMessageId,
+        acceptDurableSource: options.acceptDurableSource,
         consumeDeferredFollowupRowId: options.consumeDeferredFollowupRowId,
       },
     );

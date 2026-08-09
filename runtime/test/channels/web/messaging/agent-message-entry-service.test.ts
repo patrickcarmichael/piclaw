@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { WebAgentMessageEntryService } from "../../../../src/channels/web/messaging/agent-message-entry-service.js";
+import { createTrustedAgentMessageRequestContext } from "../../../../src/channels/web/messaging/agent-message-provenance.js";
 
 describe("WebAgentMessageEntryService", () => {
   test("parses chat_jid and falls back to the default chat before forwarding", async () => {
@@ -47,12 +48,14 @@ describe("WebAgentMessageEntryService", () => {
     });
   });
 
-  test("forwards the durable-acceptance callback through the trusted entry seam", async () => {
+  test("forwards durable acceptance and opaque provenance through the trusted entry seam", async () => {
     const accepted: unknown[] = [];
+    let forwardedContext: object | undefined;
     const service = new WebAgentMessageEntryService({
       defaultChatJid: "web:default",
       defaultAgentId: "default",
-      forwardAgentMessageRequest: async (_req, _pathname, _chatJid, _agentId, onAccepted) => {
+      forwardAgentMessageRequest: async (_req, _pathname, _chatJid, _agentId, onAccepted, context) => {
+        forwardedContext = context;
         onAccepted?.({
           chat_jid: "web:branch",
           row_id: 42,
@@ -64,12 +67,15 @@ describe("WebAgentMessageEntryService", () => {
       },
     });
 
+    const context = createTrustedAgentMessageRequestContext({ source: "runtime.test" });
     await service.handleAgentMessage(
       new Request("https://example.com/agent/default/message?chat_jid=web%3Abranch", { method: "POST" }),
       "/agent/default/message",
       (acceptance) => accepted.push(acceptance),
+      context,
     );
 
+    expect(forwardedContext).toBe(context);
     expect(accepted).toEqual([{
       chat_jid: "web:branch",
       row_id: 42,

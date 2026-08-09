@@ -113,6 +113,7 @@ export interface DeferredQueuedFollowupRecord {
   screenHint?: string;
   source?: string;
   queuedBy?: QueuedFollowupSourceMetadata;
+  durable?: boolean;
   /** Number of times materializeNextDeferredFollowup has failed for this item. */
   materializeRetries?: number;
 }

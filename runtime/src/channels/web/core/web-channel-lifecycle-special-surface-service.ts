@@ -11,6 +11,7 @@ import {
 } from "../agent/agent-peer-message-relay-service.js";
 import type { WebServerLifecycleGatewayService, WebSocketSessionData } from "../server-lifecycle-gateway-service.js";
 import type { AgentMessageAcceptanceHandler } from "../messaging/agent-message-acceptance.js";
+import type { AgentMessageRequestContext } from "../messaging/agent-message-provenance.js";
 import type { WebChannelLike } from "./web-channel-contracts.js";
 
 type WebChannelLifecycleSpecialSurfaceServerLifecycle = Pick<
@@ -100,11 +101,12 @@ export class WebChannelLifecycleSpecialSurfaceService {
     req: Request,
     pathname: string,
     onAccepted?: AgentMessageAcceptanceHandler,
+    context?: AgentMessageRequestContext,
   ): Promise<Response> {
     return getWebAgentMessageEntryService(
       this.channel as unknown as WebChannelLike & { agentMessageEntryService?: WebAgentMessageEntryService },
       this.defaults,
-    ).handleAgentMessage(req, pathname, onAccepted);
+    ).handleAgentMessage(req, pathname, onAccepted, context);
   }
 }
 

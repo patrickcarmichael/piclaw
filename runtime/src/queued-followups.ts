@@ -25,6 +25,8 @@ export interface QueuedFollowupItem {
   screenHint?: string;
   source?: string;
   queuedBy?: QueuedFollowupSourceMetadata;
+  /** Trusted in-process enqueue should become a durable source when materialized. */
+  durable?: boolean;
   /** Number of times materializeNextDeferredFollowup has failed for this item. */
   materializeRetries?: number;
 }
@@ -85,6 +87,7 @@ export function projectQueuedFollowupItem(
     screenHint: trimOptionalString(item.screenHint),
     source: trimOptionalString(item.source),
     queuedBy: normalizeQueuedFollowupSourceMetadata(item.queuedBy),
+    ...(item.durable === true ? { durable: true } : {}),
     ...(materializeRetries !== undefined ? { materializeRetries } : {}),
   };
 }

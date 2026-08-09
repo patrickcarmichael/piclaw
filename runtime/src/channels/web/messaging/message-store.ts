@@ -9,6 +9,7 @@
  */
 
 import {
+  acceptStoredChatMessageSource,
   attachMediaToMessage,
   clampWebContent,
   createMedia,
@@ -38,6 +39,8 @@ export interface StoreWebMessageOptions {
   isSteeringMessage?: boolean;
   /** Remove stale protected intent atomically with this terminal row insert. */
   removeProtectedContinuationForSourceMessageId?: string | null;
+  /** Atomically register this user row as accepted durable work. */
+  acceptDurableSource?: boolean;
   /** Atomically remove this deferred queue row with the user-message insert. */
   consumeDeferredFollowupRowId?: number | null;
   /** Fault-injection seam used to prove transaction rollback before consume. */
@@ -137,6 +140,9 @@ export function storeWebMessage(
       // is provided. This creates a consistent thread root for replies.
       if (!params.isBot && (options.threadId === null || options.threadId === undefined)) {
         getDb().prepare("UPDATE messages SET thread_id = ? WHERE rowid = ?").run(rowId, rowId);
+      }
+      if (!params.isBot && options.acceptDurableSource === true) {
+        acceptStoredChatMessageSource(params.chatJid, rowId);
       }
 
       const sourceMessageId = typeof options.removeProtectedContinuationForSourceMessageId === "string"

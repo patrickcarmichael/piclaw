@@ -11,6 +11,11 @@
 import type { WebChannelLike } from "../core/web-channel-contracts.js";
 import type { AgentMessageAcceptanceHandler } from "../messaging/agent-message-acceptance.js";
 import {
+  getTrustedAgentMessageProvenance,
+  type AgentMessageRequestContext,
+  type TrustedAgentMessageProvenance,
+} from "../messaging/agent-message-provenance.js";
+import {
   getIdentityConfig,
   getRoutingConfig,
 } from "../../../core/config.js";
@@ -215,6 +220,8 @@ type QueueDeferredFollowupExtras = {
   linkPreviews?: unknown[];
   screenHint?: string;
   source?: string;
+  queuedBy?: TrustedAgentMessageProvenance["queuedBy"];
+  durable?: boolean;
   browserContext?: BrowserObservabilityContext;
   wakeIfIdle?: boolean;
 };
@@ -676,8 +683,10 @@ export async function handleAgentMessage(
   chatJid: string,
   defaultAgentId: string,
   onAccepted?: AgentMessageAcceptanceHandler,
+  context?: AgentMessageRequestContext,
 ): Promise<Response> {
   const agentId = pathname.split("/")[2] || defaultAgentId;
+  const trustedProvenance = getTrustedAgentMessageProvenance(context);
   const browserObservability = getBrowserObservabilityContext(req);
   const parsed = await parseAgentMessageRequest(req);
   if (parsed.error || !parsed.payload) return channel.json({ error: parsed.error }, 400);
@@ -771,7 +780,7 @@ export async function handleAgentMessage(
       }),
     });
 
-    const forwardRes = await handleAgentMessage(channel, forwardReq, pathname, mentionTarget.chat_jid, defaultAgentId, onAccepted);
+    const forwardRes = await handleAgentMessage(channel, forwardReq, pathname, mentionTarget.chat_jid, defaultAgentId, onAccepted, context);
     if (!forwardRes.ok) {
       return forwardRes;
     }
@@ -799,13 +808,13 @@ export async function handleAgentMessage(
     // start their own thread when materialized (self-rooted via
     // storeWebMessage's default behaviour).
     const queuedThreadId: number | null = null;
-    const queuedBy = extras.browserContext
+    const queuedBy = extras.queuedBy ?? (extras.browserContext
       ? {
           ...(extras.browserContext.userId ? { userId: extras.browserContext.userId } : {}),
           ...(extras.browserContext.sessionId ? { sessionId: extras.browserContext.sessionId } : {}),
           ...(extras.browserContext.clientId ? { clientId: extras.browserContext.clientId } : {}),
         }
-      : undefined;
+      : undefined);
     const queuedRowId = channel.enqueueQueuedFollowupItem(chatJid, 0, queuedContent, queuedThreadId, queuedAt, {
       mediaIds: extras.mediaIds,
       contentBlocks: extras.contentBlocks,
@@ -813,6 +822,7 @@ export async function handleAgentMessage(
       screenHint: extras.screenHint,
       source: extras.source,
       queuedBy: queuedBy && Object.keys(queuedBy).length > 0 ? queuedBy : undefined,
+      ...(extras.durable === true ? { durable: true } : {}),
     });
     channel.broadcastEvent("agent_followup_queued", {
       chat_jid: chatJid,
@@ -1060,15 +1070,17 @@ export async function handleAgentMessage(
       contentBlocks: normalized.contentBlocks,
       linkPreviews: normalized.linkPreviews,
       screenHint: normalized.screenHint,
-      source: "web.compose",
-      browserContext: browserObservability,
+      source: trustedProvenance?.source ?? "web.compose",
+      queuedBy: trustedProvenance?.queuedBy,
+      durable: trustedProvenance !== null,
+      browserContext: trustedProvenance ? undefined : browserObservability,
       wakeIfIdle: hasQueuedBacklog && !isActive,
     });
 
     return response;
   }
 
-  const durableDirectNormal = new URL(req.url).hostname !== "internal"
+  const durableDirectNormal = (new URL(req.url).hostname !== "internal" || trustedProvenance !== null)
     && !command
     && !themeCommand
     && !metersCommand
@@ -1214,8 +1226,8 @@ export async function handleAgentMessage(
       interaction.id,
       interaction.timestamp,
       {
-        source: "web.compose_persisted",
-        queuedBy: {
+        source: trustedProvenance?.source ?? "web.compose_persisted",
+        queuedBy: trustedProvenance?.queuedBy ?? {
           ...(browserObservability.userId ? { userId: browserObservability.userId } : {}),
           ...(browserObservability.sessionId ? { sessionId: browserObservability.sessionId } : {}),
           ...(browserObservability.clientId ? { clientId: browserObservability.clientId } : {}),
@@ -1228,7 +1240,7 @@ export async function handleAgentMessage(
       row_id: interaction.id,
       content,
       timestamp: interaction.timestamp,
-      source: "web.compose_persisted",
+      source: trustedProvenance?.source ?? "web.compose_persisted",
     });
 
     return channel.json(

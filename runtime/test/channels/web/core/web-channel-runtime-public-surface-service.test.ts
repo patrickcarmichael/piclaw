@@ -5,6 +5,7 @@ import {
   createWebChannelRuntimePublicSurfaceService,
   getWebChannelRuntimePublicSurfaceService,
 } from "../../../../src/channels/web/core/web-channel-runtime-public-surface-service.js";
+import { getTrustedAgentMessageProvenance } from "../../../../src/channels/web/messaging/agent-message-provenance.js";
 
 function interaction(id: number): InteractionRow {
   return {
@@ -16,6 +17,10 @@ function interaction(id: number): InteractionRow {
 }
 
 describe("web channel runtime public surface service", () => {
+  test("does not trust a lookalike in-process provenance object", () => {
+    expect(getTrustedAgentMessageProvenance({ source: "goal.continuation", durable: true })).toBeNull();
+  });
+
   test("stores only plain text extension working-indicator frames", () => {
     const service = createWebChannelRuntimePublicSurfaceService({
       runtimeFollowupFacade: {} as any,
@@ -43,11 +48,13 @@ describe("web channel runtime public surface service", () => {
   test("delegates targeted runtime agent messages to the web handler path when available", async () => {
     const calls: string[] = [];
     let body: Record<string, unknown> | null = null;
+    let provenance: ReturnType<typeof getTrustedAgentMessageProvenance> = null;
     const service = createWebChannelRuntimePublicSurfaceService({
-      handleAgentMessage: async (req, pathname) => {
+      handleAgentMessage: async (req, pathname, _onAccepted, context) => {
         const url = new URL(req.url);
         calls.push(`handler:${pathname}:${url.searchParams.get("chat_jid")}`);
         body = await req.json() as Record<string, unknown>;
+        provenance = getTrustedAgentMessageProvenance(context);
         return Response.json({
           user_message: { id: 77, chat_jid: "web:goal", timestamp: "2026-03-28T00:00:00.000Z", data: { thread_id: 77 } },
           thread_id: 77,
@@ -66,6 +73,8 @@ describe("web channel runtime public surface service", () => {
       linkPreviews: [{ url: "https://example.invalid" }],
       threadId: 5,
       mode: "queue",
+      source: "goal.continuation",
+      queuedBy: { source: "goal", sourceMessageId: "goal-source-1" },
     });
 
     expect(result.status).toBe("ok");
@@ -74,6 +83,10 @@ describe("web channel runtime public surface service", () => {
     expect(result.thread_id).toBe(77);
     expect(result.created).toBe(true);
     expect(calls).toEqual(["handler:/agent/default/message:web:goal"]);
+    expect(provenance).toEqual({
+      source: "goal.continuation",
+      queuedBy: { source: "goal", sourceMessageId: "goal-source-1" },
+    });
     expect(body).toEqual({
       content: "🎯 Continue goal: Ship it",
       mode: "queue",

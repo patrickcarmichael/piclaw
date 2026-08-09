@@ -177,7 +177,7 @@ export function installWebChannelPrototype(
         queuedContent: string,
         threadId?: number | null,
         queuedAt?: string,
-        extras?: { mediaIds?: number[]; contentBlocks?: unknown[]; linkPreviews?: unknown[]; screenHint?: string; source?: string; queuedBy?: QueuedFollowupItem["queuedBy"] },
+        extras?: { mediaIds?: number[]; contentBlocks?: unknown[]; linkPreviews?: unknown[]; screenHint?: string; source?: string; queuedBy?: QueuedFollowupItem["queuedBy"]; durable?: boolean },
       ): number => service.enqueueQueuedFollowupItem(chatJid, rowId, queuedContent, threadId, queuedAt, extras)),
     },
     peekQueuedFollowupItem: {
@@ -723,7 +723,8 @@ export function installWebChannelPrototype(
         req: Request,
         pathname: string,
         onAccepted?: Parameters<WebChannelLike["handleAgentMessage"]>[2],
-      ) => service.handleAgentMessage(req, pathname, onAccepted)),
+        context?: Parameters<WebChannelLike["handleAgentMessage"]>[3],
+      ) => service.handleAgentMessage(req, pathname, onAccepted, context)),
     },
     processChat: {
       configurable: true,
@@ -748,6 +749,7 @@ export function installWebChannelPrototype(
           isTerminalAgentReply?: boolean;
           isSteeringMessage?: boolean;
           removeProtectedContinuationForSourceMessageId?: string | null;
+          acceptDurableSource?: boolean;
           consumeDeferredFollowupRowId?: number | null;
         } = {},
       ): InteractionRow | null => service.storeMessage(chatJid, content, isBot, mediaIds, options)),

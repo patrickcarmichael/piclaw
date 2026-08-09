@@ -380,6 +380,7 @@ function materializeQueuedFollowup(
       linkPreviews: Array.isArray(item.linkPreviews) ? item.linkPreviews : undefined,
       threadId: item.threadId ?? undefined,
       screenHint: item.screenHint,
+      acceptDurableSource: item.durable === true,
       consumeDeferredFollowupRowId: item.rowId,
     },
   );
