@@ -2964,6 +2964,13 @@ test("restart recovery replays pending steers exactly once through one durable s
   expect(db.getDb().prepare(`SELECT COUNT(*) AS count FROM chat_accepted_sources
     WHERE chat_jid = ? AND source_kind = 'restart_continuation'`).get("web:default") as any)
     .toEqual({ count: 1 });
+  expect(db.getDb().prepare(`SELECT content, is_steering_message FROM messages
+    WHERE chat_jid = ? AND content IN (?, ?) ORDER BY rowid`).all("web:default", ...steerTexts) as any)
+    .toEqual([
+      { content: steerTexts[0], is_steering_message: 1 },
+      { content: steerTexts[1], is_steering_message: 1 },
+    ]);
+  expect(db.getMessagesSince("web:default", db.getChatCursor("web:default"), "Pi")).toEqual([]);
 
   await web.processChat("web:default", "default");
 
@@ -2973,6 +2980,7 @@ test("restart recovery replays pending steers exactly once through one durable s
   expect(prompts[0].indexOf(steerTexts[0])).toBeLessThan(prompts[0].indexOf(steerTexts[1]));
   expect(db.getChatOperationDisposition(successor.sourceSeq)).toMatchObject({ outcome: "succeeded" });
   expect(db.peekNextAcceptedChatSource("web:default")).toBeNull();
+  expect(db.getMessagesSince("web:default", db.getChatCursor("web:default"), "Pi")).toEqual([]);
   expect(db.getDb().prepare(`SELECT COUNT(*) AS count FROM messages
     WHERE chat_jid = ? AND is_bot_message = 1 AND content = 'Restart steers completed.'`)
     .get("web:default") as any).toEqual({ count: 1 });

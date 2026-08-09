@@ -1054,6 +1054,17 @@ export function completeChatOperation(
           if (!disposition || disposition.outcome !== "interrupted" || disposition.cause !== "restart_steer_carried") {
             throw new ChatOperationInvariantError("Carried restart steer requires an explicit carried disposition");
           }
+          if (!intentSource.payloadRef.startsWith("message:")) {
+            throw new ChatOperationInvariantError("Carried restart steer requires one durable message payload");
+          }
+          const messageId = intentSource.payloadRef.slice("message:".length);
+          const message = db.prepare(`SELECT is_bot_message FROM messages WHERE chat_jid = ? AND id = ?`)
+            .get(chatJid, messageId) as { is_bot_message: number } | undefined;
+          if (!message || message.is_bot_message === 1) {
+            throw new ChatOperationInvariantError("Carried restart steer message is missing or invalid");
+          }
+          db.prepare(`UPDATE messages SET is_steering_message = 1 WHERE chat_jid = ? AND id = ?`)
+            .run(chatJid, messageId);
           db.prepare(`INSERT INTO chat_goal_continuation_intents
             (continuation_source_seq, intent_source_seq, ordinal) VALUES (?, ?, ?)`)
             .run(successor.sourceSeq, intentSource.sourceSeq, ordinal);

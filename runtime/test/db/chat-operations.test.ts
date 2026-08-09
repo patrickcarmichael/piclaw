@@ -17,6 +17,24 @@ const register = (chatJid: string, id: string, acceptedAt = "2026-08-07T22:00:00
   return op.storeAcceptedChatMessageSource({ id, chat_jid: chatJid, sender: "user", sender_name: "User", content: id,
     timestamp: acceptedAt, is_from_me: false, is_bot_message: false }, acceptedAt).source;
 };
+const registerSteer = (chatJid: string, state: ChatOperationState, id: string, acceptedAt: string) => {
+  db.storeMessage({
+    id,
+    chat_jid: chatJid,
+    sender: "user",
+    sender_name: "User",
+    content: id,
+    timestamp: acceptedAt,
+    is_from_me: false,
+    is_bot_message: false,
+  });
+  return op.registerChatOperationIntent(chatJid, owner(state), {
+    sourceKind: "steer",
+    sourceId: id,
+    acceptedAt,
+    payloadRef: `message:${id}`,
+  });
+};
 const terminal = (chatJid: string, id: string) => ({
   id, chat_jid: chatJid, sender: "bot", sender_name: "Pi", content: "done",
   timestamp: "2026-08-07T22:01:00.000Z", is_from_me: true, is_bot_message: true,
@@ -224,12 +242,10 @@ describe("durable accepted-input operations", () => {
       const chatJid = jid(`restart-steers-${boundary}`);
       const root = register(chatJid, `restart-root-${boundary}`);
       const claimed = op.claimNextChatOperation(chatJid).operation!;
-      const first = op.registerChatOperationIntent(chatJid, owner(claimed), {
-        sourceKind: "steer", sourceId: `restart-first-${boundary}`, acceptedAt: "now-1", payloadRef: `steer:first-${boundary}`,
-      });
-      const second = op.registerChatOperationIntent(chatJid, owner(claimed), {
-        sourceKind: "steer", sourceId: `restart-second-${boundary}`, acceptedAt: "now-2", payloadRef: `steer:second-${boundary}`,
-      });
+      const firstMessageId = `restart-first-${boundary}`;
+      const secondMessageId = `restart-second-${boundary}`;
+      const first = registerSteer(chatJid, claimed, firstMessageId, "now-1");
+      const second = registerSteer(chatJid, claimed, secondMessageId, "now-2");
       if (first.status !== "registered" || second.status !== "registered") throw new Error("expected restart steers");
       const carriedIntentSourceSeqs = [first.source.sourceSeq, second.source.sourceSeq];
       const request = {
@@ -263,6 +279,12 @@ describe("durable accepted-input operations", () => {
         WHERE chat_jid = ? AND source_kind = 'restart_continuation'`).get(chatJid)).toBeNull();
       expect(db.getDb().prepare("SELECT 1 FROM messages WHERE chat_jid = ? AND id = ?")
         .get(chatJid, request.artifact.message.id)).toBeNull();
+      expect(db.getDb().prepare(`SELECT id, is_steering_message FROM messages
+        WHERE chat_jid = ? AND id IN (?, ?) ORDER BY rowid`).all(chatJid, firstMessageId, secondMessageId))
+        .toEqual([
+          { id: firstMessageId, is_steering_message: 0 },
+          { id: secondMessageId, is_steering_message: 0 },
+        ]);
 
       expect(op.completeChatOperation(chatJid, request).status).toBe("completed");
       const successor = op.peekNextAcceptedChatSource(chatJid)!;
@@ -274,6 +296,12 @@ describe("durable accepted-input operations", () => {
       expect(op.getRestartContinuationParentSource(successor)?.sourceSeq).toBe(root.sourceSeq);
       expect(op.getContinuationCarriedIntentSources(successor.sourceSeq).map((item) => item.sourceSeq))
         .toEqual(carriedIntentSourceSeqs);
+      expect(db.getDb().prepare(`SELECT id, is_steering_message FROM messages
+        WHERE chat_jid = ? AND id IN (?, ?) ORDER BY rowid`).all(chatJid, firstMessageId, secondMessageId))
+        .toEqual([
+          { id: firstMessageId, is_steering_message: 1 },
+          { id: secondMessageId, is_steering_message: 1 },
+        ]);
       expect(op.completeChatOperation(chatJid, request).status).toBe("repeated");
     }
   });
@@ -303,12 +331,12 @@ describe("durable accepted-input operations", () => {
     }).status).toBe("completed");
     const firstGoal = op.claimNextChatOperation(chatJid);
     if (firstGoal.status !== "claimed") throw new Error("expected first Goal continuation");
-    const steer = op.registerChatOperationIntent(chatJid, owner(firstGoal.operation), {
-      sourceKind: "steer",
-      sourceId: "goal-restart-steer",
-      acceptedAt: "2026-08-09T09:01:00.000Z",
-      payloadRef: "steer:goal-restart",
-    });
+    const steer = registerSteer(
+      chatJid,
+      firstGoal.operation,
+      "goal-restart-steer",
+      "2026-08-09T09:01:00.000Z",
+    );
     if (steer.status !== "registered") throw new Error("expected restart steer");
     expect(op.completeChatOperation(chatJid, {
       owner: owner(firstGoal.operation),
