@@ -1,5 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import {
+  blockChatOperation,
+  cancelChatOperation,
   claimNextChatOperation,
   completeChatOperation,
   getAcceptedChatSource,
@@ -9,6 +11,8 @@ import {
   getDb,
   initDatabase,
   promoteChatOperation,
+  registerChatOperationIntent,
+  retryBlockedChatOperation,
   storeAcceptedChatMessageSource,
   storeMessage,
   type ChatOperationCompletionBoundary,
@@ -64,6 +68,48 @@ function recoveryContext(overrides: Partial<WebRecoveryContext> = {}): WebRecove
     processChat: async () => {},
     ...overrides,
   };
+}
+
+function registerPendingSteer(
+  run: ReturnType<typeof createRunningPrompt>,
+  content: string,
+  timestamp = new Date().toISOString(),
+): number {
+  const messageId = `steer-${crypto.randomUUID()}`;
+  storeMessage({
+    id: messageId,
+    chat_jid: run.operation.chatJid,
+    sender: "user",
+    sender_name: "User",
+    content,
+    timestamp,
+    is_from_me: false,
+    is_bot_message: false,
+    is_steering_message: true,
+  });
+  const registered = registerChatOperationIntent(run.operation.chatJid, owner(run.operation), {
+    sourceKind: "steer",
+    sourceId: messageId,
+    acceptedAt: timestamp,
+    payloadRef: `message:${messageId}`,
+  });
+  if (registered.status !== "registered") throw new Error(`Expected steer registration, got ${registered.status}`);
+  return registered.source.sourceSeq;
+}
+
+function restartSuccessors(chatJid: string): Array<{ source_seq: number; source_kind: string; source_id: string; payload_ref: string }> {
+  return getDb().prepare(`SELECT source_seq, source_kind, source_id, payload_ref FROM chat_accepted_sources
+    WHERE chat_jid = ? AND source_kind = 'restart_continuation' ORDER BY source_seq`)
+    .all(chatJid) as Array<{ source_seq: number; source_kind: string; source_id: string; payload_ref: string }>;
+}
+
+function carriedSteerText(successorSourceSeq: number): string[] {
+  return (getDb().prepare(`SELECT message.content FROM chat_goal_continuation_intents carried
+    JOIN chat_accepted_sources intent ON intent.source_seq = carried.intent_source_seq
+    JOIN messages message ON message.chat_jid = intent.chat_jid
+      AND ('message:' || message.id) = intent.payload_ref
+    WHERE carried.continuation_source_seq = ? ORDER BY carried.ordinal`).all(successorSourceSeq) as Array<{ content: string }>)
+    .map((row) => row.content);
 }
 
 describe("atomic durable restart recovery", () => {
@@ -278,6 +324,135 @@ describe("atomic durable restart recovery", () => {
       // The same owner remains recoverable after rollback.
       recoverInflightRuns(recoveryContext());
       expect(getChatOperation(chatJid)).toBeNull();
+    });
+  }
+
+  for (const evidence of ["partial", "terminal", "none"] as const) {
+    test(`carries pending steers once in source-sequence order after ${evidence} restart evidence`, () => {
+      const chatJid = `web:recover-steers-${evidence}-${crypto.randomUUID()}`;
+      const run = createRunningPrompt(chatJid);
+      const firstIntentSeq = registerPendingSteer(run, "First accepted steer", new Date(Date.now() + 1).toISOString());
+      const secondIntentSeq = registerPendingSteer(run, "Second accepted steer", new Date(Date.now() + 2).toISOString());
+      let replyId: string | null = null;
+      if (evidence !== "none") {
+        replyId = `${evidence}-${crypto.randomUUID()}`;
+        storeMessage({
+          id: replyId,
+          chat_jid: chatJid,
+          sender: "web-agent",
+          sender_name: "Pi",
+          content: evidence === "terminal" ? "Finished before restart." : "Visible partial work.",
+          timestamp: new Date(Date.now() + 3).toISOString(),
+          is_from_me: true,
+          is_bot_message: true,
+          is_terminal_agent_reply: evidence === "terminal",
+          operation_id: run.operation.operationId,
+        });
+      }
+
+      recoverInflightRuns(recoveryContext());
+      recoverInflightRuns(recoveryContext());
+
+      expect(getChatOperation(chatJid)).toBeNull();
+      expect(getChatOperationDisposition(run.sourceSeq)).toMatchObject({
+        outcome: evidence === "terminal" ? "succeeded" : "interrupted",
+        cause: evidence === "terminal"
+          ? "recovered_terminal_output"
+          : evidence === "partial"
+            ? "recovered_partial_output"
+            : "service_restart",
+        provenance: "web_startup_recovery",
+        ...(replyId ? { terminalMessageId: replyId } : {}),
+      });
+      for (const sourceSeq of [firstIntentSeq, secondIntentSeq]) {
+        expect(getChatOperationDisposition(sourceSeq)).toMatchObject({
+          outcome: "interrupted",
+          cause: "restart_steer_carried",
+          provenance: "web_startup_recovery",
+          terminalMessageId: null,
+        });
+      }
+      const successors = restartSuccessors(chatJid);
+      expect(successors).toEqual([{
+        source_seq: expect.any(Number),
+        source_kind: "restart_continuation",
+        source_id: `source:${run.sourceSeq}`,
+        payload_ref: `accepted-source:${run.sourceSeq}`,
+      }]);
+      expect(carriedSteerText(successors[0].source_seq)).toEqual([
+        "First accepted steer",
+        "Second accepted steer",
+      ]);
+      expect(getDb().prepare(`SELECT COUNT(*) AS count FROM chat_operation_dispositions
+        WHERE source_seq IN (?, ?) AND cause = 'steer_applied'`).get(firstIntentSeq, secondIntentSeq))
+        .toEqual({ count: 0 });
+    });
+  }
+
+  test("cancellation observed before restart completion wins without recovery writes", () => {
+    const chatJid = `web:recover-steers-cancel-${crypto.randomUUID()}`;
+    const run = createRunningPrompt(chatJid);
+    const intentSeq = registerPendingSteer(run, "Do not lose this steer");
+    const cancelled = cancelChatOperation(chatJid, owner(run.operation), {
+      cause: "user_abort",
+      requestedAt: new Date().toISOString(),
+    });
+    if (cancelled.status !== "applied") throw new Error("Expected cancellation");
+
+    recoverInflightRuns(recoveryContext());
+
+    expect(getChatOperation(chatJid)).toEqual(cancelled.operation);
+    expect(getChatOperationDisposition(run.sourceSeq)).toBeNull();
+    expect(getChatOperationDisposition(intentSeq)).toBeNull();
+    expect(restartSuccessors(chatJid)).toEqual([]);
+    expect(getDb().prepare(`SELECT COUNT(*) AS count FROM messages
+      WHERE chat_jid = ? AND is_bot_message = 1`).get(chatJid)).toEqual({ count: 0 });
+  });
+
+  for (const race of ["cancellation", "unblock"] as const) {
+    test(`${race} ownership drift before restart commit wins without partial writes`, () => {
+      const chatJid = `web:recover-steers-race-${race}-${crypto.randomUUID()}`;
+      const run = createRunningPrompt(chatJid);
+      const intentSeq = registerPendingSteer(run, "Race-safe steer");
+      const source = getAcceptedChatSource(run.sourceSeq);
+      if (!source) throw new Error("Expected accepted source");
+      const store: WebRecoveryStore = {
+        getInflightRuns: () => [],
+        transaction: (execute) => execute(),
+        getAgentReplyStateAfter: () => "none",
+        clearInflightMarker: () => {},
+        rollbackInflightRun: () => {},
+        getAllChatCursors: () => ({}),
+        getKnownChatJids: () => [],
+        getDeferredQueuedFollowups: () => [],
+        getMessagesSince: () => [],
+        getRecoverableDurableRuns: () => [{ operation: run.operation, source }],
+        getLatestAgentReplyForOperation: () => null,
+        completeChatOperation: (jid, request) => {
+          if (race === "cancellation") {
+            const cancelled = cancelChatOperation(jid, owner(run.operation), {
+              cause: "user_abort",
+              requestedAt: new Date().toISOString(),
+            });
+            if (cancelled.status !== "applied") throw new Error("Expected cancellation race");
+          } else {
+            const blocked = blockChatOperation(jid, owner(run.operation));
+            if (blocked.status !== "applied") throw new Error("Expected block race");
+            const unblocked = retryBlockedChatOperation(jid, owner(blocked.operation));
+            if (unblocked.status !== "applied") throw new Error("Expected unblock race");
+          }
+          return completeChatOperation(jid, request);
+        },
+      };
+
+      recoverInflightRuns(recoveryContext(), store);
+
+      expect(getChatOperation(chatJid)).not.toBeNull();
+      expect(getChatOperationDisposition(run.sourceSeq)).toBeNull();
+      expect(getChatOperationDisposition(intentSeq)).toBeNull();
+      expect(restartSuccessors(chatJid)).toEqual([]);
+      expect(getDb().prepare(`SELECT COUNT(*) AS count FROM messages
+        WHERE chat_jid = ? AND is_bot_message = 1`).get(chatJid)).toEqual({ count: 0 });
     });
   }
 
