@@ -3123,6 +3123,149 @@ test("durable Goal deadline checkpoint commits one visible successor and replays
   }
 });
 
+test("Goal checkpoint fence classifies a steer accepted after its intent snapshot as a new durable prompt", async () => {
+  const ws = createTempWorkspace("piclaw-web-channel-");
+  cleanupWorkspace = ws.cleanup;
+  restoreEnv = setEnv({ PICLAW_WORKSPACE: ws.workspace, PICLAW_STORE: ws.store, PICLAW_DATA: ws.data });
+
+  const db = await import("../../../src/db.js");
+  const runtime = await import("../../../src/addons/runtime-contributions.js");
+  db.initDatabase();
+  db.getDb().exec("DELETE FROM chat_goal_continuation_intents; DELETE FROM message_media; DELETE FROM messages; DELETE FROM chats; DELETE FROM chat_cursors;");
+  db.storeChatMetadata("web:default", new Date().toISOString(), "Web");
+  const accepted = db.storeAcceptedChatMessageSource({
+    id: `msg-${crypto.randomUUID()}`,
+    chat_jid: "web:default",
+    sender: "user",
+    sender_name: "User",
+    content: "checkpoint without losing a late steer",
+    timestamp: new Date().toISOString(),
+    is_from_me: false,
+    is_bot_message: false,
+  }).source;
+  const lateMessageId = `late-steer-${crypto.randomUUID()}`;
+  const lateAcceptedAt = new Date(Date.now() + 1).toISOString();
+  db.storeMessage({
+    id: lateMessageId,
+    chat_jid: "web:default",
+    sender: "user",
+    sender_name: "User",
+    content: "late steer must become new work",
+    timestamp: lateAcceptedAt,
+    is_from_me: false,
+    is_bot_message: false,
+  });
+
+  const checkpointId = `checkpoint-${crypto.randomUUID()}`;
+  let lateRegistration: any = null;
+  let scheduled = 0;
+  let revalidations = 0;
+  const resolution = {
+    action: "continue" as const,
+    goalId: "goal-late-steer",
+    objective: "Fence late steering",
+    planFingerprint: "plan-v1",
+    visibleText: "Goal checkpoint fenced.",
+    continuationText: "Continue after the fence",
+  };
+  const provider = {
+    tryLatch(input: any) {
+      return { ...input, goalId: resolution.goalId, objective: resolution.objective,
+        planFingerprint: resolution.planFingerprint, expiresAt: new Date(Date.now() + 60_000).toISOString() };
+    },
+    revalidate() {
+      revalidations += 1;
+      if (revalidations !== 1) return { ...resolution };
+      return {
+        ...resolution,
+        toJSON() {
+          const operation = db.getChatOperation("web:default")!;
+          lateRegistration = db.registerChatOperationIntent("web:default", {
+            operationId: operation.operationId,
+            sourceSeq: operation.sourceSeq,
+            phase: operation.phase,
+            generation: operation.generation,
+          }, {
+            sourceKind: "steer",
+            sourceId: lateMessageId,
+            acceptedAt: lateAcceptedAt,
+            payloadRef: `message:${lateMessageId}`,
+          });
+          return { ...resolution };
+        },
+      };
+    },
+    markScheduled() { scheduled += 1; },
+    release() {},
+    resolveContinuation() { return { status: "continue" as const, content: "Continue fenced goal with tools" }; },
+  };
+  const unregister = runtime.registerAddonGoalDeadlineCheckpointProvider(provider);
+  try {
+    const webMod = await import("../../../src/channels/web.js");
+    let checkpointResult: boolean | null = null;
+    const web = new (webMod.WebChannel as any)({
+      queue: { enqueue: () => {} },
+      agentPool: {
+        setSessionBinder: () => {},
+        runAgent: async (_prompt: string, _chatJid: string, options: any) => {
+          const deadlineAt = new Date(Date.now() + 60_000).toISOString();
+          expect(options.goalDeadlineCheckpoint.tryLatch({
+            checkpointId,
+            oldTurnId: options.turnId,
+            timeoutMs: 3_600_000,
+            reserveMs: options.goalDeadlineCheckpoint.reserveMs,
+            deadlineAt,
+            triggeredAt: new Date().toISOString(),
+          })).toBe(true);
+          checkpointResult = await options.onGoalDeadlineCheckpoint({
+            checkpointId,
+            oldTurnId: options.turnId,
+            timeoutMs: 3_600_000,
+            reserveMs: options.goalDeadlineCheckpoint.reserveMs,
+            deadlineAt,
+            triggeredAt: new Date().toISOString(),
+            settledAt: new Date().toISOString(),
+            settlement: "idle",
+            abortError: null,
+            pendingSteering: [],
+            pendingFollowUps: [],
+          });
+          return { status: "error", result: null, error: "checkpointed", abortCause: "goal_deadline_checkpoint" };
+        },
+        getContextUsageForChat: async () => null,
+      },
+    });
+
+    await web.processChat("web:default", "default");
+
+    expect(checkpointResult).toBe(true);
+    expect(scheduled).toBe(1);
+    expect(db.getChatOperationDisposition(accepted.sourceSeq)).toMatchObject({
+      outcome: "interrupted",
+      cause: "goal_deadline_checkpoint",
+    });
+    expect(lateRegistration).toMatchObject({
+      status: "deferred",
+      source: {
+        sourceClass: "prompt",
+        sourceKind: "message",
+        sourceId: lateMessageId,
+        selectable: true,
+        operationId: null,
+      },
+    });
+    expect(db.getPendingChatOperationIntentSources(lateRegistration.source.operationId ?? "")).toEqual([]);
+    expect(db.getDb().prepare(`SELECT source_kind FROM chat_accepted_sources
+      WHERE chat_jid = ? AND selectable = 1 AND source_seq > ? ORDER BY source_seq`)
+      .all("web:default", accepted.sourceSeq)).toEqual([
+      { source_kind: "message" },
+      { source_kind: "goal_continuation" },
+    ]);
+  } finally {
+    unregister();
+  }
+});
+
 test("real AgentPool committed Goal checkpoint finalizes and wakes its durable successor exactly once", async () => {
   const ws = createTempWorkspace("piclaw-web-channel-");
   cleanupWorkspace = ws.cleanup;
