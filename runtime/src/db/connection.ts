@@ -493,6 +493,7 @@ function createSchema(database: Database): void {
       provenance TEXT NOT NULL,
       terminal_message_chat_jid TEXT,
       terminal_message_id TEXT,
+      internal_artifact_kind TEXT,
       created_at TEXT NOT NULL,
       UNIQUE (chat_jid, source_kind, source_id),
       UNIQUE (terminal_message_chat_jid, terminal_message_id)
@@ -634,6 +635,27 @@ function createSchema(database: Database): void {
  * Handles the `content_blocks`, `link_previews`, and `thread_id` columns
  * added for the web channel's rich-message support.
  */
+function ensureChatOperationDispositionColumns(database: Database): void {
+  const columns = database.prepare("PRAGMA table_info(chat_operation_dispositions)").all() as Array<{ name: string }>;
+  if (!columns.some((column) => column.name === "internal_artifact_kind")) {
+    try {
+      database.exec("ALTER TABLE chat_operation_dispositions ADD COLUMN internal_artifact_kind TEXT");
+    } catch (err) {
+      debugSuppressedError(log, "Operation-disposition migration raced an already-updated schema state.", err, {
+        operation: "db.ensure_chat_operation_disposition_columns.add_column",
+        name: "internal_artifact_kind",
+      });
+    }
+  }
+  database.exec(`
+    CREATE TRIGGER IF NOT EXISTS chat_operation_disposition_internal_artifact_immutable
+    BEFORE UPDATE OF internal_artifact_kind ON chat_operation_dispositions
+    BEGIN
+      SELECT RAISE(ABORT, 'operation disposition internal artifact is immutable');
+    END;
+  `);
+}
+
 function ensureMessageColumns(database: Database): void {
   const columns = database.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>;
   const existing = new Set(columns.map((col) => col.name));
@@ -1044,6 +1066,7 @@ export function initDatabase(): void {
   createSchema(db);
   ensureOwnedMigrationLedger(db);
   ensureChatBranchConstraints(db);
+  ensureChatOperationDispositionColumns(db);
   ensureMessageColumns(db);
   ensureKeychainNoteColumns(db);
   ensureTokenUsageColumns(db);
