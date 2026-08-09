@@ -47,6 +47,7 @@ import {
   getChatOperationDisposition,
   getPendingChatOperationIntentSources,
   getContinuationCarriedIntentSources,
+  getContinuationGoalLineage,
   getGoalContinuationLineage,
   getProtectedContinuationRootSource,
   getRestartContinuationParentSource,
@@ -1892,7 +1893,7 @@ export async function processChat(
     .map((intent) => intent.payloadRef.startsWith("message:")
       ? loadDurableSourceMessage(chatJid, intent.payloadRef.slice("message:".length))
       : null)
-    .filter((message): message is NewMessage => Boolean(message?.is_steering_message));
+    .filter((message): message is NewMessage => Boolean(message));
   if (hasCarriedSteers && carriedSteers.length !== carriedIntentSources.length) {
     blockChatOperation(chatJid, durableOperationOwner(durableOperation!));
     return;
@@ -2593,7 +2594,7 @@ export async function processChat(
                 ? initialResolution.visibleText
                 : "Goal deadline checkpoint could not safely schedule a continuation.";
             const artifactId = createUuid("message");
-            const currentLineage = source.sourceKind === "goal_continuation" ? getGoalContinuationLineage(source) : null;
+            const currentLineage = getContinuationGoalLineage(source);
             const rootSourceSeq = currentLineage?.rootSourceSeq
               ?? (source.sourceKind === "protected_continuation" ? getProtectedContinuationRootSource(source)?.sourceSeq : null)
               ?? (source.sourceKind === "restart_continuation" ? getRestartContinuationRootSource(source)?.sourceSeq : null)

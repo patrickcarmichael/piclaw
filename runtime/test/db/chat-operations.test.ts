@@ -278,6 +278,93 @@ describe("durable accepted-input operations", () => {
     }
   });
 
+  test("Goal lineage advances across an intervening restart continuation", () => {
+    const chatJid = jid("goal-restart-lineage");
+    const root = register(chatJid, "goal-restart-root");
+    const rootClaim = op.claimNextChatOperation(chatJid).operation!;
+    expect(op.completeChatOperation(chatJid, {
+      owner: owner(rootClaim),
+      outcome: "interrupted",
+      cause: "goal_deadline_checkpoint",
+      provenance: "goal:test",
+      createdAt: "2026-08-09T09:00:00.000Z",
+      artifact: { message: terminal(chatJid, `goal-restart-first-${serial}`) },
+      successor: {
+        sourceKind: "goal_continuation",
+        rootSourceSeq: root.sourceSeq,
+        parentSourceSeq: root.sourceSeq,
+        parentGeneration: 0,
+        generation: 1,
+        goalId: "goal-restart",
+        checkpointId: "checkpoint-1",
+        oldTurnId: "turn-1",
+        carriedIntentSourceSeqs: [],
+      },
+    }).status).toBe("completed");
+    const firstGoal = op.claimNextChatOperation(chatJid);
+    if (firstGoal.status !== "claimed") throw new Error("expected first Goal continuation");
+    const steer = op.registerChatOperationIntent(chatJid, owner(firstGoal.operation), {
+      sourceKind: "steer",
+      sourceId: "goal-restart-steer",
+      acceptedAt: "2026-08-09T09:01:00.000Z",
+      payloadRef: "steer:goal-restart",
+    });
+    if (steer.status !== "registered") throw new Error("expected restart steer");
+    expect(op.completeChatOperation(chatJid, {
+      owner: owner(firstGoal.operation),
+      outcome: "interrupted",
+      cause: "recovered_partial_output",
+      provenance: "web_startup_recovery",
+      createdAt: "2026-08-09T09:01:01.000Z",
+      artifact: { message: terminal(chatJid, `goal-restart-recovered-${serial}`) },
+      successor: {
+        sourceKind: "restart_continuation",
+        parentSourceSeq: firstGoal.source.sourceSeq,
+        carriedIntentSourceSeqs: [steer.source.sourceSeq],
+      },
+      intentDispositions: [{
+        sourceSeq: steer.source.sourceSeq,
+        outcome: "interrupted",
+        cause: "restart_steer_carried",
+        provenance: "web_startup_recovery",
+      }],
+    }).status).toBe("completed");
+    const restart = op.claimNextChatOperation(chatJid);
+    if (restart.status !== "claimed") throw new Error("expected restart continuation");
+    expect(op.getContinuationGoalLineage(restart.source)).toMatchObject({
+      rootSourceSeq: root.sourceSeq,
+      generation: 1,
+      goalId: "goal-restart",
+    });
+    expect(op.completeChatOperation(chatJid, {
+      owner: owner(restart.operation),
+      outcome: "interrupted",
+      cause: "goal_deadline_checkpoint",
+      provenance: "goal:test",
+      createdAt: "2026-08-09T09:02:00.000Z",
+      artifact: { message: terminal(chatJid, `goal-restart-second-${serial}`) },
+      successor: {
+        sourceKind: "goal_continuation",
+        rootSourceSeq: root.sourceSeq,
+        parentSourceSeq: restart.source.sourceSeq,
+        parentGeneration: 1,
+        generation: 2,
+        goalId: "goal-restart",
+        checkpointId: "checkpoint-2",
+        oldTurnId: "turn-2",
+        carriedIntentSourceSeqs: [],
+      },
+    }).status).toBe("completed");
+    const secondGoal = op.peekNextAcceptedChatSource(chatJid)!;
+    expect(op.getGoalContinuationLineage(secondGoal)).toMatchObject({
+      rootSourceSeq: root.sourceSeq,
+      parentSourceSeq: restart.source.sourceSeq,
+      parentGeneration: 1,
+      generation: 2,
+      goalId: "goal-restart",
+    });
+  });
+
   test("Goal checkpoint atomically preserves lineage, carried steers, restart claims, and repeated generations", () => {
     const chatJid = jid("goal-checkpoint");
     const root = register(chatJid, "goal-root");

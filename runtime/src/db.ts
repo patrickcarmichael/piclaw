@@ -164,6 +164,7 @@ export {
   getRestartContinuationParentSource,
   getRestartContinuationRootSource,
   getGoalContinuationLineage,
+  getContinuationGoalLineage,
   getContinuationCarriedIntentSources,
   getGoalContinuationCarriedIntentSources,
   getChatOperation,

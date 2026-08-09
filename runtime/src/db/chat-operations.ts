@@ -436,15 +436,35 @@ export function getGoalContinuationLineage(source: AcceptedChatSource): GoalCont
           : parent.sourceSeq;
       if (parentRoot !== parsed.rootSourceSeq || parsed.generation !== 1) return null;
     } else {
-      if (parent.sourceKind !== "goal_continuation") return null;
-      const parentPayload = JSON.parse(parent.payloadRef.slice(GOAL_CONTINUATION_PAYLOAD_PREFIX.length)) as GoalContinuationLineage;
-      if (parentPayload.rootSourceSeq !== parsed.rootSourceSeq || parentPayload.generation !== parsed.parentGeneration
-        || parentPayload.goalId !== parsed.goalId || parsed.generation !== parsed.parentGeneration + 1) return null;
+      const parentLineage = getContinuationGoalLineage(parent);
+      if (!parentLineage || parentLineage.rootSourceSeq !== parsed.rootSourceSeq
+        || parentLineage.generation !== parsed.parentGeneration || parentLineage.goalId !== parsed.goalId
+        || parsed.generation !== parsed.parentGeneration + 1) return null;
     }
     return parsed;
   } catch {
     return null;
   }
+}
+
+export function getContinuationGoalLineage(source: AcceptedChatSource): GoalContinuationLineage | null {
+  let current: AcceptedChatSource | null = source;
+  const seen = new Set<number>();
+  while (current) {
+    if (seen.has(current.sourceSeq)) return null;
+    seen.add(current.sourceSeq);
+    if (current.sourceKind === "goal_continuation") return getGoalContinuationLineage(current);
+    if (current.sourceKind === "restart_continuation") {
+      current = getRestartContinuationParentSource(current);
+      continue;
+    }
+    if (current.sourceKind === "protected_continuation") {
+      current = getProtectedContinuationRootSource(current);
+      continue;
+    }
+    return null;
+  }
+  return null;
 }
 
 export function getContinuationCarriedIntentSources(sourceSeq: number): AcceptedChatSource[] {
@@ -877,7 +897,7 @@ export function completeChatOperation(
         throw new ChatOperationInvariantError("Restart continuation lineage conflicts with the completed source");
       }
       if (request.successor.sourceKind === "goal_continuation") {
-        const currentLineage = source?.sourceKind === "goal_continuation" ? getGoalContinuationLineage(source) : null;
+        const currentLineage = source ? getContinuationGoalLineage(source) : null;
         const protectedRoot = source?.sourceKind === "protected_continuation" ? getProtectedContinuationRootSource(source) : null;
         const restartRoot = source?.sourceKind === "restart_continuation" ? getRestartContinuationRootSource(source) : null;
         const expectedRoot = currentLineage?.rootSourceSeq ?? protectedRoot?.sourceSeq ?? restartRoot?.sourceSeq ?? source?.sourceSeq;
@@ -1042,7 +1062,7 @@ export function completeChatOperation(
         if (request.cause !== "goal_deadline_checkpoint") {
           throw new ChatOperationInvariantError("Goal continuation requires the Goal deadline checkpoint cause");
         }
-        const currentLineage = source.sourceKind === "goal_continuation" ? getGoalContinuationLineage(source) : null;
+        const currentLineage = getContinuationGoalLineage(source);
         const protectedRoot = source.sourceKind === "protected_continuation" ? getProtectedContinuationRootSource(source) : null;
         const restartRoot = source.sourceKind === "restart_continuation" ? getRestartContinuationRootSource(source) : null;
         const expectedRoot = currentLineage?.rootSourceSeq ?? protectedRoot?.sourceSeq ?? restartRoot?.sourceSeq ?? source.sourceSeq;

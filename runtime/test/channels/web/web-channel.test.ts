@@ -2902,7 +2902,6 @@ test("restart recovery replays pending steers exactly once through one durable s
       timestamp: acceptedAt,
       is_from_me: false,
       is_bot_message: false,
-      is_steering_message: true,
     });
     const registered = db.registerChatOperationIntent("web:default", {
       operationId: running.operation.operationId,
