@@ -748,6 +748,28 @@ describe("durable accepted-input operations", () => {
     });
   });
 
+  test("accepted steer payloads never re-enter legacy pending scans after queue-failure accounting", () => {
+    const chatJid = jid("intent-queue-failure-scan");
+    const root = register(chatJid, "queue-failure-root");
+    const claimed = op.claimNextChatOperation(chatJid).operation!;
+    const steer = registerSteer(chatJid, claimed, "queue-failure-unflagged", "2026-08-07T22:00:01.000Z");
+    if (steer.status !== "registered") throw new Error("expected steer");
+    expect(op.disposeChatOperationIntent(chatJid, owner(claimed), {
+      sourceSeq: steer.source.sourceSeq,
+      outcome: "failed",
+      cause: "steer_queue_failed",
+      provenance: "web_compose_steer_queue_failure",
+      createdAt: "2026-08-07T22:00:02.000Z",
+    }).status).toBe("disposed");
+    expect(db.getDb().prepare(`SELECT is_steering_message FROM messages WHERE chat_jid = ? AND id = ?`)
+      .get(chatJid, "queue-failure-unflagged")).toEqual({ is_steering_message: 0 });
+    expect(db.getMessagesSince(chatJid, root.frontierCursorTs!, "Pi")).toEqual([]);
+    expect(db.getNewMessages([chatJid], root.frontierCursorTs!, "Pi")).toEqual({
+      messages: [],
+      newTimestamp: root.frontierCursorTs,
+    });
+  });
+
   test("rename preserves operation lookup, cleanup retains terminal evidence, and explicit branch deletion removes it", () => {
     const chatJid = jid("lifecycle"); const renamed = `operation:renamed-lifecycle:${serial}`;
     db.storeChatMetadata(chatJid, "2026-08-07T22:00:00Z", "Lifecycle");
