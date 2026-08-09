@@ -272,17 +272,23 @@ export function handleAppSseEvent(
     previewResyncGenerationRef.current = resyncGeneration;
     previewResyncPendingRef.current = true;
     dirtyPreviewResyncRefs.delete(previewResyncPendingRef);
-    draftBufferRef.current = '';
-    thoughtBufferRef.current = '';
-    setAgentStatus(null);
-    setAgentDraft({ text: '', totalLines: 0 });
-    setAgentPlan('');
-    setAgentThought({ text: '', totalLines: 0 });
-    setExtensionWorkingState({ message: null, indicator: null, visible: true });
-    setPendingRequest(null);
-    pendingRequestRef.current = null;
-    clearAgentRunState();
+
+    const clearPreviewState = () => {
+      draftBufferRef.current = '';
+      thoughtBufferRef.current = '';
+      setAgentStatus(null);
+      setAgentDraft({ text: '', totalLines: 0 });
+      setAgentPlan('');
+      setAgentThought({ text: '', totalLines: 0 });
+      setExtensionWorkingState({ message: null, indicator: null, visible: true });
+      setPendingRequest(null);
+      pendingRequestRef.current = null;
+      wasAgentActiveRef.current = false;
+      clearAgentRunState();
+    };
+
     if (isAppChatActivationRecent(currentChatJid)) {
+      clearPreviewState();
       if (previewResyncGenerationRef.current === resyncGeneration) {
         previewResyncPendingRef.current = false;
       }
@@ -292,21 +298,28 @@ export function handleAppSseEvent(
     const targetChatJid = currentChatJid;
     const applyStatusSnapshot = (response) => {
       if (activeChatJidRef.current !== targetChatJid) return;
-      if (!response?.data) return;
 
-      const payload = response.data;
-      if (payload.type === 'done' || payload.type === 'error') {
-        // A terminal event may have landed while SSE was disconnected. The
-        // connected handler already refreshes timeline/model state; refresh
-        // context explicitly so session rotation completion is fully applied.
-        void refreshContextUsage();
+      const payload = response?.data;
+      const isTerminal = payload?.type === 'done' || payload?.type === 'error';
+      if (!response || response.status !== 'active' || !payload || isTerminal) {
+        clearPreviewState();
+        if (isTerminal) {
+          // A terminal event may have landed while SSE was disconnected. The
+          // connected handler already refreshes timeline/model state; refresh
+          // context explicitly so session rotation completion is fully applied.
+          void refreshContextUsage();
+        }
         return;
       }
-      if (response.status !== 'active') return;
       const activeTurn = readAgentTurnId(payload);
+      if (activeTurn && activeTurn !== currentTurnIdRef.current) {
+        clearPreviewState();
+      }
       if (activeTurn) setActiveTurn(activeTurn);
+      wasAgentActiveRef.current = true;
       setAgentStatus(payload);
       noteAgentActivity({
+        running: true,
         clearSilence: true,
         atMs: parseStatusLastEventAt(payload) ?? Date.now(),
       });
@@ -329,6 +342,7 @@ export function handleAppSseEvent(
           dirtyPreviewResyncRefs.delete(previewResyncPendingRef);
           const response = await getAgentStatus(targetChatJid);
           if (previewResyncGenerationRef.current !== resyncGeneration) return;
+          if (dirtyPreviewResyncRefs.has(previewResyncPendingRef)) continue;
           applyStatusSnapshot(response);
         } while (dirtyPreviewResyncRefs.has(previewResyncPendingRef));
       } catch (error) {
@@ -355,6 +369,18 @@ export function handleAppSseEvent(
         void refreshCurrentChatBranches();
       }
       return;
+    }
+
+    if (previewResyncPendingRef.current) {
+      const isTerminalStatus = data.type === 'done' || data.type === 'error';
+      const changesTurn = Boolean(turnId) && turnId !== currentTurnIdRef.current;
+      if (isTerminalStatus || changesTurn) {
+        previewResyncGenerationRef.current += 1;
+        previewResyncPendingRef.current = false;
+        dirtyPreviewResyncRefs.delete(previewResyncPendingRef);
+      } else {
+        dirtyPreviewResyncRefs.add(previewResyncPendingRef);
+      }
     }
 
     const liveContextUsage = normalizeContextUsage(data.context_usage);
@@ -398,16 +424,18 @@ export function handleAppSseEvent(
         setAgentStatus(null);
       }
     } else {
+      const startsNewTurn = Boolean(turnId) && turnId !== currentTurnIdRef.current;
+      const startsUnidentifiedTurn = !turnId && !currentTurnIdRef.current;
       if (turnId) setActiveTurn(turnId);
       noteAgentActivity({
         running: true,
         clearSilence: true,
         atMs: parseStatusLastEventAt(data) ?? Date.now(),
       });
-      // Only the turn-opening status owns preview reset. Intra-turn model
-      // phases (post-tool waiting, fresh reasoning, and drafting) must preserve
-      // the accumulated panes until their typed preview events update them.
-      if (data.type === 'thinking' && !data.phase) {
+      // Only a turn-opening status owns preview reset. Repeated same-turn
+      // `thinking` statuses can omit phase metadata, so phase absence alone
+      // must not erase an already-streamed Draft pane.
+      if (data.type === 'thinking' && !data.phase && (startsNewTurn || startsUnidentifiedTurn)) {
         draftBufferRef.current = '';
         thoughtBufferRef.current = '';
         setAgentDraft({ text: '', totalLines: 0 });
