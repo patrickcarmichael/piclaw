@@ -3,11 +3,17 @@ import "../../helpers.ts";
 import {
   beginChatRun,
   claimNextChatOperation,
+  disposeChatOperationIntent,
+  fenceChatOperationSettlement,
   getChatCursor,
   getChatOperation,
   getInflightMessageId,
+  getMessageByRowId,
+  getMessageRowIdById,
   initDatabase,
   registerAcceptedChatSource,
+  registerChatOperationIntent,
+  storeMessage,
 } from "../../../src/db.js";
 import { handleAgentMessage } from "../../../src/channels/web/handlers/agent.ts";
 
@@ -787,6 +793,100 @@ describe("web agent message handler", () => {
     expect(body.queued).toBe("followup");
     expect(queuedFollowups).toEqual([{ chatJid: "web:default", content: "follow up while compacting" }]);
     expect(storeMessageCalls).toBe(0);
+  });
+
+  test("reports a disposed steer replay as failed without another SDK queue effect", async () => {
+    initDatabase();
+    const chatJid = `web:disposed-steer-replay-${crypto.randomUUID()}`;
+    registerAcceptedChatSource({
+      chatJid,
+      sourceClass: "prompt",
+      sourceKind: "queued_followup",
+      sourceId: "disposed-replay-root",
+      acceptedAt: "2026-08-09T12:00:00.000Z",
+      payloadRef: "followup:disposed-replay-root",
+    });
+    const operation = claimNextChatOperation(chatJid).operation;
+    if (!operation) throw new Error("expected operation");
+    const owner = {
+      operationId: operation.operationId,
+      sourceSeq: operation.sourceSeq,
+      phase: operation.phase,
+      generation: operation.generation,
+    };
+    const messageId = `disposed-steer-${crypto.randomUUID()}`;
+    const acceptedAt = "2026-08-09T12:00:01.000Z";
+    storeMessage({
+      id: messageId,
+      chat_jid: chatJid,
+      sender: "user",
+      sender_name: "User",
+      content: "replay failed steer",
+      timestamp: acceptedAt,
+      is_from_me: false,
+      is_bot_message: false,
+      is_steering_message: true,
+    });
+    const registered = registerChatOperationIntent(chatJid, owner, {
+      sourceKind: "steer", sourceId: messageId, acceptedAt, payloadRef: `message:${messageId}`,
+    });
+    if (registered.status === "rejected" || registered.status === "deferred") throw new Error("expected intent");
+    expect(disposeChatOperationIntent(chatJid, owner, {
+      sourceSeq: registered.source.sourceSeq,
+      outcome: "failed",
+      cause: "steer_queue_failed",
+      provenance: "test_disposed_replay",
+      createdAt: "2026-08-09T12:00:02.000Z",
+    }).status).toBe("disposed");
+    expect(fenceChatOperationSettlement(chatJid, owner, {
+      fenceId: `disposed-replay-fence-${crypto.randomUUID()}`,
+      fencedAt: "2026-08-09T12:00:03.000Z",
+    }).status).toBe("fenced");
+    const rowId = getMessageRowIdById(chatJid, messageId);
+    const interaction = rowId ? getMessageByRowId(chatJid, rowId) : null;
+    if (!interaction) throw new Error("expected replay interaction");
+
+    const broadcasts: Array<{ event: string; payload: any }> = [];
+    let sdkQueueEffects = 0;
+    const channel = {
+      agentPool: {
+        isStreaming: () => true,
+        isActive: () => true,
+        queueStreamingMessage: async (_jid: string, _text: string, _behavior: string, request: any) => {
+          const admission = request.beforeQueue();
+          expect(admission).toEqual({ sourceSeq: registered.source.sourceSeq, queueEffect: "existing" });
+          if (admission.queueEffect !== "existing") sdkQueueEffects += 1;
+          return { queued: true, existing: true, operationIntentSourceSeq: admission.sourceSeq };
+        },
+      },
+      json: (payload: unknown, status = 200) => new Response(JSON.stringify(payload), {
+        status,
+        headers: { "Content-Type": "application/json" },
+      }),
+      enqueueQueuedFollowupItem: () => 0,
+      getQueuedFollowupCount: () => 0,
+      broadcastEvent: (event: string, payload: unknown) => broadcasts.push({ event, payload }),
+      storeMessage: () => interaction,
+      sendMessage: async () => {},
+    } as any;
+
+    const req = new Request("https://example.com/agent/disposed/message", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content: "replay failed steer", mode: "steer", persist_steer: true }),
+    });
+    const response = await handleAgentMessage(channel, req, "/agent/disposed/message", chatJid, "disposed");
+    expect(response.status).toBe(201);
+    expect(await response.json()).toMatchObject({
+      queued: "steer_failed",
+      error: "Steer was already disposed: steer_queue_failed",
+    });
+    expect(sdkQueueEffects).toBe(0);
+    expect(broadcasts).toContainEqual(expect.objectContaining({
+      event: "agent_steer_failed",
+      payload: expect.objectContaining({ queued: "steer_failed" }),
+    }));
+    expect(broadcasts.some((entry) => entry.event === "agent_steer_queued")).toBe(false);
   });
 
   test("returns typed 400s for malformed agent message payload classes", async () => {

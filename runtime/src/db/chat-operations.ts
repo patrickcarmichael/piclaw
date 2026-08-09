@@ -351,6 +351,7 @@ export function registerChatOperationIntent(chatJid: string, expected: ChatOpera
   sourceKind: "steer"; sourceId: string; acceptedAt: string; payloadRef: string;
 }, hooks: ChatOperationIntentRegistrationHooks = {}):
   | { status: "registered" | "existing"; source: AcceptedChatSource }
+  | { status: "disposed"; source: AcceptedChatSource; disposition: ChatOperationDisposition }
   | { status: "deferred"; source: AcceptedChatSource; fenceId: string }
   | { status: "rejected"; reason: ChatOperationMismatch | "operation_cancelled" } {
   for (const value of [chatJid, input.sourceId, input.acceptedAt, input.payloadRef]) {
@@ -376,6 +377,8 @@ export function registerChatOperationIntent(chatJid: string, expected: ChatOpera
         if (source.sourceClass !== "intent" || source.selectable || source.operationId !== active!.operationId) {
           throw new ChatOperationInvariantError("Intent identity was reused with different immutable fields");
         }
+        const disposition = getChatOperationDisposition(source.sourceSeq);
+        if (disposition) return { status: "disposed", source, disposition } as const;
         return { status: "existing", source } as const;
       }
       if (source.sourceClass !== "prompt" || !source.selectable || source.operationId !== null

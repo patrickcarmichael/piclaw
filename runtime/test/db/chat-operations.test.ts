@@ -651,6 +651,21 @@ describe("durable accepted-input operations", () => {
     expect(first.source.operationId).toBe(claimed.operationId);
     expect(second.source.operationId).toBe(claimed.operationId);
     expect(op.getAcceptedChatSource(first.source.sourceSeq)).toEqual(first.source);
+    const failed = op.registerChatOperationIntent(chatJid, owner(claimed), {
+      sourceKind: "steer", sourceId: "failed", acceptedAt: "now", payloadRef: "steer:failed",
+    });
+    if (failed.status === "rejected" || failed.status === "deferred") throw new Error("failed intent registration");
+    expect(op.disposeChatOperationIntent(chatJid, owner(claimed), {
+      sourceSeq: failed.source.sourceSeq, outcome: "failed", cause: "steer_queue_failed",
+      provenance: "test", createdAt: "now",
+    }).status).toBe("disposed");
+    expect(op.registerChatOperationIntent(chatJid, owner(claimed), {
+      sourceKind: "steer", sourceId: "failed", acceptedAt: "now", payloadRef: "steer:failed",
+    })).toMatchObject({
+      status: "disposed",
+      source: { sourceSeq: failed.source.sourceSeq },
+      disposition: { outcome: "failed", cause: "steer_queue_failed" },
+    });
     const completed = op.completeChatOperation(chatJid, { owner: owner(claimed), outcome: "succeeded", cause: "normal",
       provenance: "provider", createdAt: "now", artifact: { message: terminal(chatJid, `intent-bot-${serial}`) },
       intentDispositions: [

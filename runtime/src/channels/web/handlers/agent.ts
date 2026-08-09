@@ -46,6 +46,7 @@ import {
   getChatCursor,
   getChatOperation,
   getChatOperationDisposition,
+  getChatOperationSettlementFence,
   fenceChatOperationSettlement,
   getPendingChatOperationIntentSources,
   getContinuationCarriedIntentSources,
@@ -1303,12 +1304,13 @@ export async function handleAgentMessage(
               payloadRef: `message:${persistedMessageId}`,
             });
             if (registered.status === "rejected") throw new Error(`Steer intent ownership rejected: ${registered.reason}`);
-            const fencedReplay = registered.status === "existing" && getChatOperationSettlementFence(chatJid);
+            const noEffectReplay = registered.status === "disposed"
+              || (registered.status === "existing" && getChatOperationSettlementFence(chatJid));
             return {
               sourceSeq: registered.source.sourceSeq,
               queueEffect: registered.status === "deferred"
                 ? "deferred" as const
-                : fencedReplay
+                : noEffectReplay
                   ? "existing" as const
                   : "steer" as const,
             };
@@ -1333,6 +1335,25 @@ export async function handleAgentMessage(
         }
       : {});
     if (steerResult.existing) {
+      const disposition = steerResult.operationIntentSourceSeq
+        ? getChatOperationDisposition(steerResult.operationIntentSourceSeq)
+        : null;
+      if (disposition) {
+        const error = `Steer was already disposed: ${disposition.cause}`;
+        channel.broadcastEvent("agent_steer_failed", {
+          chat_jid: chatJid,
+          thread_id: threadId ?? null,
+          source,
+          queued: "steer_failed",
+          error,
+        });
+        return channel.json({
+          user_message: interaction,
+          thread_id: threadId,
+          queued: "steer_failed",
+          error,
+        }, 201);
+      }
       return channel.json({
         user_message: interaction,
         thread_id: threadId,
