@@ -219,6 +219,65 @@ describe("durable accepted-input operations", () => {
     })).toThrow("lineage conflicts");
   });
 
+  test("restart continuation atomically carries pending steers in source order and is repeatable", () => {
+    for (const boundary of ["artifact", "successor", "intents", "disposition", "frontier", "release"] as const) {
+      const chatJid = jid(`restart-steers-${boundary}`);
+      const root = register(chatJid, `restart-root-${boundary}`);
+      const claimed = op.claimNextChatOperation(chatJid).operation!;
+      const first = op.registerChatOperationIntent(chatJid, owner(claimed), {
+        sourceKind: "steer", sourceId: `restart-first-${boundary}`, acceptedAt: "now-1", payloadRef: `steer:first-${boundary}`,
+      });
+      const second = op.registerChatOperationIntent(chatJid, owner(claimed), {
+        sourceKind: "steer", sourceId: `restart-second-${boundary}`, acceptedAt: "now-2", payloadRef: `steer:second-${boundary}`,
+      });
+      if (first.status !== "registered" || second.status !== "registered") throw new Error("expected restart steers");
+      const carriedIntentSourceSeqs = [first.source.sourceSeq, second.source.sourceSeq];
+      const request = {
+        owner: owner(claimed),
+        outcome: "succeeded" as const,
+        cause: "recovered_terminal_output",
+        provenance: "web_startup_recovery",
+        createdAt: "2026-08-09T09:00:00.000Z",
+        artifact: { message: terminal(chatJid, `restart-terminal-${boundary}-${serial}`) },
+        successor: {
+          sourceKind: "restart_continuation" as const,
+          parentSourceSeq: root.sourceSeq,
+          carriedIntentSourceSeqs,
+        },
+        intentDispositions: carriedIntentSourceSeqs.map((sourceSeq) => ({
+          sourceSeq,
+          outcome: "interrupted" as const,
+          cause: "restart_steer_carried",
+          provenance: "web_startup_recovery",
+        })),
+      };
+
+      expect(() => op.completeChatOperation(chatJid, request, {
+        afterWrite(point) { if (point === boundary) throw new Error(`fault:${point}`); },
+      })).toThrow(`fault:${boundary}`);
+      expect(op.getChatOperation(chatJid)).toEqual(claimed);
+      expect(op.getChatOperationDisposition(root.sourceSeq)).toBeNull();
+      expect(op.getChatOperationDisposition(first.source.sourceSeq)).toBeNull();
+      expect(op.getChatOperationDisposition(second.source.sourceSeq)).toBeNull();
+      expect(db.getDb().prepare(`SELECT 1 FROM chat_accepted_sources
+        WHERE chat_jid = ? AND source_kind = 'restart_continuation'`).get(chatJid)).toBeNull();
+      expect(db.getDb().prepare("SELECT 1 FROM messages WHERE chat_jid = ? AND id = ?")
+        .get(chatJid, request.artifact.message.id)).toBeNull();
+
+      expect(op.completeChatOperation(chatJid, request).status).toBe("completed");
+      const successor = op.peekNextAcceptedChatSource(chatJid)!;
+      expect(successor).toMatchObject({
+        sourceKind: "restart_continuation",
+        sourceId: `source:${root.sourceSeq}`,
+        payloadRef: `accepted-source:${root.sourceSeq}`,
+      });
+      expect(op.getRestartContinuationParentSource(successor)?.sourceSeq).toBe(root.sourceSeq);
+      expect(op.getContinuationCarriedIntentSources(successor.sourceSeq).map((item) => item.sourceSeq))
+        .toEqual(carriedIntentSourceSeqs);
+      expect(op.completeChatOperation(chatJid, request).status).toBe("repeated");
+    }
+  });
+
   test("Goal checkpoint atomically preserves lineage, carried steers, restart claims, and repeated generations", () => {
     const chatJid = jid("goal-checkpoint");
     const root = register(chatJid, "goal-root");
