@@ -8,6 +8,7 @@
 
 import type { AgentPool } from "../../../agent-pool.js";
 import type { AgentMessageAcceptanceHandler } from "../messaging/agent-message-acceptance.js";
+import type { AgentMessageRequestContext } from "../messaging/agent-message-provenance.js";
 import type { SendMessageOptions } from "../messaging/message-write-flows.js";
 import type { WorkspaceDispatchChannel } from "../http/dispatch-workspace.js";
 import type { MediaDispatchChannel } from "../http/dispatch-media.js";
@@ -72,6 +73,7 @@ export interface WebChannelLike
       isTerminalAgentReply?: boolean;
       isSteeringMessage?: boolean;
       removeProtectedContinuationForSourceMessageId?: string | null;
+      acceptDurableSource?: boolean;
       consumeDeferredFollowupRowId?: number | null;
     }
   ): InteractionRow | null;
@@ -102,7 +104,7 @@ export interface WebChannelLike
     queuedContent: string,
     threadId?: number | null,
     queuedAt?: string,
-    extras?: { mediaIds?: number[]; contentBlocks?: unknown[]; linkPreviews?: unknown[]; screenHint?: string; source?: string; queuedBy?: QueuedFollowupItem["queuedBy"] }
+    extras?: { mediaIds?: number[]; contentBlocks?: unknown[]; linkPreviews?: unknown[]; screenHint?: string; source?: string; queuedBy?: QueuedFollowupItem["queuedBy"]; durable?: boolean }
   ): number;
   getQueuedFollowupCount(chatJid: string): number;
   getQueuedFollowupItems(chatJid: string): QueuedFollowupItem[];
@@ -200,7 +202,12 @@ export interface WebChannelLike
   handleAdaptiveCardAction(req: Request): Promise<Response>;
   handleAgentSidePrompt(req: Request): Promise<Response>;
   handleAgentSidePromptStream(req: Request): Promise<Response>;
-  handleAgentMessage(req: Request, pathname: string, onAccepted?: AgentMessageAcceptanceHandler): Promise<Response>;
+  handleAgentMessage(
+    req: Request,
+    pathname: string,
+    onAccepted?: AgentMessageAcceptanceHandler,
+    context?: AgentMessageRequestContext,
+  ): Promise<Response>;
   resumeChat(chatJid: string, threadRootId?: number | null): void;
 
   /** Utility helpers shared via request helpers and helpers. */

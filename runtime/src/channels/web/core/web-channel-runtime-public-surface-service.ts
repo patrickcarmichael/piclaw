@@ -3,6 +3,11 @@ import type { WebAgentBufferEntry } from "../agent/agent-buffers.js";
 import type { QueuedFollowupItem, QueuedFollowupSourceMetadata } from "../runtime/followup-placeholders.js";
 import type { SendMessageOptions } from "../messaging/message-write-flows.js";
 import type { WebMessageProcessingStorageService } from "../messaging/message-processing-storage-service.js";
+import {
+  createTrustedAgentMessageRequestContext,
+  type AgentMessageRequestContext,
+} from "../messaging/agent-message-provenance.js";
+import type { AgentMessageAcceptanceHandler } from "../messaging/agent-message-acceptance.js";
 import type { WebChannelRuntimeFollowupFacadeService } from "../runtime/runtime-followup-facade-service.js";
 import type { WebSessionBroadcastService } from "../sse/session-broadcast-service.js";
 
@@ -56,7 +61,12 @@ type WebChannelRuntimePublicSurfaceBroadcast = Pick<
 >;
 
 type WebChannelRuntimePublicSurfaceAgentMessageEntry = {
-  handleAgentMessage?: (req: Request, pathname: string) => Promise<Response>;
+  handleAgentMessage?: (
+    req: Request,
+    pathname: string,
+    onAccepted?: AgentMessageAcceptanceHandler,
+    context?: AgentMessageRequestContext,
+  ) => Promise<Response>;
 };
 
 type WebChannelRuntimePublicSurfaceAgentPool = {
@@ -348,10 +358,11 @@ export class WebChannelRuntimePublicSurfaceService {
         ...(request?.threadId !== undefined ? { thread_id: normalizeRuntimeMessageThreadId(request?.threadId) ?? null } : {}),
         ...(screenHint !== undefined ? { screen_hint: screenHint } : {}),
       };
+      const context = createTrustedAgentMessageRequestContext({ source, queuedBy });
       const response = await this.channel.handleAgentMessage(new Request(
         `http://internal/agent/default/message?chat_jid=${encodeURIComponent(chatJid)}`,
         { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) },
-      ), "/agent/default/message");
+      ), "/agent/default/message", undefined, context);
       const responsePayload = await response.clone().json().catch(() => null);
       if (!response.ok) {
         const detail = await readRuntimeHandlerError(response);
@@ -389,6 +400,7 @@ export class WebChannelRuntimePublicSurfaceService {
         ...(screenHint ? { screenHint } : {}),
         source,
         ...(queuedBy ? { queuedBy } : {}),
+        durable: true,
       });
       this.channel.sessionBroadcast.broadcastEvent("agent_followup_queued", {
         chat_jid: chatJid,
@@ -409,6 +421,7 @@ export class WebChannelRuntimePublicSurfaceService {
       linkPreviews,
       threadId: explicitThreadId,
       screenHint,
+      acceptDurableSource: true,
     });
     if (!interaction) throw new Error("Failed to store runtime agent message.");
 
@@ -438,7 +451,7 @@ export class WebChannelRuntimePublicSurfaceService {
     queuedContent: string,
     threadId?: number | null,
     queuedAt?: string,
-    extras?: { mediaIds?: number[]; contentBlocks?: unknown[]; linkPreviews?: unknown[]; screenHint?: string; source?: string; queuedBy?: QueuedFollowupItem["queuedBy"] },
+    extras?: { mediaIds?: number[]; contentBlocks?: unknown[]; linkPreviews?: unknown[]; screenHint?: string; source?: string; queuedBy?: QueuedFollowupItem["queuedBy"]; durable?: boolean },
   ): number {
     return this.channel.runtimeFollowupFacade.enqueueQueuedFollowupItem(
       chatJid,
@@ -619,6 +632,7 @@ export class WebChannelRuntimePublicSurfaceService {
       isTerminalAgentReply?: boolean;
       isSteeringMessage?: boolean;
       removeProtectedContinuationForSourceMessageId?: string | null;
+      acceptDurableSource?: boolean;
       consumeDeferredFollowupRowId?: number | null;
     } = {},
   ): InteractionRow | null {

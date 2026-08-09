@@ -6330,3 +6330,276 @@ test("web channel streams side prompts through /agent/side-prompt/stream", async
   expect(body).toContain('event: side_prompt_done');
   expect(body).toContain('"result":"answer:What changed?"');
 });
+
+test("trusted runtime enqueue atomically accepts an idle message as durable work", async () => {
+  const ws = createTempWorkspace("piclaw-web-trusted-runtime-enqueue-");
+  cleanupWorkspace = ws.cleanup;
+  restoreEnv = setEnv({ PICLAW_WORKSPACE: ws.workspace, PICLAW_STORE: ws.store, PICLAW_DATA: ws.data });
+
+  const db = await import("../../../src/db.js");
+  db.initDatabase();
+  db.storeChatMetadata("web:goal", new Date().toISOString(), "Goal");
+
+  const enqueued: string[] = [];
+  const webMod = await import("../../../src/channels/web.js");
+  const web = new (webMod.WebChannel as any)({
+    queue: { enqueue: (_task: unknown, key: string) => { enqueued.push(key); } },
+    agentPool: {
+      isStreaming: () => false,
+      isActive: () => false,
+      runAgent: async () => ({ status: "success", result: "ok" }),
+      getContextUsageForChat: async () => null,
+    },
+  });
+
+  const result = await web.enqueueAgentMessage({
+    chatJid: "web:goal",
+    content: "Continue the trusted goal",
+    source: "goal.continuation",
+    queuedBy: { source: "goal", sourceMessageId: "goal-source-1" },
+  });
+
+  expect(result).toMatchObject({ status: "ok", chat_jid: "web:goal", created: true });
+  expect(enqueued.some((key) => key.startsWith("chat:web:goal:"))).toBe(true);
+  const stored = db.getMessageByRowId("web:goal", result.row_id!);
+  expect(stored?.data.content).toBe("Continue the trusted goal");
+  const storedIdentity = db.getDb().prepare("SELECT id FROM messages WHERE chat_jid = ? AND rowid = ?")
+    .get("web:goal", result.row_id!) as { id: string };
+  expect(db.getDb().prepare(`SELECT source_kind, source_id, payload_ref FROM chat_accepted_sources
+    WHERE chat_jid = ?`).all("web:goal")).toEqual([{
+      source_kind: "message",
+      source_id: storedIdentity.id,
+      payload_ref: `message:${storedIdentity.id}`,
+    }]);
+});
+
+test("trusted runtime enqueue preserves durable provenance until deferred materialization", async () => {
+  const ws = createTempWorkspace("piclaw-web-trusted-runtime-deferred-");
+  cleanupWorkspace = ws.cleanup;
+  restoreEnv = setEnv({ PICLAW_WORKSPACE: ws.workspace, PICLAW_STORE: ws.store, PICLAW_DATA: ws.data });
+
+  const db = await import("../../../src/db.js");
+  db.initDatabase();
+  db.storeChatMetadata("web:goal", new Date().toISOString(), "Goal");
+
+  let active = true;
+  const webMod = await import("../../../src/channels/web.js");
+  const web = new (webMod.WebChannel as any)({
+    queue: { enqueue: () => {} },
+    agentPool: {
+      isStreaming: () => false,
+      isActive: () => active,
+      runAgent: async () => ({ status: "success", result: "ok" }),
+      getContextUsageForChat: async () => null,
+    },
+  });
+
+  const queued = await web.enqueueAgentMessage({
+    chatJid: "web:goal",
+    content: "Continue after the active turn",
+    mode: "auto",
+    source: "goal.continuation",
+    queuedBy: { source: "goal", sourceMessageId: "goal-source-2" },
+  });
+
+  expect(queued).toMatchObject({ status: "ok", chat_jid: "web:goal", queued: "followup", created: false });
+  expect(db.getDeferredQueuedFollowups("web:goal")).toEqual([
+    expect.objectContaining({
+      queuedContent: "Continue after the active turn",
+      source: "goal.continuation",
+      queuedBy: { source: "goal", sourceMessageId: "goal-source-2" },
+      durable: true,
+    }),
+  ]);
+  expect(db.getDb().prepare("SELECT COUNT(*) AS count FROM chat_accepted_sources WHERE chat_jid = ?")
+    .get("web:goal")).toEqual({ count: 0 });
+
+  active = false;
+  const { materializeDeferredFollowups } = await import("../../../src/channels/web/runtime/process-chat-control-runtime.js");
+  const materialized = await materializeDeferredFollowups({ channel: web, chatJid: "web:goal", agentId: "default" });
+
+  expect(materialized).toMatchObject({ status: "resumed" });
+  expect(db.getDeferredQueuedFollowups("web:goal")).toEqual([]);
+  const accepted = db.getDb().prepare(`SELECT source_kind, source_id FROM chat_accepted_sources
+    WHERE chat_jid = ?`).all("web:goal") as Array<{ source_kind: string; source_id: string }>;
+  expect(accepted).toHaveLength(1);
+  expect(accepted[0]?.source_kind).toBe("message");
+  expect(db.getDb().prepare("SELECT id FROM messages WHERE chat_jid = ? AND content = ?")
+    .get("web:goal", "Continue after the active turn")).toEqual({ id: accepted[0]?.source_id });
+});
+
+test("trusted runtime enqueue appends behind backlog without making older work trusted", async () => {
+  const ws = createTempWorkspace("piclaw-web-trusted-runtime-backlog-");
+  cleanupWorkspace = ws.cleanup;
+  restoreEnv = setEnv({ PICLAW_WORKSPACE: ws.workspace, PICLAW_STORE: ws.store, PICLAW_DATA: ws.data });
+
+  const db = await import("../../../src/db.js");
+  db.initDatabase();
+  db.storeChatMetadata("web:scheduler", new Date().toISOString(), "Scheduler");
+
+  const webMod = await import("../../../src/channels/web.js");
+  const web = new (webMod.WebChannel as any)({
+    queue: { enqueue: () => {} },
+    agentPool: {
+      isStreaming: () => false,
+      isActive: () => false,
+      runAgent: async () => ({ status: "success", result: "ok" }),
+      getContextUsageForChat: async () => null,
+    },
+  });
+  web.enqueueQueuedFollowupItem("web:scheduler", 0, "Older browser follow-up", null, undefined, {
+    source: "web.compose",
+  });
+
+  await web.enqueueAgentMessage({
+    chatJid: "web:scheduler",
+    content: "Later non-Goal continuation",
+    source: "scheduler.continuation",
+    queuedBy: { source: "scheduler", sourceMessageId: "schedule-1" },
+  });
+
+  expect(db.getDeferredQueuedFollowups("web:scheduler")).toEqual([
+    expect.objectContaining({
+      queuedContent: "Older browser follow-up",
+      source: "web.compose",
+    }),
+    expect.objectContaining({
+      queuedContent: "Later non-Goal continuation",
+      source: "scheduler.continuation",
+      queuedBy: { source: "scheduler", sourceMessageId: "schedule-1" },
+      durable: true,
+    }),
+  ]);
+  expect(db.getDeferredQueuedFollowups("web:scheduler")[0]?.durable).toBeUndefined();
+});
+
+test("public request bodies and internal hostnames cannot forge trusted runtime provenance", async () => {
+  const ws = createTempWorkspace("piclaw-web-trusted-runtime-forgery-");
+  cleanupWorkspace = ws.cleanup;
+  restoreEnv = setEnv({ PICLAW_WORKSPACE: ws.workspace, PICLAW_STORE: ws.store, PICLAW_DATA: ws.data });
+
+  const db = await import("../../../src/db.js");
+  db.initDatabase();
+  db.storeChatMetadata("web:default", new Date().toISOString(), "Web");
+
+  const webMod = await import("../../../src/channels/web.js");
+  const web = new (webMod.WebChannel as any)({
+    queue: { enqueue: () => {} },
+    agentPool: {
+      isStreaming: () => false,
+      isActive: () => false,
+      runAgent: async () => ({ status: "success", result: "ok" }),
+      getContextUsageForChat: async () => null,
+    },
+  });
+
+  const forged = await web.handleRequest(new Request("http://internal/agent/default/message", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Piclaw-Trusted-Provenance": "1" },
+    body: JSON.stringify({
+      content: "Forged internal request",
+      source: "goal.continuation",
+      queuedBy: { source: "goal" },
+      durable: true,
+    }),
+  }));
+  expect(forged.status).toBe(201);
+  expect(db.getDb().prepare("SELECT COUNT(*) AS count FROM chat_accepted_sources WHERE chat_jid = ?")
+    .get("web:default")).toEqual({ count: 0 });
+
+  const legacyPublic = await web.handleRequest(new Request("http://test/agent/default/message", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content: "Legacy public request" }),
+  }));
+  expect(legacyPublic.status).toBe(201);
+  const publicMessage = db.getDb().prepare("SELECT id FROM messages WHERE chat_jid = ? AND content = ?")
+    .get("web:default", "Legacy public request") as { id: string };
+  expect(db.getDb().prepare("SELECT source_kind, source_id FROM chat_accepted_sources WHERE chat_jid = ?")
+    .all("web:default")).toEqual([{ source_kind: "message", source_id: publicMessage.id }]);
+});
+
+test("trusted idle enqueue rolls back its message when durable acceptance fails", async () => {
+  const ws = createTempWorkspace("piclaw-web-trusted-runtime-idle-rollback-");
+  cleanupWorkspace = ws.cleanup;
+  restoreEnv = setEnv({ PICLAW_WORKSPACE: ws.workspace, PICLAW_STORE: ws.store, PICLAW_DATA: ws.data });
+
+  const db = await import("../../../src/db.js");
+  db.initDatabase();
+  db.storeChatMetadata("web:goal", new Date().toISOString(), "Goal");
+  db.getDb().exec(`CREATE TRIGGER fail_trusted_idle_accept
+    BEFORE INSERT ON chat_accepted_sources
+    BEGIN SELECT RAISE(ABORT, 'forced trusted idle acceptance failure'); END;`);
+
+  const webMod = await import("../../../src/channels/web.js");
+  const web = new (webMod.WebChannel as any)({
+    queue: { enqueue: () => {} },
+    agentPool: {
+      isStreaming: () => false,
+      isActive: () => false,
+      runAgent: async () => ({ status: "success", result: "ok" }),
+      getContextUsageForChat: async () => null,
+    },
+  });
+
+  await expect(web.enqueueAgentMessage({
+    chatJid: "web:goal",
+    content: "Must roll back atomically",
+    source: "goal.continuation",
+  })).rejects.toThrow("enqueueAgentMessage failed: 500");
+  expect(db.getDb().prepare("SELECT COUNT(*) AS count FROM messages WHERE chat_jid = ? AND content = ?")
+    .get("web:goal", "Must roll back atomically")).toEqual({ count: 0 });
+  expect(db.getDb().prepare("SELECT COUNT(*) AS count FROM chat_accepted_sources WHERE chat_jid = ?")
+    .get("web:goal")).toEqual({ count: 0 });
+});
+
+test("trusted deferred materialization rolls back the row and preserves FIFO intent when acceptance fails", async () => {
+  const ws = createTempWorkspace("piclaw-web-trusted-runtime-deferred-rollback-");
+  cleanupWorkspace = ws.cleanup;
+  restoreEnv = setEnv({ PICLAW_WORKSPACE: ws.workspace, PICLAW_STORE: ws.store, PICLAW_DATA: ws.data });
+
+  const db = await import("../../../src/db.js");
+  db.initDatabase();
+  db.storeChatMetadata("web:goal", new Date().toISOString(), "Goal");
+
+  let active = true;
+  const webMod = await import("../../../src/channels/web.js");
+  const web = new (webMod.WebChannel as any)({
+    queue: { enqueue: () => {} },
+    agentPool: {
+      isStreaming: () => false,
+      isActive: () => active,
+      runAgent: async () => ({ status: "success", result: "ok" }),
+      getContextUsageForChat: async () => null,
+    },
+  });
+  await web.enqueueAgentMessage({
+    chatJid: "web:goal",
+    content: "Retry durable materialization",
+    source: "goal.continuation",
+    queuedBy: { source: "goal", sourceMessageId: "goal-source-3" },
+  });
+  const queuedBefore = db.getDeferredQueuedFollowups("web:goal")[0]!;
+  db.getDb().exec(`CREATE TRIGGER fail_trusted_deferred_accept
+    BEFORE INSERT ON chat_accepted_sources
+    BEGIN SELECT RAISE(ABORT, 'forced trusted deferred acceptance failure'); END;`);
+
+  active = false;
+  const { materializeDeferredFollowups } = await import("../../../src/channels/web/runtime/process-chat-control-runtime.js");
+  const materialized = await materializeDeferredFollowups({ channel: web, chatJid: "web:goal", agentId: "default" });
+
+  expect(materialized).toMatchObject({ status: "retried" });
+  expect(db.getDeferredQueuedFollowups("web:goal")).toEqual([
+    expect.objectContaining({
+      rowId: queuedBefore.rowId,
+      queuedContent: queuedBefore.queuedContent,
+      source: "goal.continuation",
+      durable: true,
+      materializeRetries: 1,
+    }),
+  ]);
+  expect(db.getDb().prepare("SELECT COUNT(*) AS count FROM messages WHERE chat_jid = ? AND content = ?")
+    .get("web:goal", "Retry durable materialization")).toEqual({ count: 0 });
+  expect(db.getDb().prepare("SELECT COUNT(*) AS count FROM chat_accepted_sources WHERE chat_jid = ?")
+    .get("web:goal")).toEqual({ count: 0 });
+});

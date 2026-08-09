@@ -92,7 +92,7 @@ export class WebChannelRuntimeFollowupFacadeService {
     queuedContent: string,
     threadId?: number | null,
     queuedAt?: string,
-    extras?: { mediaIds?: number[]; contentBlocks?: unknown[]; linkPreviews?: unknown[]; screenHint?: string; source?: string; queuedBy?: QueuedFollowupItem["queuedBy"] },
+    extras?: { mediaIds?: number[]; contentBlocks?: unknown[]; linkPreviews?: unknown[]; screenHint?: string; source?: string; queuedBy?: QueuedFollowupItem["queuedBy"]; durable?: boolean },
   ): number {
     return this.deps.getQueuedFollowupLifecycle().enqueueQueuedFollowupItem(
       chatJid,

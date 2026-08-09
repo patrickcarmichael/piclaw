@@ -58,7 +58,7 @@ export class QueuedFollowupLifecycleService {
     queuedContent: string,
     threadId?: number | null,
     queuedAt?: string,
-    extras?: Pick<QueuedFollowupItem, "mediaIds" | "contentBlocks" | "linkPreviews" | "screenHint" | "source" | "queuedBy">
+    extras?: Pick<QueuedFollowupItem, "mediaIds" | "contentBlocks" | "linkPreviews" | "screenHint" | "source" | "queuedBy" | "durable">
   ): void {
     this.placeholderStore.enqueue(chatJid, rowId, queuedContent, threadId, queuedAt, extras);
   }
@@ -78,7 +78,7 @@ export class QueuedFollowupLifecycleService {
     queuedContent: string,
     threadId?: number | null,
     queuedAt?: string,
-    extras?: { mediaIds?: number[]; contentBlocks?: unknown[]; linkPreviews?: unknown[]; screenHint?: string; source?: string; queuedBy?: QueuedFollowupItem["queuedBy"] }
+    extras?: { mediaIds?: number[]; contentBlocks?: unknown[]; linkPreviews?: unknown[]; screenHint?: string; source?: string; queuedBy?: QueuedFollowupItem["queuedBy"]; durable?: boolean }
   ): number {
     const resolvedRowId = Number.isFinite(rowId) && rowId !== 0 ? rowId : this.allocateDeferredQueuedRowId(chatJid);
     const queued = this.getDeferredQueuedFollowupItems(chatJid);
