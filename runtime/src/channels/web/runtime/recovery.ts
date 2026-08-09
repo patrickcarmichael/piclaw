@@ -19,6 +19,7 @@ import {
   getInflightRuns,
   getMessageThreadRootIdById,
   getMessagesSince,
+  getPendingChatOperationIntentSources,
   getPreflightRuns,
   getResumableDurableChatJids,
   quarantinePendingManualCompactCommands,
@@ -204,6 +205,7 @@ export interface WebRecoveryStore {
   getBlockedDurableChatJids?(): string[];
   getRecoverableDurableRuns?(): RecoverableDurableRun[];
   getLatestAgentReplyForOperation?(chatJid: string, operationId: string): PersistedAgentReply | null;
+  getPendingChatOperationIntentSources?(operationId: string): AcceptedChatSource[];
   completeChatOperation?(chatJid: string, request: ChatOperationCompletion): ChatOperationCompletionResult;
   getDeferredQueuedFollowups(chatJid: string): DeferredQueuedFollowupRecord[];
   getMessagesSince(chatJid: string, since: string, assistantName: string): unknown[];
@@ -267,6 +269,7 @@ const defaultStore: WebRecoveryStore = {
   getBlockedDurableChatJids,
   getRecoverableDurableRuns,
   getLatestAgentReplyForOperation,
+  getPendingChatOperationIntentSources,
   completeChatOperation,
   getDeferredQueuedFollowups,
   getMessagesSince,
@@ -395,6 +398,7 @@ function recoverDurableRunningOperations(
 
   for (const { operation, source } of runs) {
     const reply = store.getLatestAgentReplyForOperation(operation.chatJid, operation.operationId);
+    const pendingIntents = store.getPendingChatOperationIntentSources?.(operation.operationId) ?? [];
     const draft = reply ? null : (ctx.getDraftRecovery?.(operation.chatJid) ?? null);
     const sourceMessageId = source.frontierMessageId ?? source.sourceId;
     const recoveryMessage = reply
@@ -428,6 +432,19 @@ function recoverDurableRunningOperations(
           : recoveryMessage
             ? { message: recoveryMessage }
             : undefined,
+        ...(pendingIntents.length > 0 ? {
+          successor: {
+            sourceKind: "restart_continuation" as const,
+            parentSourceSeq: source.sourceSeq,
+            carriedIntentSourceSeqs: pendingIntents.map((intent) => intent.sourceSeq),
+          },
+          intentDispositions: pendingIntents.map((intent) => ({
+            sourceSeq: intent.sourceSeq,
+            outcome: "interrupted" as const,
+            cause: "restart_steer_carried",
+            provenance: "web_startup_recovery",
+          })),
+        } : {}),
       });
       if (completed.status !== "completed" && completed.status !== "repeated") {
         log.info("Durable restart recovery lost operation ownership", {

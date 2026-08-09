@@ -46,9 +46,12 @@ import {
   getChatOperation,
   getChatOperationDisposition,
   getPendingChatOperationIntentSources,
-  getGoalContinuationCarriedIntentSources,
+  getContinuationCarriedIntentSources,
+  getContinuationGoalLineage,
   getGoalContinuationLineage,
   getProtectedContinuationRootSource,
+  getRestartContinuationParentSource,
+  getRestartContinuationRootSource,
   getChatPreflight,
   getInflightMessageId,
   getMessageByRowId,
@@ -62,6 +65,7 @@ import {
   resumeChatOperation,
   setChatCursor,
   waitChatOperation,
+  type AcceptedChatSource,
   type ChatOperationOutcome,
   type ChatOperationOwner,
   type ChatOperationState,
@@ -105,7 +109,7 @@ const TOOL_BUDGET_CONTINUATION_EXTENSION_ID = "piclaw.tool-budget-continuation";
 
 function loadDurableSourceMessage(chatJid: string, messageId: string): NewMessage | null {
   const row = getDb().prepare(`SELECT rowid, id, chat_jid, sender, sender_name, content, screen_hint,
-    content_blocks, link_previews, thread_id, timestamp, is_from_me, is_bot_message
+    content_blocks, link_previews, thread_id, timestamp, is_from_me, is_bot_message, is_steering_message
     FROM messages WHERE chat_jid = ? AND id = ?`).get(chatJid, messageId) as {
       rowid: number;
       id: string;
@@ -120,6 +124,7 @@ function loadDurableSourceMessage(chatJid: string, messageId: string): NewMessag
       timestamp: string;
       is_from_me: number;
       is_bot_message: number;
+      is_steering_message: number;
     } | undefined;
   if (!row) return null;
   const parseArray = (value: string | null): unknown[] | undefined => {
@@ -144,7 +149,32 @@ function loadDurableSourceMessage(chatJid: string, messageId: string): NewMessag
     timestamp: row.timestamp,
     is_from_me: row.is_from_me === 1,
     is_bot_message: row.is_bot_message === 1,
+    is_steering_message: row.is_steering_message === 1,
   };
+}
+
+function resolveDurablePromptRoot(source: AcceptedChatSource): AcceptedChatSource | null {
+  let current: AcceptedChatSource | null = source;
+  const seen = new Set<number>();
+  while (current) {
+    if (seen.has(current.sourceSeq)) return null;
+    seen.add(current.sourceSeq);
+    if (current.sourceKind === "restart_continuation") {
+      current = getRestartContinuationParentSource(current);
+      continue;
+    }
+    if (current.sourceKind === "protected_continuation") {
+      current = getProtectedContinuationRootSource(current);
+      continue;
+    }
+    if (current.sourceKind === "goal_continuation") {
+      const lineage = getGoalContinuationLineage(current);
+      current = lineage ? getAcceptedChatSource(lineage.rootSourceSeq) : null;
+      continue;
+    }
+    return current.sourceClass === "prompt" && current.selectable ? current : null;
+  }
+  return null;
 }
 
 function messagePrecedes(left: NewMessage, right: NewMessage): boolean {
@@ -1625,6 +1655,7 @@ export async function processChat(
     && messagePrecedes(selection.currentMessage, nextAcceptedMessage);
   const shouldClaimDurableSource = Boolean(existingOperation)
     || Boolean(nextAcceptedSource?.sourceKind === "protected_continuation")
+    || Boolean(nextAcceptedSource?.sourceKind === "restart_continuation")
     || Boolean(nextAcceptedSource?.sourceKind === "goal_continuation")
     || Boolean(nextAcceptedSource?.sourceKind === "message" && !earlierLegacyMessage);
   const operationClaim = shouldClaimDurableSource ? claimNextChatOperation(chatJid) : null;
@@ -1636,6 +1667,7 @@ export async function processChat(
     : null;
   if (durableOperation && durableSource?.sourceKind !== "message"
     && durableSource?.sourceKind !== "protected_continuation"
+    && durableSource?.sourceKind !== "restart_continuation"
     && durableSource?.sourceKind !== "goal_continuation") {
     log.warn("Durable prompt consumer refused an unsupported source", {
       operation: "process_chat.operation_source_not_supported",
@@ -1695,41 +1727,45 @@ export async function processChat(
     return;
   }
 
-  const protectedContinuationRoot = durableSource?.sourceKind === "protected_continuation"
-    ? getProtectedContinuationRootSource(durableSource)
+  const continuationPromptRoot = durableSource && durableSource.sourceKind !== "message"
+    ? resolveDurablePromptRoot(durableSource)
     : null;
   const goalContinuationLineage = durableSource?.sourceKind === "goal_continuation"
     ? getGoalContinuationLineage(durableSource)
     : null;
-  const goalContinuationRoot = goalContinuationLineage
-    ? getAcceptedChatSource(goalContinuationLineage.rootSourceSeq)
-    : null;
   const durableMessageId = durableSource?.sourceKind === "message"
     ? durableSource.sourceId
-    : protectedContinuationRoot?.frontierMessageId ?? goalContinuationRoot?.frontierMessageId;
+    : continuationPromptRoot?.frontierMessageId;
   const claimedMessage = durableMessageId ? loadDurableSourceMessage(chatJid, durableMessageId) : null;
   if (durableOperation && !claimedMessage) {
-    if (durableSource?.sourceKind === "protected_continuation") {
+    if (durableSource?.sourceKind === "protected_continuation" || durableSource?.sourceKind === "restart_continuation") {
+      const restartContinuation = durableSource.sourceKind === "restart_continuation";
       const createdAt = new Date().toISOString();
       const artifactId = createUuid("message");
+      const failureCause = restartContinuation
+        ? "restart_continuation_invalid_lineage"
+        : "protected_continuation_invalid_lineage";
+      const failureProvenance = restartContinuation
+        ? "web_process_chat_restart_refusal"
+        : "web_process_chat_protected_refusal";
       const completed = completeChatOperation(chatJid, {
         owner: durableOperationOwner(durableOperation),
         outcome: "failed",
-        cause: "protected_continuation_invalid_lineage",
-        provenance: "web_process_chat_protected_refusal",
+        cause: failureCause,
+        provenance: failureProvenance,
         createdAt,
         intentDispositions: getPendingChatOperationIntentSources(durableOperation.operationId).map((intent) => ({
           sourceSeq: intent.sourceSeq,
           outcome: "failed" as const,
-          cause: "protected_continuation_invalid_lineage",
-          provenance: "web_process_chat_protected_refusal",
+          cause: failureCause,
+          provenance: failureProvenance,
         })),
         artifact: { message: {
           id: artifactId,
           chat_jid: chatJid,
           sender: "web-agent",
           sender_name: getIdentityConfig().assistantName,
-          content: "Protected recovery continuation could not be resumed because its source lineage is invalid. Retry the original request manually.",
+          content: `${restartContinuation ? "Restart" : "Protected recovery"} continuation could not be resumed because its source lineage is invalid. Retry the original request manually.`,
           timestamp: createdAt,
           is_from_me: false,
           is_bot_message: true,
@@ -1737,7 +1773,7 @@ export async function processChat(
           content_blocks: [buildTurnOutcomeMarker({
             kind: "recovery",
             label: "recovery",
-            title: "Protected continuation refused",
+            title: `${restartContinuation ? "Restart" : "Protected"} continuation refused`,
             detail: "The immutable source lineage is missing or invalid. Retry the original request manually.",
             severity: "error",
           })],
@@ -1809,6 +1845,7 @@ export async function processChat(
 
   const channelName = detectChannel(chatJid);
   const durableProtectedContinuation = durableSource?.sourceKind === "protected_continuation";
+  const durableRestartContinuation = durableSource?.sourceKind === "restart_continuation";
   const durableGoalContinuation = durableSource?.sourceKind === "goal_continuation";
   const goalProvider = durableGoalContinuation ? getAddonGoalDeadlineCheckpointProvider() : null;
   const goalContinuation = durableGoalContinuation && goalContinuationLineage && goalProvider
@@ -1840,7 +1877,7 @@ export async function processChat(
     }
     return;
   }
-  const protectedRecoveryPrompt = durableProtectedContinuation
+  const protectedRecoveryPrompt = durableProtectedContinuation || durableRestartContinuation
     ? TOOL_ENABLED_RECOVERY_CONTINUATION_PROMPT
     : resolveProtectedRecoveryPrompt(currentMessage);
   const promptMessage = durableGoalContinuation && goalContinuation?.status === "continue"
@@ -1848,19 +1885,20 @@ export async function processChat(
     : protectedRecoveryPrompt
       ? { ...currentMessage, content: protectedRecoveryPrompt }
       : currentMessage;
-  const carriedGoalSteers = durableGoalContinuation && durableSource
-    ? getGoalContinuationCarriedIntentSources(durableSource.sourceSeq)
-      .map((intent) => intent.payloadRef.startsWith("message:")
-        ? loadDurableSourceMessage(chatJid, intent.payloadRef.slice("message:".length))
-        : null)
-      .filter((message): message is NewMessage => Boolean(message))
+  const hasCarriedSteers = durableGoalContinuation || durableRestartContinuation;
+  const carriedIntentSources = hasCarriedSteers && durableSource
+    ? getContinuationCarriedIntentSources(durableSource.sourceSeq)
     : [];
-  if (durableGoalContinuation && durableSource
-    && carriedGoalSteers.length !== getGoalContinuationCarriedIntentSources(durableSource.sourceSeq).length) {
+  const carriedSteers = carriedIntentSources
+    .map((intent) => intent.payloadRef.startsWith("message:")
+      ? loadDurableSourceMessage(chatJid, intent.payloadRef.slice("message:".length))
+      : null)
+    .filter((message): message is NewMessage => Boolean(message));
+  if (hasCarriedSteers && carriedSteers.length !== carriedIntentSources.length) {
     blockChatOperation(chatJid, durableOperationOwner(durableOperation!));
     return;
   }
-  const prompt = formatMessages([promptMessage, ...carriedGoalSteers], channelName, chatJid);
+  const prompt = formatMessages([promptMessage, ...carriedSteers], channelName, chatJid);
   const lastMessage = currentMessage;
   const runStartedAt = new Date().toISOString();
   const threadId = lastMessage.timestamp;
@@ -2556,9 +2594,10 @@ export async function processChat(
                 ? initialResolution.visibleText
                 : "Goal deadline checkpoint could not safely schedule a continuation.";
             const artifactId = createUuid("message");
-            const currentLineage = source.sourceKind === "goal_continuation" ? getGoalContinuationLineage(source) : null;
+            const currentLineage = getContinuationGoalLineage(source);
             const rootSourceSeq = currentLineage?.rootSourceSeq
               ?? (source.sourceKind === "protected_continuation" ? getProtectedContinuationRootSource(source)?.sourceSeq : null)
+              ?? (source.sourceKind === "restart_continuation" ? getRestartContinuationRootSource(source)?.sourceSeq : null)
               ?? source.sourceSeq;
             const parentGeneration = currentLineage?.generation ?? 0;
             const carriedIntentSourceSeqs = canContinue ? intents.slice(appliedCount).map((intent) => intent.sourceSeq) : [];

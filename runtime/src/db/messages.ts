@@ -690,6 +690,12 @@ export function getNewMessages(
       AND is_bot_message = 0 AND content NOT LIKE ?
       AND LTRIM(content) NOT LIKE '/%'
       AND COALESCE(is_steering_message, 0) = 0
+      AND NOT EXISTS (
+        SELECT 1 FROM chat_accepted_sources accepted
+        WHERE accepted.chat_jid = messages.chat_jid
+          AND accepted.source_class = 'intent' AND accepted.source_kind = 'steer'
+          AND accepted.payload_ref = ('message:' || messages.id)
+      )
     ORDER BY timestamp
   `;
 
@@ -720,6 +726,12 @@ export function getMessagesSince(
       AND is_bot_message = 0 AND content NOT LIKE ?
       AND LTRIM(content) NOT LIKE '/%'
       AND COALESCE(is_steering_message, 0) = 0
+      AND NOT EXISTS (
+        SELECT 1 FROM chat_accepted_sources accepted
+        WHERE accepted.chat_jid = messages.chat_jid
+          AND accepted.source_class = 'intent' AND accepted.source_kind = 'steer'
+          AND accepted.payload_ref = ('message:' || messages.id)
+      )
     ORDER BY timestamp
   `;
   const rows = db.prepare(sql).all(chatJid, sinceTimestamp, `${botPrefix}:%`) as Array<Omit<NewMessage, "content_blocks"> & { content_blocks?: string | null }>;

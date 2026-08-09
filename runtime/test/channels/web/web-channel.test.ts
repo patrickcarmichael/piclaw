@@ -2850,6 +2850,142 @@ test("durable processChat externalizes one protected child then completes one po
   expect(web.getQueuedFollowupItems("web:default")).toHaveLength(0);
 });
 
+test("restart recovery replays pending steers exactly once through one durable successor", async () => {
+  const ws = createTempWorkspace("piclaw-web-channel-");
+  cleanupWorkspace = ws.cleanup;
+  restoreEnv = setEnv({ PICLAW_WORKSPACE: ws.workspace, PICLAW_STORE: ws.store, PICLAW_DATA: ws.data });
+
+  const db = await import("../../../src/db.js");
+  const { TOOL_ENABLED_RECOVERY_CONTINUATION_PROMPT } = await import("../../../src/agent-pool/context-pressure-retry.js");
+  db.initDatabase();
+  db.getDb().exec("DELETE FROM chat_goal_continuation_intents; DELETE FROM message_media; DELETE FROM messages; DELETE FROM chats; DELETE FROM chat_cursors;");
+  db.storeChatMetadata("web:default", new Date().toISOString(), "Web");
+  const accepted = db.storeAcceptedChatMessageSource({
+    id: `msg-${crypto.randomUUID()}`,
+    chat_jid: "web:default",
+    sender: "user",
+    sender_name: "User",
+    content: "finish the restart-safe task",
+    timestamp: new Date().toISOString(),
+    is_from_me: false,
+    is_bot_message: false,
+  }).source;
+  const claimed = db.claimNextChatOperation("web:default");
+  if (claimed.status !== "claimed") throw new Error("expected durable claim");
+  const claimedOwner = {
+    operationId: claimed.operation.operationId,
+    sourceSeq: claimed.operation.sourceSeq,
+    phase: claimed.operation.phase,
+    generation: claimed.operation.generation,
+  };
+  const preflight = db.promoteChatOperation("web:default", claimedOwner, "preflight");
+  if (preflight.status !== "applied") throw new Error("expected preflight promotion");
+  const running = db.promoteChatOperation("web:default", {
+    operationId: preflight.operation.operationId,
+    sourceSeq: preflight.operation.sourceSeq,
+    phase: preflight.operation.phase,
+    generation: preflight.operation.generation,
+  }, "running");
+  if (running.status !== "applied") throw new Error("expected running promotion");
+
+  const steerTexts = ["first restart steer", "second restart steer"];
+  const intentSourceSeqs: number[] = [];
+  for (const content of steerTexts) {
+    const steerId = `steer-${crypto.randomUUID()}`;
+    const acceptedAt = new Date().toISOString();
+    db.storeMessage({
+      id: steerId,
+      chat_jid: "web:default",
+      sender: "user",
+      sender_name: "User",
+      content,
+      timestamp: acceptedAt,
+      is_from_me: false,
+      is_bot_message: false,
+    });
+    const registered = db.registerChatOperationIntent("web:default", {
+      operationId: running.operation.operationId,
+      sourceSeq: running.operation.sourceSeq,
+      phase: running.operation.phase,
+      generation: running.operation.generation,
+    }, {
+      sourceKind: "steer",
+      sourceId: steerId,
+      acceptedAt,
+      payloadRef: `message:${steerId}`,
+    });
+    expect(registered.status).toBe("registered");
+    if (registered.status === "registered") intentSourceSeqs.push(registered.source.sourceSeq);
+  }
+  const partialId = `partial-${crypto.randomUUID()}`;
+  db.storeMessage({
+    id: partialId,
+    chat_jid: "web:default",
+    sender: "web-agent",
+    sender_name: "Pi",
+    content: "Visible work before restart.",
+    timestamp: new Date().toISOString(),
+    is_from_me: true,
+    is_bot_message: true,
+    is_terminal_agent_reply: false,
+    operation_id: running.operation.operationId,
+  });
+
+  const prompts: string[] = [];
+  const webMod = await import("../../../src/channels/web.js");
+  const web = new (webMod.WebChannel as any)({
+    queue: { enqueue: () => {} },
+    agentPool: {
+      setSessionBinder: () => {},
+      runAgent: async (prompt: string, _chatJid: string, options: any) => {
+        prompts.push(prompt);
+        const output = { status: "success" as const, result: "Restart steers completed.", attachments: [] };
+        await options.onTerminalOutput(output);
+        return output;
+      },
+      getContextUsageForChat: async () => null,
+    },
+  });
+
+  web.recoverInflightRuns();
+  web.recoverInflightRuns();
+
+  expect(db.getChatOperationDisposition(accepted.sourceSeq)).toMatchObject({
+    outcome: "interrupted",
+    cause: "recovered_partial_output",
+  });
+  const successor = db.peekNextAcceptedChatSource("web:default")!;
+  expect(successor).toMatchObject({
+    sourceKind: "restart_continuation",
+    payloadRef: `accepted-source:${accepted.sourceSeq}`,
+  });
+  expect(db.getContinuationCarriedIntentSources(successor.sourceSeq).map((item: any) => item.sourceSeq))
+    .toEqual(intentSourceSeqs);
+  expect(db.getDb().prepare(`SELECT COUNT(*) AS count FROM chat_accepted_sources
+    WHERE chat_jid = ? AND source_kind = 'restart_continuation'`).get("web:default") as any)
+    .toEqual({ count: 1 });
+  expect(db.getDb().prepare(`SELECT content, is_steering_message FROM messages
+    WHERE chat_jid = ? AND content IN (?, ?) ORDER BY rowid`).all("web:default", ...steerTexts) as any)
+    .toEqual([
+      { content: steerTexts[0], is_steering_message: 1 },
+      { content: steerTexts[1], is_steering_message: 1 },
+    ]);
+  expect(db.getMessagesSince("web:default", db.getChatCursor("web:default"), "Pi")).toEqual([]);
+
+  await web.processChat("web:default", "default");
+
+  expect(prompts).toHaveLength(1);
+  expect(prompts[0]).toContain(TOOL_ENABLED_RECOVERY_CONTINUATION_PROMPT);
+  for (const text of steerTexts) expect(prompts[0].split(text)).toHaveLength(2);
+  expect(prompts[0].indexOf(steerTexts[0])).toBeLessThan(prompts[0].indexOf(steerTexts[1]));
+  expect(db.getChatOperationDisposition(successor.sourceSeq)).toMatchObject({ outcome: "succeeded" });
+  expect(db.peekNextAcceptedChatSource("web:default")).toBeNull();
+  expect(db.getMessagesSince("web:default", db.getChatCursor("web:default"), "Pi")).toEqual([]);
+  expect(db.getDb().prepare(`SELECT COUNT(*) AS count FROM messages
+    WHERE chat_jid = ? AND is_bot_message = 1 AND content = 'Restart steers completed.'`)
+    .get("web:default") as any).toEqual({ count: 1 });
+});
+
 test("durable Goal deadline checkpoint commits one visible successor and replays carried steering once", async () => {
   const ws = createTempWorkspace("piclaw-web-channel-");
   cleanupWorkspace = ws.cleanup;

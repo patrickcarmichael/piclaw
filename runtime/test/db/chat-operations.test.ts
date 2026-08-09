@@ -17,6 +17,24 @@ const register = (chatJid: string, id: string, acceptedAt = "2026-08-07T22:00:00
   return op.storeAcceptedChatMessageSource({ id, chat_jid: chatJid, sender: "user", sender_name: "User", content: id,
     timestamp: acceptedAt, is_from_me: false, is_bot_message: false }, acceptedAt).source;
 };
+const registerSteer = (chatJid: string, state: ChatOperationState, id: string, acceptedAt: string) => {
+  db.storeMessage({
+    id,
+    chat_jid: chatJid,
+    sender: "user",
+    sender_name: "User",
+    content: id,
+    timestamp: acceptedAt,
+    is_from_me: false,
+    is_bot_message: false,
+  });
+  return op.registerChatOperationIntent(chatJid, owner(state), {
+    sourceKind: "steer",
+    sourceId: id,
+    acceptedAt,
+    payloadRef: `message:${id}`,
+  });
+};
 const terminal = (chatJid: string, id: string) => ({
   id, chat_jid: chatJid, sender: "bot", sender_name: "Pi", content: "done",
   timestamp: "2026-08-07T22:01:00.000Z", is_from_me: true, is_bot_message: true,
@@ -217,6 +235,162 @@ describe("durable accepted-input operations", () => {
     expect(() => op.completeChatOperation(chatJid, {
       ...request, successor: { sourceKind: "protected_continuation", rootSourceSeq: root.sourceSeq + 1 },
     })).toThrow("lineage conflicts");
+  });
+
+  test("restart continuation atomically carries pending steers in source order and is repeatable", () => {
+    for (const boundary of ["artifact", "successor", "intents", "disposition", "frontier", "release"] as const) {
+      const chatJid = jid(`restart-steers-${boundary}`);
+      const root = register(chatJid, `restart-root-${boundary}`);
+      const claimed = op.claimNextChatOperation(chatJid).operation!;
+      const firstMessageId = `restart-first-${boundary}`;
+      const secondMessageId = `restart-second-${boundary}`;
+      const first = registerSteer(chatJid, claimed, firstMessageId, "now-1");
+      const second = registerSteer(chatJid, claimed, secondMessageId, "now-2");
+      if (first.status !== "registered" || second.status !== "registered") throw new Error("expected restart steers");
+      const carriedIntentSourceSeqs = [first.source.sourceSeq, second.source.sourceSeq];
+      const request = {
+        owner: owner(claimed),
+        outcome: "succeeded" as const,
+        cause: "recovered_terminal_output",
+        provenance: "web_startup_recovery",
+        createdAt: "2026-08-09T09:00:00.000Z",
+        artifact: { message: terminal(chatJid, `restart-terminal-${boundary}-${serial}`) },
+        successor: {
+          sourceKind: "restart_continuation" as const,
+          parentSourceSeq: root.sourceSeq,
+          carriedIntentSourceSeqs,
+        },
+        intentDispositions: carriedIntentSourceSeqs.map((sourceSeq) => ({
+          sourceSeq,
+          outcome: "interrupted" as const,
+          cause: "restart_steer_carried",
+          provenance: "web_startup_recovery",
+        })),
+      };
+
+      expect(() => op.completeChatOperation(chatJid, request, {
+        afterWrite(point) { if (point === boundary) throw new Error(`fault:${point}`); },
+      })).toThrow(`fault:${boundary}`);
+      expect(op.getChatOperation(chatJid)).toEqual(claimed);
+      expect(op.getChatOperationDisposition(root.sourceSeq)).toBeNull();
+      expect(op.getChatOperationDisposition(first.source.sourceSeq)).toBeNull();
+      expect(op.getChatOperationDisposition(second.source.sourceSeq)).toBeNull();
+      expect(db.getDb().prepare(`SELECT 1 FROM chat_accepted_sources
+        WHERE chat_jid = ? AND source_kind = 'restart_continuation'`).get(chatJid)).toBeNull();
+      expect(db.getDb().prepare("SELECT 1 FROM messages WHERE chat_jid = ? AND id = ?")
+        .get(chatJid, request.artifact.message.id)).toBeNull();
+      expect(db.getDb().prepare(`SELECT id, is_steering_message FROM messages
+        WHERE chat_jid = ? AND id IN (?, ?) ORDER BY rowid`).all(chatJid, firstMessageId, secondMessageId))
+        .toEqual([
+          { id: firstMessageId, is_steering_message: 0 },
+          { id: secondMessageId, is_steering_message: 0 },
+        ]);
+
+      expect(op.completeChatOperation(chatJid, request).status).toBe("completed");
+      const successor = op.peekNextAcceptedChatSource(chatJid)!;
+      expect(successor).toMatchObject({
+        sourceKind: "restart_continuation",
+        sourceId: `source:${root.sourceSeq}`,
+        payloadRef: `accepted-source:${root.sourceSeq}`,
+      });
+      expect(op.getRestartContinuationParentSource(successor)?.sourceSeq).toBe(root.sourceSeq);
+      expect(op.getContinuationCarriedIntentSources(successor.sourceSeq).map((item) => item.sourceSeq))
+        .toEqual(carriedIntentSourceSeqs);
+      expect(db.getDb().prepare(`SELECT id, is_steering_message FROM messages
+        WHERE chat_jid = ? AND id IN (?, ?) ORDER BY rowid`).all(chatJid, firstMessageId, secondMessageId))
+        .toEqual([
+          { id: firstMessageId, is_steering_message: 1 },
+          { id: secondMessageId, is_steering_message: 1 },
+        ]);
+      expect(op.completeChatOperation(chatJid, request).status).toBe("repeated");
+    }
+  });
+
+  test("Goal lineage advances across an intervening restart continuation", () => {
+    const chatJid = jid("goal-restart-lineage");
+    const root = register(chatJid, "goal-restart-root");
+    const rootClaim = op.claimNextChatOperation(chatJid).operation!;
+    expect(op.completeChatOperation(chatJid, {
+      owner: owner(rootClaim),
+      outcome: "interrupted",
+      cause: "goal_deadline_checkpoint",
+      provenance: "goal:test",
+      createdAt: "2026-08-09T09:00:00.000Z",
+      artifact: { message: terminal(chatJid, `goal-restart-first-${serial}`) },
+      successor: {
+        sourceKind: "goal_continuation",
+        rootSourceSeq: root.sourceSeq,
+        parentSourceSeq: root.sourceSeq,
+        parentGeneration: 0,
+        generation: 1,
+        goalId: "goal-restart",
+        checkpointId: "checkpoint-1",
+        oldTurnId: "turn-1",
+        carriedIntentSourceSeqs: [],
+      },
+    }).status).toBe("completed");
+    const firstGoal = op.claimNextChatOperation(chatJid);
+    if (firstGoal.status !== "claimed") throw new Error("expected first Goal continuation");
+    const steer = registerSteer(
+      chatJid,
+      firstGoal.operation,
+      "goal-restart-steer",
+      "2026-08-09T09:01:00.000Z",
+    );
+    if (steer.status !== "registered") throw new Error("expected restart steer");
+    expect(op.completeChatOperation(chatJid, {
+      owner: owner(firstGoal.operation),
+      outcome: "interrupted",
+      cause: "recovered_partial_output",
+      provenance: "web_startup_recovery",
+      createdAt: "2026-08-09T09:01:01.000Z",
+      artifact: { message: terminal(chatJid, `goal-restart-recovered-${serial}`) },
+      successor: {
+        sourceKind: "restart_continuation",
+        parentSourceSeq: firstGoal.source.sourceSeq,
+        carriedIntentSourceSeqs: [steer.source.sourceSeq],
+      },
+      intentDispositions: [{
+        sourceSeq: steer.source.sourceSeq,
+        outcome: "interrupted",
+        cause: "restart_steer_carried",
+        provenance: "web_startup_recovery",
+      }],
+    }).status).toBe("completed");
+    const restart = op.claimNextChatOperation(chatJid);
+    if (restart.status !== "claimed") throw new Error("expected restart continuation");
+    expect(op.getContinuationGoalLineage(restart.source)).toMatchObject({
+      rootSourceSeq: root.sourceSeq,
+      generation: 1,
+      goalId: "goal-restart",
+    });
+    expect(op.completeChatOperation(chatJid, {
+      owner: owner(restart.operation),
+      outcome: "interrupted",
+      cause: "goal_deadline_checkpoint",
+      provenance: "goal:test",
+      createdAt: "2026-08-09T09:02:00.000Z",
+      artifact: { message: terminal(chatJid, `goal-restart-second-${serial}`) },
+      successor: {
+        sourceKind: "goal_continuation",
+        rootSourceSeq: root.sourceSeq,
+        parentSourceSeq: restart.source.sourceSeq,
+        parentGeneration: 1,
+        generation: 2,
+        goalId: "goal-restart",
+        checkpointId: "checkpoint-2",
+        oldTurnId: "turn-2",
+        carriedIntentSourceSeqs: [],
+      },
+    }).status).toBe("completed");
+    const secondGoal = op.peekNextAcceptedChatSource(chatJid)!;
+    expect(op.getGoalContinuationLineage(secondGoal)).toMatchObject({
+      rootSourceSeq: root.sourceSeq,
+      parentSourceSeq: restart.source.sourceSeq,
+      parentGeneration: 1,
+      generation: 2,
+      goalId: "goal-restart",
+    });
   });
 
   test("Goal checkpoint atomically preserves lineage, carried steers, restart claims, and repeated generations", () => {
@@ -571,6 +745,28 @@ describe("durable accepted-input operations", () => {
     expect(op.getPendingChatOperationIntentSources(blockedOwner.operationId)).toEqual([]);
     expect(op.getChatOperationDisposition(blockedIntent.source.sourceSeq)).toMatchObject({
       outcome: "failed", cause: "steer_queue_failed", provenance: "web_compose_steer_queue_failure",
+    });
+  });
+
+  test("accepted steer payloads never re-enter legacy pending scans after queue-failure accounting", () => {
+    const chatJid = jid("intent-queue-failure-scan");
+    const root = register(chatJid, "queue-failure-root");
+    const claimed = op.claimNextChatOperation(chatJid).operation!;
+    const steer = registerSteer(chatJid, claimed, "queue-failure-unflagged", "2026-08-07T22:00:01.000Z");
+    if (steer.status !== "registered") throw new Error("expected steer");
+    expect(op.disposeChatOperationIntent(chatJid, owner(claimed), {
+      sourceSeq: steer.source.sourceSeq,
+      outcome: "failed",
+      cause: "steer_queue_failed",
+      provenance: "web_compose_steer_queue_failure",
+      createdAt: "2026-08-07T22:00:02.000Z",
+    }).status).toBe("disposed");
+    expect(db.getDb().prepare(`SELECT is_steering_message FROM messages WHERE chat_jid = ? AND id = ?`)
+      .get(chatJid, "queue-failure-unflagged")).toEqual({ is_steering_message: 0 });
+    expect(db.getMessagesSince(chatJid, root.frontierCursorTs!, "Pi")).toEqual([]);
+    expect(db.getNewMessages([chatJid], root.frontierCursorTs!, "Pi")).toEqual({
+      messages: [],
+      newTimestamp: root.frontierCursorTs,
     });
   });
 

@@ -505,8 +505,8 @@ function createSchema(database: Database): void {
       SELECT RAISE(ABORT, 'operation disposition is immutable');
     END;
 
-    -- Immutable refs for operation intents that were accepted but not yet
-    -- applied when a Goal deadline continuation superseded their owner.
+    -- Immutable refs for operation intents carried into one durable Goal or
+    -- restart continuation after their original owner settled.
     CREATE TABLE IF NOT EXISTS chat_goal_continuation_intents (
       continuation_source_seq INTEGER NOT NULL,
       intent_source_seq INTEGER NOT NULL UNIQUE,
