@@ -53,6 +53,42 @@ async function setup(name: string, chatJid = `web:${name}`) {
   return { ws, db, chatJid, operation };
 }
 
+function completeSucceededForCleanup(
+  db: typeof import("../../src/db.js"),
+  chatJid: string,
+  provenance: string,
+  pendingIntentOutcome: "succeeded" | "failed" = "succeeded",
+) {
+  const operation = db.getChatOperation(chatJid);
+  if (!operation) throw new Error("expected active operation during test cleanup");
+  const pending = db.getPendingChatOperationIntentSources(operation.operationId);
+  const completed = db.completeChatOperation(chatJid, {
+    owner: ownerOf(operation),
+    outcome: "succeeded",
+    cause: "normal",
+    provenance,
+    createdAt: "2026-08-09T10:30:00.000Z",
+    artifact: { message: {
+      id: `${provenance}-terminal`,
+      chat_jid: chatJid,
+      sender: "bot",
+      sender_name: "Pi",
+      content: "done",
+      timestamp: "2026-08-09T10:30:00.000Z",
+      is_from_me: true,
+      is_bot_message: true,
+      is_terminal_agent_reply: true,
+    } },
+    intentDispositions: pending.map((source: any) => ({
+      sourceSeq: source.sourceSeq,
+      outcome: pendingIntentOutcome,
+      cause: pendingIntentOutcome === "failed" ? "steer_queue_failed" : "normal",
+      provenance,
+    })),
+  });
+  expect(completed.status).toBe("completed");
+}
+
 test("real concurrent durable prompt admits exact-owner streaming steers in source_seq FIFO order", async () => {
   const { ws, db, chatJid, operation } = await setup("operation-steer-fifo");
   let promptStarted = false;
@@ -125,6 +161,113 @@ test("real concurrent durable prompt admits exact-owner streaming steers in sour
 
   releasePrompt();
   await run;
+  completeSucceededForCleanup(db, chatJid, "test_fifo_cleanup");
+  await pool.shutdown();
+  ws.cleanup();
+});
+
+test("settlement-fenced operation defers an admitted steer as durable prompt without an SDK queue effect", async () => {
+  const { ws, db, chatJid, operation } = await setup("operation-steer-settlement-fence");
+  let promptStarted = false;
+  let releasePrompt!: () => void;
+  const promptGate = new Promise<void>((resolve) => { releasePrompt = resolve; });
+  let steerEffects = 0;
+
+  class BlockingSession {
+    isStreaming = false;
+    private listeners: Array<(event: any) => void> = [];
+    subscribe(listener: (event: any) => void) { this.listeners.push(listener); return () => {}; }
+    async steer() { steerEffects += 1; }
+    async prompt() {
+      this.isStreaming = true;
+      promptStarted = true;
+      await promptGate;
+      this.isStreaming = false;
+      for (const listener of this.listeners) {
+        listener({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "done" } });
+      }
+    }
+    async abort() { releasePrompt(); }
+    bindExtensions() {}
+    dispose() {}
+  }
+
+  const { AgentPool } = await importFresh<typeof import("../../src/agent-pool.js")>("../src/agent-pool.js");
+  const pool = new AgentPool({
+    ...createAgentPoolModelOptions(),
+    createSession: async () => createRuntime(new BlockingSession()) as any,
+  });
+  const owner = ownerOf(operation);
+  const run = pool.runAgent("root", chatJid, { timeoutMs: 0, operationOwner: owner });
+  await waitFor(() => promptStarted, 1_000);
+  expect(db.fenceChatOperationSettlement(chatJid, owner, {
+    fenceId: "checkpoint-settlement-fence",
+    fencedAt: "2026-08-09T10:10:00.000Z",
+  }).status).toBe("fenced");
+  db.storeMessage({
+    id: "post-fence-steer",
+    chat_jid: chatJid,
+    sender: "user",
+    sender_name: "User",
+    content: "run after the checkpoint",
+    timestamp: "2026-08-09T10:10:01.000Z",
+    is_from_me: false,
+    is_bot_message: false,
+  });
+
+  const result = await pool.queueStreamingMessage(chatJid, "run after the checkpoint", "steer", {
+    operationOwner: owner,
+    beforeQueue: () => {
+      const registered = db.registerChatOperationIntent(chatJid, owner, {
+        sourceKind: "steer",
+        sourceId: "post-fence-steer",
+        acceptedAt: "2026-08-09T10:10:01.000Z",
+        payloadRef: "message:post-fence-steer",
+      });
+      if (registered.status === "rejected") throw new Error(registered.reason);
+      return {
+        sourceSeq: registered.source.sourceSeq,
+        queueEffect: registered.status === "deferred" ? "deferred" as const : "steer" as const,
+      };
+    },
+  });
+
+  expect(result).toEqual({
+    queued: false,
+    deferred: true,
+    deferredSourceSeq: expect.any(Number),
+  });
+  expect(steerEffects).toBe(0);
+  expect(db.getPendingChatOperationIntentSources(operation.operationId)).toEqual([]);
+  expect(db.getAcceptedChatSource(result.deferredSourceSeq!)).toMatchObject({
+    sourceClass: "prompt",
+    sourceKind: "message",
+    sourceId: "post-fence-steer",
+    selectable: true,
+    operationId: null,
+  });
+
+  releasePrompt();
+  await run;
+  expect(db.completeChatOperation(chatJid, {
+    owner,
+    outcome: "succeeded",
+    cause: "normal",
+    provenance: "test_settlement_fence",
+    createdAt: "2026-08-09T10:10:02.000Z",
+    settlementFenceId: "checkpoint-settlement-fence",
+    artifact: { message: {
+      id: "settlement-fence-terminal",
+      chat_jid: chatJid,
+      sender: "bot",
+      sender_name: "Pi",
+      content: "done",
+      timestamp: "2026-08-09T10:10:02.000Z",
+      is_from_me: true,
+      is_bot_message: true,
+      is_terminal_agent_reply: true,
+    } },
+  }).status).toBe("completed");
   await pool.shutdown();
   ws.cleanup();
 });
@@ -190,6 +333,7 @@ test("owner drift after intent registration rejects SDK queueing and truthfully 
 
   releasePrompt();
   await run;
+  completeSucceededForCleanup(db, chatJid, "test_owner_drift_cleanup");
   await pool.shutdown();
   ws.cleanup();
 });
@@ -365,6 +509,7 @@ test("durable queue failure runs truthful accounting callback and never reports 
 
   releasePrompt();
   await run;
+  completeSucceededForCleanup(db, chatJid, "test_queue_failure_cleanup", "failed");
   await pool.shutdown();
   ws.cleanup();
 });
@@ -517,6 +662,99 @@ test("real concurrent durable prompt accepts a compose steer through WebChannel"
 
   releasePrompt();
   await run;
+  completeSucceededForCleanup(db, chatJid, "test_web_compose_cleanup");
+  await pool.shutdown();
+  ws.cleanup();
+});
+
+test("Web compose steer accepted after the settlement fence becomes a visible durable follow-up", async () => {
+  const { ws, db, chatJid, operation } = await setup("operation-steer-web-fenced", "web:default");
+  db.storeChatMetadata(chatJid, "2026-08-09T10:20:00.000Z", "Web");
+  let promptStarted = false;
+  let releasePrompt!: () => void;
+  const promptGate = new Promise<void>((resolve) => { releasePrompt = resolve; });
+  let steerEffects = 0;
+
+  class BlockingSession {
+    isStreaming = false;
+    private listeners: Array<(event: any) => void> = [];
+    subscribe(listener: (event: any) => void) { this.listeners.push(listener); return () => {}; }
+    async steer() { steerEffects += 1; }
+    async prompt() {
+      this.isStreaming = true;
+      promptStarted = true;
+      await promptGate;
+      this.isStreaming = false;
+      for (const listener of this.listeners) {
+        listener({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "done" } });
+      }
+    }
+    async abort() { releasePrompt(); }
+    bindExtensions() {}
+    dispose() {}
+  }
+
+  const { AgentPool } = await importFresh<typeof import("../../src/agent-pool.js")>("../src/agent-pool.js");
+  const pool = new AgentPool({
+    ...createAgentPoolModelOptions(),
+    createSession: async () => createRuntime(new BlockingSession()) as any,
+  });
+  const run = pool.runAgent("root", chatJid, { timeoutMs: 0, operationOwner: ownerOf(operation) });
+  await waitFor(() => promptStarted, 1_000);
+  expect(db.fenceChatOperationSettlement(chatJid, ownerOf(operation), {
+    fenceId: "web-compose-fence",
+    fencedAt: "2026-08-09T10:20:01.000Z",
+  }).status).toBe("fenced");
+
+  const { WebChannel } = await importFresh<typeof import("../../src/channels/web.js")>("../src/channels/web.js");
+  const events: string[] = [];
+  const web = new (WebChannel as any)({ queue: { enqueue: () => {} }, agentPool: pool });
+  const originalBroadcast = web.broadcastEvent.bind(web);
+  web.broadcastEvent = (event: string, payload: Record<string, unknown>) => {
+    events.push(event);
+    return originalBroadcast(event, payload);
+  };
+  const response = await web.handleRequest(new Request("http://test/agent/default/message", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content: "compose after fence", mode: "steer" }),
+  }));
+  const payload = await response.json();
+
+  expect(response.status).toBe(201);
+  expect(payload.queued).toBe("followup");
+  expect(steerEffects).toBe(0);
+  expect(events).toContain("new_post");
+  expect(events).toContain("agent_followup_queued");
+  expect(events).not.toContain("agent_steer_queued");
+  expect(db.getChatOperationIntentSources(operation.operationId)).toEqual([]);
+  const deferred = db.getDb().prepare(`SELECT * FROM chat_accepted_sources
+    WHERE chat_jid = ? AND source_kind = 'message' AND source_seq > ?`).get(chatJid, operation.sourceSeq) as any;
+  expect(deferred).toMatchObject({ source_class: "prompt", selectable: 1, operation_id: null });
+  expect(db.getDb().prepare("SELECT is_steering_message FROM messages WHERE chat_jid = ? AND id = ?")
+    .get(chatJid, deferred.source_id)).toEqual({ is_steering_message: 0 });
+
+  releasePrompt();
+  await run;
+  expect(db.completeChatOperation(chatJid, {
+    owner: ownerOf(operation),
+    outcome: "succeeded",
+    cause: "normal",
+    provenance: "test_web_settlement_fence",
+    createdAt: "2026-08-09T10:20:02.000Z",
+    settlementFenceId: "web-compose-fence",
+    artifact: { message: {
+      id: "web-compose-fence-terminal",
+      chat_jid: chatJid,
+      sender: "bot",
+      sender_name: "Pi",
+      content: "done",
+      timestamp: "2026-08-09T10:20:02.000Z",
+      is_from_me: true,
+      is_bot_message: true,
+      is_terminal_agent_reply: true,
+    } },
+  }).status).toBe("completed");
   await pool.shutdown();
   ws.cleanup();
 });
@@ -581,6 +819,7 @@ test("compose steer queue failure is durably failed and never degrades into an o
 
   releasePrompt();
   await run;
+  completeSucceededForCleanup(db, chatJid, "test_web_failure_cleanup");
   await pool.shutdown();
   ws.cleanup();
 });
@@ -638,6 +877,15 @@ test("cancellation racing compose steer rejects before intent registration or SD
 
   releasePrompt();
   await run;
+  const cancelled = db.getChatOperation(chatJid);
+  if (!cancelled?.cancellation) throw new Error("expected cancelled operation");
+  expect(db.completeChatOperation(chatJid, {
+    owner: ownerOf(cancelled),
+    outcome: "cancelled",
+    cause: cancelled.cancellation.cause,
+    provenance: "test_web_cancel_cleanup",
+    createdAt: "2026-08-08T20:00:02.000Z",
+  }).status).toBe("completed");
   await pool.shutdown();
   ws.cleanup();
 });

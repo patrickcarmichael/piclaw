@@ -45,6 +45,7 @@ import {
   getChatCursor,
   getChatOperation,
   getChatOperationDisposition,
+  fenceChatOperationSettlement,
   getPendingChatOperationIntentSources,
   getContinuationCarriedIntentSources,
   getContinuationGoalLineage,
@@ -68,6 +69,7 @@ import {
   type AcceptedChatSource,
   type ChatOperationOutcome,
   type ChatOperationOwner,
+  type ChatOperationSettlementFence,
   type ChatOperationState,
 } from "../../../db.js";
 import { detectChannel, formatMessages, formatOutbound } from "../../../router.js";
@@ -1300,7 +1302,10 @@ export async function handleAgentMessage(
               payloadRef: `message:${persistedMessageId}`,
             });
             if (registered.status === "rejected") throw new Error(`Steer intent ownership rejected: ${registered.reason}`);
-            return { sourceSeq: registered.source.sourceSeq };
+            return {
+              sourceSeq: registered.source.sourceSeq,
+              queueEffect: registered.status === "deferred" ? "deferred" as const : "steer" as const,
+            };
           },
           onQueueFailure: (failure: { error?: string }, registration: { sourceSeq: number }) => {
             const observed = getChatOperation(chatJid);
@@ -1321,6 +1326,23 @@ export async function handleAgentMessage(
           },
         }
       : {});
+    if (steerResult.deferred && steerResult.deferredSourceSeq) {
+      broadcastNewPost();
+      channel.broadcastEvent("agent_followup_queued", {
+        chat_jid: chatJid,
+        thread_id: threadId ?? null,
+        row_id: interaction.id,
+        content,
+        timestamp: interaction.timestamp,
+        source: source ?? "compose_settlement_fence",
+      });
+      return channel.json({
+        user_message: interaction,
+        thread_id: threadId,
+        queued: "followup",
+      }, 201);
+    }
+
     if (!steerResult.queued) {
       if (!operationOwner) return null;
       if ((persistSteer || operationOwner) && interaction.id) {
@@ -2458,6 +2480,7 @@ export async function processChat(
   };
 
   let goalDeadlineLease: AddonGoalDeadlineCheckpointLease | null = null;
+  let goalDeadlineFence: ChatOperationSettlementFence | null = null;
   const goalDeadlineProvider = durableOperation ? getAddonGoalDeadlineCheckpointProvider() : null;
   const goalDeadlineReserveMs = goalDeadlineProvider ? getGoalDeadlineCheckpointReserveMs(timeoutMs) : 0;
   const output = await channel.agentPool.runAgent(prompt, chatJid, {
@@ -2511,7 +2534,7 @@ export async function processChat(
             tryLatch: (latch: import("../../../agent-pool/contracts.js").GoalDeadlineCheckpointLatch) => {
               const current = getChatOperation(chatJid);
               if (!current || current.operationId !== durableOperation?.operationId || current.cancellation) return false;
-              goalDeadlineLease = goalDeadlineProvider.tryLatch({
+              const lease = goalDeadlineProvider.tryLatch({
                 chatJid,
                 operationId: current.operationId,
                 sourceSeq: current.sourceSeq,
@@ -2520,16 +2543,33 @@ export async function processChat(
                 checkpointId: latch.checkpointId,
                 deadlineAt: latch.deadlineAt,
               });
-              return Boolean(goalDeadlineLease);
+              if (!lease) return false;
+              try {
+                const fenced = fenceChatOperationSettlement(chatJid, durableOperationOwner(current), {
+                  fenceId: latch.checkpointId,
+                  fencedAt: latch.triggeredAt,
+                });
+                if (fenced.status === "rejected") {
+                  goalDeadlineProvider.release(lease);
+                  return false;
+                }
+                goalDeadlineLease = lease;
+                goalDeadlineFence = fenced.fence;
+                return true;
+              } catch (error) {
+                goalDeadlineProvider.release(lease);
+                throw error;
+              }
             },
           },
           onGoalDeadlineCheckpoint: async (evidence: import("../../../agent-pool/contracts.js").GoalDeadlineCheckpointEvidence) => {
             terminalOutputHandledInPromptLane = true;
             clearCommittedDraft();
             const lease = goalDeadlineLease;
-            if (!lease) return false;
+            const settlementFence = goalDeadlineFence;
+            if (!lease || !settlementFence) return false;
             try {
-            if (lease.checkpointId !== evidence.checkpointId) return false;
+            if (lease.checkpointId !== evidence.checkpointId || settlementFence.fenceId !== evidence.checkpointId) return false;
             const operation = getChatOperation(chatJid);
             if (!operation || operation.operationId !== lease.operationId || operation.sourceSeq !== lease.sourceSeq) return false;
             const source = getAcceptedChatSource(operation.sourceSeq);
@@ -2621,6 +2661,7 @@ export async function processChat(
                       : "goal_deadline_checkpoint_not_continued",
                 provenance,
                 createdAt,
+                settlementFenceId: settlementFence.fenceId,
                 ...(initialResolution.action === "suppress" || cancellation ? {} : { artifact: { message: {
                   id: artifactId,
                   chat_jid: chatJid,

@@ -4,10 +4,12 @@ import {
   cancelChatOperation,
   claimNextChatOperation,
   completeChatOperation,
+  fenceChatOperationSettlement,
   getAcceptedChatSource,
   getChatCursor,
   getChatOperation,
   getChatOperationDisposition,
+  getChatOperationSettlementFence,
   getDb,
   initDatabase,
   promoteChatOperation,
@@ -388,6 +390,57 @@ describe("atomic durable restart recovery", () => {
         .toEqual({ count: 0 });
     });
   }
+
+  test("restart recovery preserves a settlement fence and carries only its pre-fence steers", () => {
+    const chatJid = `web:recover-settlement-fence-${crypto.randomUUID()}`;
+    const run = createRunningPrompt(chatJid);
+    const preFenceIntentSeq = registerPendingSteer(run, "Carry this pre-fence steer");
+    const fence = fenceChatOperationSettlement(chatJid, owner(run.operation), {
+      fenceId: `checkpoint-${crypto.randomUUID()}`,
+      fencedAt: new Date().toISOString(),
+    });
+    if (fence.status === "rejected") throw new Error("Expected settlement fence");
+    const lateId = `late-${crypto.randomUUID()}`;
+    const lateTimestamp = new Date(Date.now() + 2).toISOString();
+    storeMessage({
+      id: lateId,
+      chat_jid: chatJid,
+      sender: "user",
+      sender_name: "User",
+      content: "Run this after restart settlement",
+      timestamp: lateTimestamp,
+      is_from_me: false,
+      is_bot_message: false,
+    });
+    const late = registerChatOperationIntent(chatJid, owner(run.operation), {
+      sourceKind: "steer",
+      sourceId: lateId,
+      acceptedAt: lateTimestamp,
+      payloadRef: `message:${lateId}`,
+    });
+    if (late.status !== "deferred") throw new Error("Expected post-fence durable prompt");
+
+    recoverInflightRuns(recoveryContext());
+    recoverInflightRuns(recoveryContext());
+
+    expect(getChatOperation(chatJid)).toBeNull();
+    expect(getChatOperationSettlementFence(chatJid)).toBeNull();
+    expect(getChatOperationDisposition(preFenceIntentSeq)).toMatchObject({
+      outcome: "interrupted",
+      cause: "restart_steer_carried",
+    });
+    expect(getChatOperationDisposition(late.source.sourceSeq)).toBeNull();
+    expect(getAcceptedChatSource(late.source.sourceSeq)).toMatchObject({
+      sourceClass: "prompt",
+      sourceKind: "message",
+      selectable: true,
+      operationId: null,
+    });
+    const successors = restartSuccessors(chatJid);
+    expect(successors).toHaveLength(1);
+    expect(carriedSteerText(successors[0].source_seq)).toEqual(["Carry this pre-fence steer"]);
+    expect(late.source.sourceSeq).toBeLessThan(successors[0].source_seq);
+  });
 
   test("cancellation observed before restart completion wins without recovery writes", () => {
     const chatJid = `web:recover-steers-cancel-${crypto.randomUUID()}`;

@@ -78,6 +78,7 @@ describe("durable accepted-input operations", () => {
     expect([...columns("chat_cursors")]).toEqual(expect.arrayContaining([
       "operation_id", "operation_source_seq", "operation_phase", "operation_generation",
       "operation_cancel_cause", "operation_cancel_requested_at",
+      "operation_settling_fence_id", "operation_settling_fenced_at",
     ]));
     expect(columns("chat_cursors").has("operation_terminal_disposition")).toBe(false);
     expect([...columns("chat_accepted_sources")]).toEqual(expect.arrayContaining([
@@ -660,6 +661,228 @@ describe("durable accepted-input operations", () => {
     expect(op.registerChatOperationIntent(chatJid, owner(claimed), {
       sourceKind: "steer", sourceId: "late", acceptedAt: "now", payloadRef: "steer:late",
     })).toEqual({ status: "rejected", reason: "no_operation" });
+  });
+
+  test("settlement fence atomically snapshots pre-fence intents and classifies post-fence steers as prompts", () => {
+    const chatJid = jid("settlement-classification");
+    const root = register(chatJid, "settlement-root");
+    const claimed = op.claimNextChatOperation(chatJid).operation!;
+    const first = registerSteer(chatJid, claimed, `settlement-first-${serial}`, "2026-08-09T10:00:01.000Z");
+    if (first.status === "rejected" || first.status === "deferred") throw new Error("expected pre-fence intent");
+
+    const stale = op.fenceChatOperationSettlement(chatJid, { ...owner(claimed), generation: claimed.generation + 1 }, {
+      fenceId: `stale-fence-${serial}`,
+      fencedAt: "2026-08-09T10:00:02.000Z",
+    });
+    expect(stale).toEqual({ status: "rejected", reason: "generation_mismatch" });
+    expect(op.getChatOperationSettlementFence(chatJid)).toBeNull();
+
+    const secondId = `settlement-second-${serial}`;
+    db.storeMessage({ id: secondId, chat_jid: chatJid, sender: "user", sender_name: "User", content: secondId,
+      timestamp: "2026-08-09T10:00:02.000Z", is_from_me: false, is_bot_message: false });
+    const fenced = op.fenceChatOperationSettlement(chatJid, owner(claimed), {
+      fenceId: `fence-${serial}`,
+      fencedAt: "2026-08-09T10:00:03.000Z",
+    }, {
+      beforeSnapshot() {
+        expect(op.registerChatOperationIntent(chatJid, owner(claimed), {
+          sourceKind: "steer", sourceId: secondId, acceptedAt: "2026-08-09T10:00:02.000Z",
+          payloadRef: `message:${secondId}`,
+        }).status).toBe("registered");
+      },
+    });
+    if (fenced.status === "rejected") throw new Error(`fence rejected: ${fenced.reason}`);
+    expect(fenced.status).toBe("fenced");
+    expect(fenced.fence.intents.map((source) => source.sourceId)).toEqual([first.source.sourceId, secondId]);
+    expect(op.fenceChatOperationSettlement(chatJid, owner(claimed), {
+      fenceId: fenced.fence.fenceId,
+      fencedAt: fenced.fence.fencedAt,
+    }).status).toBe("existing");
+    expect(op.fenceChatOperationSettlement(chatJid, owner(claimed), {
+      fenceId: `other-fence-${serial}`,
+      fencedAt: fenced.fence.fencedAt,
+    })).toEqual({ status: "rejected", reason: "operation_already_settling" });
+
+    const lateId = `settlement-late-${serial}`;
+    const lateAt = "2026-08-09T10:00:04.000Z";
+    db.storeMessage({ id: lateId, chat_jid: chatJid, sender: "user", sender_name: "User", content: lateId,
+      timestamp: lateAt, is_from_me: false, is_bot_message: false });
+    const late = op.registerChatOperationIntent(chatJid, owner(claimed), {
+      sourceKind: "steer", sourceId: lateId, acceptedAt: lateAt, payloadRef: `message:${lateId}`,
+    });
+    if (late.status !== "deferred") throw new Error(`expected deferred classification, got ${late.status}`);
+    expect(late).toMatchObject({
+      fenceId: fenced.fence.fenceId,
+      source: { sourceClass: "prompt", sourceKind: "message", selectable: true, operationId: null },
+    });
+    expect(op.getPendingChatOperationIntentSources(claimed.operationId).map((source) => source.sourceId))
+      .toEqual([first.source.sourceId, secondId]);
+    expect(op.completeChatOperation(chatJid, {
+      owner: owner(claimed), outcome: "succeeded", cause: "normal", provenance: "provider", createdAt: "now",
+      artifact: { message: terminal(chatJid, `unfenced-terminal-${serial}`) },
+      intentDispositions: fenced.fence.intents.map((intent) => ({
+        sourceSeq: intent.sourceSeq, outcome: "succeeded" as const, cause: "steer_applied", provenance: "provider",
+      })),
+    })).toMatchObject({ status: "rejected", reason: "operation_settling" });
+    expect(op.getChatOperationDisposition(root.sourceSeq)).toBeNull();
+    expect(op.completeChatOperation(chatJid, {
+      owner: owner(claimed),
+      outcome: "interrupted",
+      cause: "goal_deadline_checkpoint",
+      provenance: "goal:test",
+      createdAt: "2026-08-09T10:00:05.000Z",
+      settlementFenceId: fenced.fence.fenceId,
+      artifact: { message: terminal(chatJid, `fenced-terminal-${serial}`) },
+      successor: {
+        sourceKind: "goal_continuation",
+        rootSourceSeq: root.sourceSeq,
+        parentSourceSeq: root.sourceSeq,
+        parentGeneration: 0,
+        generation: 1,
+        goalId: `goal-fifo-${serial}`,
+        checkpointId: fenced.fence.fenceId,
+        oldTurnId: `turn-fifo-${serial}`,
+        carriedIntentSourceSeqs: fenced.fence.intents.map((intent) => intent.sourceSeq),
+      },
+      intentDispositions: fenced.fence.intents.map((intent) => ({
+        sourceSeq: intent.sourceSeq,
+        outcome: "interrupted" as const,
+        cause: "goal_deadline_steer_carried",
+        provenance: "goal:test",
+      })),
+    }).status).toBe("completed");
+    const successor = db.getDb().prepare(`SELECT source_seq FROM chat_accepted_sources
+      WHERE chat_jid = ? AND source_kind = 'goal_continuation'`).get(chatJid) as { source_seq: number };
+    expect(op.getGoalContinuationCarriedIntentSources(successor.source_seq).map((source) => source.sourceId))
+      .toEqual([first.source.sourceId, secondId]);
+    expect(late.source.sourceSeq).toBeLessThan(successor.source_seq);
+    expect(op.getChatOperationSettlementFence(chatJid)).toBeNull();
+  });
+
+  test("settlement and late-steer faults are rollback-safe at every deterministic boundary", () => {
+    const preSnapshotChat = jid("fence-pre-snapshot-fault");
+    register(preSnapshotChat, "root");
+    const preSnapshotOwner = op.claimNextChatOperation(preSnapshotChat).operation!;
+    expect(() => op.fenceChatOperationSettlement(preSnapshotChat, owner(preSnapshotOwner), {
+      fenceId: `fence-pre-snapshot-${serial}`, fencedAt: "2026-08-09T10:01:00.000Z",
+    }, { beforeSnapshot() { throw new Error("fault:pre-snapshot"); } })).toThrow("fault:pre-snapshot");
+    expect(op.getChatOperationSettlementFence(preSnapshotChat)).toBeNull();
+    expect(op.getChatOperation(preSnapshotChat)).toEqual(preSnapshotOwner);
+
+    for (const boundary of ["pre-transaction", "artifact", "successor", "intents", "disposition", "frontier", "release"] as const) {
+      const chatJid = jid(`settlement-fault-${boundary}`);
+      const root = register(chatJid, `root-${boundary}`);
+      const claimed = op.claimNextChatOperation(chatJid).operation!;
+      const pre = registerSteer(chatJid, claimed, `pre-${boundary}-${serial}`, `2026-08-09T10:02:${String(serial % 60).padStart(2, "0")}.000Z`);
+      if (pre.status === "rejected" || pre.status === "deferred") throw new Error("expected pre-fence intent");
+      const fenceId = `fence-${boundary}-${serial}`;
+      const fenced = op.fenceChatOperationSettlement(chatJid, owner(claimed), {
+        fenceId, fencedAt: "2026-08-09T10:03:00.000Z",
+      });
+      if (fenced.status === "rejected") throw new Error("expected settlement fence");
+      const lateId = `late-${boundary}-${serial}`;
+      const lateAt = `2026-08-09T10:04:${String(serial % 60).padStart(2, "0")}.000Z`;
+      db.storeMessage({ id: lateId, chat_jid: chatJid, sender: "user", sender_name: "User", content: lateId,
+        timestamp: lateAt, is_from_me: false, is_bot_message: false });
+      let lateSourceSeq = 0;
+      let injected = false;
+      const request = {
+        owner: owner(claimed), outcome: "interrupted" as const, cause: "goal_deadline_checkpoint",
+        provenance: "goal:test", createdAt: "2026-08-09T10:05:00.000Z", settlementFenceId: fenceId,
+        artifact: { message: terminal(chatJid, `terminal-${boundary}-${serial}`) },
+        successor: {
+          sourceKind: "goal_continuation" as const,
+          rootSourceSeq: root.sourceSeq,
+          parentSourceSeq: root.sourceSeq,
+          parentGeneration: 0,
+          generation: 1,
+          goalId: `goal-${serial}`,
+          checkpointId: fenceId,
+          oldTurnId: `turn-${serial}`,
+          carriedIntentSourceSeqs: [pre.source.sourceSeq],
+        },
+        intentDispositions: [{
+          sourceSeq: pre.source.sourceSeq,
+          outcome: "interrupted" as const,
+          cause: "goal_deadline_steer_carried",
+          provenance: "goal:test",
+        }],
+      };
+      expect(() => op.completeChatOperation(chatJid, request, {
+        beforeTransaction() {
+          if (injected) return;
+          injected = true;
+          const late = op.registerChatOperationIntent(chatJid, owner(claimed), {
+            sourceKind: "steer", sourceId: lateId, acceptedAt: lateAt, payloadRef: `message:${lateId}`,
+          });
+          if (late.status !== "deferred") throw new Error("late steer was not deferred");
+          lateSourceSeq = late.source.sourceSeq;
+          if (boundary === "pre-transaction") throw new Error("fault:pre-transaction");
+        },
+        afterWrite(point) { if (point === boundary) throw new Error(`fault:${point}`); },
+      })).toThrow(`fault:${boundary}`);
+      expect(op.getChatOperation(chatJid)).toEqual(claimed);
+      expect(op.getChatOperationSettlementFence(chatJid)).toMatchObject({ fenceId });
+      expect(op.getAcceptedChatSource(lateSourceSeq)).toMatchObject({
+        sourceClass: "prompt", sourceKind: "message", selectable: true, operationId: null,
+      });
+      expect(op.getChatOperationDisposition(root.sourceSeq)).toBeNull();
+      expect(op.getChatOperationDisposition(pre.source.sourceSeq)).toBeNull();
+      expect(op.completeChatOperation(chatJid, request).status).toBe("completed");
+      expect(op.getChatOperation(chatJid)).toBeNull();
+      expect(op.getChatOperationSettlementFence(chatJid)).toBeNull();
+      expect(op.getChatOperationDisposition(pre.source.sourceSeq)).toMatchObject({
+        outcome: "interrupted", cause: "goal_deadline_steer_carried",
+      });
+      expect(op.getAcceptedChatSource(lateSourceSeq)).toMatchObject({ sourceClass: "prompt", selectable: true });
+      expect(op.completeChatOperation(chatJid, request).status).toBe("repeated");
+    }
+
+    const lateFaultChat = jid("late-classification-fault");
+    register(lateFaultChat, "root");
+    const lateFaultOwner = op.claimNextChatOperation(lateFaultChat).operation!;
+    const lateFaultFence = op.fenceChatOperationSettlement(lateFaultChat, owner(lateFaultOwner), {
+      fenceId: `late-fault-fence-${serial}`, fencedAt: "2026-08-09T10:06:00.000Z",
+    });
+    if (lateFaultFence.status === "rejected") throw new Error("expected late-fault fence");
+    const lateFaultId = `late-fault-${serial}`;
+    const lateFaultAt = "2026-08-09T10:06:01.000Z";
+    db.storeMessage({ id: lateFaultId, chat_jid: lateFaultChat, sender: "user", sender_name: "User", content: lateFaultId,
+      timestamp: lateFaultAt, is_from_me: false, is_bot_message: false });
+    expect(() => op.registerChatOperationIntent(lateFaultChat, owner(lateFaultOwner), {
+      sourceKind: "steer", sourceId: lateFaultId, acceptedAt: lateFaultAt, payloadRef: `message:${lateFaultId}`,
+    }, { afterWrite(classification) { throw new Error(`fault:late-steer-${classification}`); } }))
+      .toThrow("fault:late-steer-deferred");
+    expect(db.getDb().prepare("SELECT 1 FROM chat_accepted_sources WHERE chat_jid = ? AND source_id = ?")
+      .get(lateFaultChat, lateFaultId)).toBeNull();
+    expect(op.registerChatOperationIntent(lateFaultChat, owner(lateFaultOwner), {
+      sourceKind: "steer", sourceId: lateFaultId, acceptedAt: lateFaultAt, payloadRef: `message:${lateFaultId}`,
+    }).status).toBe("deferred");
+  });
+
+  test("cancellation after a settlement fence rejects late classification before writes", () => {
+    const chatJid = jid("settlement-cancel"); register(chatJid, "root");
+    const claimed = op.claimNextChatOperation(chatJid).operation!;
+    expect(op.fenceChatOperationSettlement(chatJid, owner(claimed), {
+      fenceId: `cancel-fence-${serial}`, fencedAt: "2026-08-09T10:07:00.000Z",
+    }).status).toBe("fenced");
+    const cancelled = op.cancelChatOperation(chatJid, owner(claimed), {
+      cause: "user_abort", requestedAt: "2026-08-09T10:07:01.000Z",
+    });
+    if (cancelled.status !== "applied") throw new Error("expected cancellation");
+    const lateId = `cancel-late-${serial}`;
+    db.storeMessage({ id: lateId, chat_jid: chatJid, sender: "user", sender_name: "User", content: lateId,
+      timestamp: "2026-08-09T10:07:02.000Z", is_from_me: false, is_bot_message: false });
+    expect(op.registerChatOperationIntent(chatJid, owner(cancelled.operation), {
+      sourceKind: "steer", sourceId: lateId, acceptedAt: "2026-08-09T10:07:02.000Z", payloadRef: `message:${lateId}`,
+    })).toEqual({ status: "rejected", reason: "operation_cancelled" });
+    expect(db.getDb().prepare("SELECT 1 FROM chat_accepted_sources WHERE chat_jid = ? AND source_id = ?")
+      .get(chatJid, lateId)).toBeNull();
+    expect(op.completeChatOperation(chatJid, {
+      owner: owner(cancelled.operation), outcome: "cancelled", cause: "user_abort", provenance: "test",
+      createdAt: "2026-08-09T10:07:03.000Z", intentDispositions: [],
+    }).status).toBe("completed");
+    expect(op.getChatOperationSettlementFence(chatJid)).toBeNull();
   });
 
   test("queue failure disposition is exact-owner, idempotent, completion-compatible, and cancellation-safe", () => {

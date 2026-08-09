@@ -3044,23 +3044,16 @@ test("durable Goal deadline checkpoint commits one visible successor and replays
           prompts.push(prompt);
           if (prompts.length === 1) {
             const deadlineAt = new Date(Date.now() + 60_000).toISOString();
-            expect(options.goalDeadlineCheckpoint.tryLatch({
-              checkpointId,
-              oldTurnId: options.turnId,
-              timeoutMs: 3_600_000,
-              reserveMs: options.goalDeadlineCheckpoint.reserveMs,
-              deadlineAt,
-              triggeredAt: new Date().toISOString(),
-            })).toBe(true);
             const operation = db.getChatOperation("web:default")!;
             const steerId = `steer-${crypto.randomUUID()}`;
+            const steerTimestamp = new Date().toISOString();
             db.storeMessage({
               id: steerId,
               chat_jid: "web:default",
               sender: "user",
               sender_name: "User",
               content: "also verify restart safety",
-              timestamp: new Date().toISOString(),
+              timestamp: steerTimestamp,
               is_from_me: false,
               is_bot_message: false,
               is_steering_message: true,
@@ -3073,9 +3066,17 @@ test("durable Goal deadline checkpoint commits one visible successor and replays
             }, {
               sourceKind: "steer",
               sourceId: steerId,
-              acceptedAt: new Date().toISOString(),
+              acceptedAt: steerTimestamp,
               payloadRef: `message:${steerId}`,
             }).status).toBe("registered");
+            expect(options.goalDeadlineCheckpoint.tryLatch({
+              checkpointId,
+              oldTurnId: options.turnId,
+              timeoutMs: 3_600_000,
+              reserveMs: options.goalDeadlineCheckpoint.reserveMs,
+              deadlineAt,
+              triggeredAt: new Date().toISOString(),
+            })).toBe(true);
             expect(await options.onGoalDeadlineCheckpoint({
               checkpointId,
               oldTurnId: options.turnId,
