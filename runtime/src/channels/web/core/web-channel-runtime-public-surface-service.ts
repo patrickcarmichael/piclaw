@@ -400,6 +400,7 @@ export class WebChannelRuntimePublicSurfaceService {
         ...(screenHint ? { screenHint } : {}),
         source,
         ...(queuedBy ? { queuedBy } : {}),
+        durable: true,
       });
       this.channel.sessionBroadcast.broadcastEvent("agent_followup_queued", {
         chat_jid: chatJid,
@@ -420,6 +421,7 @@ export class WebChannelRuntimePublicSurfaceService {
       linkPreviews,
       threadId: explicitThreadId,
       screenHint,
+      acceptDurableSource: true,
     });
     if (!interaction) throw new Error("Failed to store runtime agent message.");
 
