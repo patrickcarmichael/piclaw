@@ -212,6 +212,83 @@ test("real AgentPool awaits terminal output inside the prompt lane before ownerl
   cleanupOperationTestChat(db, "web:terminal-order");
 });
 
+test("real AgentPool treats a committed Goal checkpoint as terminally finalized", async () => {
+  const ws = getTestWorkspace();
+  restoreEnv = setEnv({
+    PICLAW_WORKSPACE: ws.workspace,
+    PICLAW_STORE: ws.store,
+    PICLAW_DATA: ws.data,
+    PICLAW_TURN_AUTO_RECOVERY_ENABLED: "0",
+  });
+  const db = await importFresh<typeof import("../src/db.js")>("../src/db.js");
+  db.initDatabase();
+  const { AgentPool } = await importFresh<typeof import("../src/agent-pool.js")>("../src/agent-pool.js");
+  const chatJid = "web:goal-checkpoint-terminal";
+  let rejectPrompt!: (error: Error) => void;
+  let checkpointCommitCalls = 0;
+  let ordinaryTerminalCalls = 0;
+  let clearQueueCalls = 0;
+
+  class CheckpointSession {
+    sessionManager = {
+      getLeafId: () => "goal-checkpoint-leaf",
+      getEntries: () => [{ type: "message", message: { role: "user" } }],
+    };
+    isStreaming = false;
+    isCompacting = false;
+    isRetrying = false;
+    subscribe() { return () => {}; }
+    getSteeringMessages() { return []; }
+    getFollowUpMessages() { return []; }
+    clearQueue() { clearQueueCalls += 1; }
+    async prompt() {
+      this.isStreaming = true;
+      await new Promise<void>((_resolve, reject) => { rejectPrompt = reject; });
+    }
+    async abort() {
+      this.isStreaming = false;
+      rejectPrompt(new Error("checkpoint abort"));
+    }
+    dispose() {}
+  }
+
+  const pool = new AgentPool({
+    ...createAgentPoolModelOptions(),
+    createSession: async () => createRuntime(new CheckpointSession()) as any,
+  });
+
+  try {
+    const result = await pool.runAgent("checkpoint", chatJid, {
+      timeoutMs: 80,
+      skipPrePromptCompaction: true,
+      turnId: "turn-goal-checkpoint-terminal",
+      goalDeadlineCheckpoint: { reserveMs: 50, tryLatch: () => true },
+      onGoalDeadlineCheckpoint: () => {
+        checkpointCommitCalls += 1;
+        return true;
+      },
+      onTerminalOutput: () => {
+        ordinaryTerminalCalls += 1;
+        return true;
+      },
+    });
+
+    expect(checkpointCommitCalls).toBe(1);
+    expect(ordinaryTerminalCalls).toBe(0);
+    expect(clearQueueCalls).toBe(1);
+    expect(result).toMatchObject({
+      status: "tool_complete",
+      terminalCommit: {
+        kind: "already_committed",
+        source: "goal_deadline_checkpoint",
+      },
+    });
+  } finally {
+    await pool.shutdown();
+    cleanupOperationTestChat(db, chatJid);
+  }
+});
+
 test("real AgentPool preserves callback-free fallback without accidental maintenance", async () => {
   const ws = getTestWorkspace();
   restoreEnv = setEnv({
