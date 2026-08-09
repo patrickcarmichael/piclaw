@@ -74,6 +74,7 @@ export interface ChatOperationDisposition {
   provenance: string;
   terminalMessageChatJid: string | null;
   terminalMessageId: string | null;
+  internalArtifactKind: "protected_recovery_scheduled" | null;
   createdAt: string;
 }
 
@@ -208,7 +209,8 @@ interface OperationRow {
 interface DispositionRow {
   source_seq: number; operation_id: string; chat_jid: string; source_class: string; source_kind: string;
   source_id: string; outcome: string; cause: string; provenance: string;
-  terminal_message_chat_jid: string | null; terminal_message_id: string | null; created_at: string;
+  terminal_message_chat_jid: string | null; terminal_message_id: string | null;
+  internal_artifact_kind: string | null; created_at: string;
 }
 
 function sourceFromRow(row: SourceRow): AcceptedChatSource {
@@ -226,7 +228,8 @@ function sourceFromRow(row: SourceRow): AcceptedChatSource {
 function dispositionFromRow(row: DispositionRow | null | undefined): ChatOperationDisposition | null {
   if (!row) return null;
   if (!isValue(CHAT_SOURCE_CLASSES, row.source_class) || !isValue(CHAT_SOURCE_KINDS, row.source_kind)
-    || !isValue(CHAT_OPERATION_OUTCOMES, row.outcome)) {
+    || !isValue(CHAT_OPERATION_OUTCOMES, row.outcome)
+    || (row.internal_artifact_kind !== null && row.internal_artifact_kind !== "protected_recovery_scheduled")) {
     throw new ChatOperationInvariantError(`Invalid disposition for source ${row.source_seq}`);
   }
   return {
@@ -234,6 +237,7 @@ function dispositionFromRow(row: DispositionRow | null | undefined): ChatOperati
     sourceClass: row.source_class, sourceKind: row.source_kind, sourceId: row.source_id,
     outcome: row.outcome, cause: row.cause, provenance: row.provenance,
     terminalMessageChatJid: row.terminal_message_chat_jid, terminalMessageId: row.terminal_message_id,
+    internalArtifactKind: row.internal_artifact_kind,
     createdAt: row.created_at,
   };
 }
@@ -907,8 +911,15 @@ function sameDisposition(
   chatJid: string,
   request: ChatOperationCompletion,
 ): boolean {
-  const terminalMessageId = request.artifact?.messageId ?? request.artifact?.message?.id ?? null;
-  const terminalChatJid = terminalMessageId ? (request.artifact?.message?.chat_jid ?? chatJid) : null;
+  const internalArtifactKind = request.artifact && "internal" in request.artifact
+    ? request.artifact.internal.kind
+    : null;
+  const terminalMessageId = !request.artifact || "internal" in request.artifact
+    ? null
+    : "messageId" in request.artifact ? request.artifact.messageId : request.artifact.message.id;
+  const terminalChatJid = terminalMessageId
+    ? (request.artifact && "message" in request.artifact ? request.artifact.message.chat_jid : chatJid)
+    : null;
   return source !== null
     && existing.operationId === request.owner.operationId
     && existing.sourceSeq === request.owner.sourceSeq
@@ -921,7 +932,8 @@ function sameDisposition(
     && existing.cause === request.cause
     && existing.provenance === request.provenance
     && existing.terminalMessageChatJid === terminalChatJid
-    && existing.terminalMessageId === terminalMessageId;
+    && existing.terminalMessageId === terminalMessageId
+    && existing.internalArtifactKind === internalArtifactKind;
 }
 
 export interface BlockedChatOperationSkip {
@@ -972,18 +984,22 @@ export interface ChatOperationCompletion {
   provenance: string;
   createdAt: string;
   settlementFenceId?: string;
-  artifact?: { messageId: string; message?: never } | { message: NewMessage; messageId?: never };
+  artifact?: { messageId: string }
+    | { message: NewMessage }
+    | { internal: { kind: "protected_recovery_scheduled" } };
   successor?: ChatOperationSuccessor;
   intentDispositions?: Array<{ sourceSeq: number; outcome: ChatOperationOutcome; cause: string; provenance: string }>;
 }
 
 function insertDisposition(source: AcceptedChatSource, operationId: string, outcome: ChatOperationOutcome,
-  cause: string, provenance: string, createdAt: string, artifact: { chatJid: string; messageId: string } | null): ChatOperationDisposition {
+  cause: string, provenance: string, createdAt: string, artifact: { chatJid: string; messageId: string } | null,
+  internalArtifactKind: "protected_recovery_scheduled" | null = null): ChatOperationDisposition {
   getDb().prepare(`INSERT INTO chat_operation_dispositions (source_seq, operation_id, chat_jid, source_class,
-    source_kind, source_id, outcome, cause, provenance, terminal_message_chat_jid, terminal_message_id, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    source_kind, source_id, outcome, cause, provenance, terminal_message_chat_jid, terminal_message_id,
+    internal_artifact_kind, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(source.sourceSeq, operationId, source.chatJid, source.sourceClass, source.sourceKind, source.sourceId,
-      outcome, cause, provenance, artifact?.chatJid ?? null, artifact?.messageId ?? null, createdAt);
+      outcome, cause, provenance, artifact?.chatJid ?? null, artifact?.messageId ?? null, internalArtifactKind, createdAt);
   return getChatOperationDisposition(source.sourceSeq)!;
 }
 
@@ -1162,12 +1178,22 @@ export function completeChatOperation(
     hooks.beforeWrite?.();
 
     const artifactPolicy = chatOperationTerminalArtifactPolicy(source, request.outcome);
-    if (artifactPolicy === "required" && !request.artifact) throw new ChatOperationInvariantError("Terminal message is required");
-    if (artifactPolicy === "none" && request.artifact) throw new ChatOperationInvariantError("Terminal message is prohibited for this outcome");
+    if (artifactPolicy === "required" && !request.artifact) throw new ChatOperationInvariantError("Terminal artifact is required");
+    if (artifactPolicy === "none" && request.artifact) throw new ChatOperationInvariantError("Terminal artifact is prohibited for this outcome");
+    const internalArtifact = request.artifact && "internal" in request.artifact
+      ? request.artifact.internal
+      : null;
+    const protectedSuccessor = request.successor?.sourceKind === "protected_continuation";
+    if (internalArtifact && !protectedSuccessor) {
+      throw new ChatOperationInvariantError("Internal scheduling artifact is only valid for protected recovery handoff");
+    }
+    if (protectedSuccessor && !internalArtifact) {
+      throw new ChatOperationInvariantError("Protected continuation requires internal scheduling evidence");
+    }
     let artifact: { chatJid: string; messageId: string } | null = null;
-    if (request.artifact) {
-      const messageId = request.artifact.messageId ?? request.artifact.message.id;
-      if (request.artifact.message) {
+    if (request.artifact && !("internal" in request.artifact)) {
+      const messageId = "messageId" in request.artifact ? request.artifact.messageId : request.artifact.message.id;
+      if ("message" in request.artifact) {
         const message = request.artifact.message;
         if (message.chat_jid !== chatJid || !message.is_bot_message || !message.is_terminal_agent_reply) {
           throw new ChatOperationInvariantError("Terminal message is not eligible");
@@ -1191,11 +1217,11 @@ export function completeChatOperation(
         if (request.outcome !== "interrupted") {
           throw new ChatOperationInvariantError("Continuation successor requires an interrupted outcome");
         }
-        const schedulingArtifact = artifact
-          ? db.prepare("SELECT content FROM messages WHERE chat_jid = ? AND id = ?")
-            .get(artifact.chatJid, artifact.messageId) as { content: string | null } | undefined
-          : undefined;
-        if (!schedulingArtifact || !String(schedulingArtifact.content ?? "").trim()) {
+        const schedulingArtifact = internalArtifact?.kind ?? (artifact
+          ? (db.prepare("SELECT content FROM messages WHERE chat_jid = ? AND id = ?")
+              .get(artifact.chatJid, artifact.messageId) as { content: string | null } | undefined)?.content
+          : null);
+        if (!String(schedulingArtifact ?? "").trim()) {
           throw new ChatOperationInvariantError("Continuation successor requires one non-blank scheduling artifact");
         }
       }
@@ -1351,7 +1377,7 @@ export function completeChatOperation(
     hooks.afterWrite?.("intents");
 
     const disposition = insertDisposition(source, active.operationId, request.outcome, request.cause,
-      request.provenance, request.createdAt, artifact);
+      request.provenance, request.createdAt, artifact, internalArtifact?.kind ?? null);
     hooks.afterWrite?.("disposition");
 
     db.prepare(`UPDATE chat_cursors SET cursor_ts = CASE

@@ -205,7 +205,7 @@ describe("durable accepted-input operations", () => {
       owner: owner(claimed), outcome: "interrupted" as const,
       cause: "protected_recovery_continuation_registered", provenance: "web_process_chat",
       createdAt: "2026-08-08T13:10:00.000Z",
-      artifact: { message: terminal(chatJid, `bot-handoff-${serial}`) },
+      artifact: { internal: { kind: "protected_recovery_scheduled" as const } },
       successor: { sourceKind: "protected_continuation" as const, rootSourceSeq: root.sourceSeq },
     };
     const completed = op.completeChatOperation(chatJid, request);
@@ -470,6 +470,86 @@ describe("durable accepted-input operations", () => {
     })).toThrow("exact next generation");
   });
 
+  test("protected handoff records immutable internal scheduling evidence without a timeline message", () => {
+    const chatJid = jid("protected-internal-artifact");
+    const root = register(chatJid, "root");
+    const claimed = op.claimNextChatOperation(chatJid).operation!;
+    const request = {
+      owner: owner(claimed), outcome: "interrupted" as const,
+      cause: "protected_recovery_continuation_registered", provenance: "test", createdAt: "now",
+      artifact: { internal: { kind: "protected_recovery_scheduled" as const } },
+      successor: { sourceKind: "protected_continuation" as const, rootSourceSeq: root.sourceSeq },
+    };
+
+    expect(op.completeChatOperation(chatJid, request).status).toBe("completed");
+    expect(op.getChatOperationDisposition(root.sourceSeq)).toMatchObject({
+      outcome: "interrupted",
+      terminalMessageChatJid: null,
+      terminalMessageId: null,
+      internalArtifactKind: "protected_recovery_scheduled",
+    });
+    expect(db.getDb().prepare("SELECT COUNT(*) AS count FROM messages WHERE chat_jid = ? AND is_bot_message = 1")
+      .get(chatJid)).toEqual({ count: 0 });
+    expect(op.peekNextAcceptedChatSource(chatJid)).toMatchObject({
+      sourceKind: "protected_continuation",
+      payloadRef: `accepted-source:${root.sourceSeq}`,
+    });
+    expect(op.completeChatOperation(chatJid, request).status).toBe("repeated");
+    expect(() => db.getDb().prepare(`UPDATE chat_operation_dispositions
+      SET internal_artifact_kind = NULL WHERE source_seq = ?`).run(root.sourceSeq))
+      .toThrow("operation disposition internal artifact is immutable");
+
+    const child = op.claimNextChatOperation(chatJid).operation!;
+    expect(complete(chatJid, child, `protected-eventual-${serial}`).status).toBe("completed");
+    db.storeChatMetadata(chatJid, "2026-08-07T22:02:00.000Z", "Protected export");
+    db.ensureChatBranch({ chat_jid: chatJid });
+    db.archiveChatBranch(chatJid);
+    const exported = db.exportArchivedBranchDownloadData(chatJid);
+    expect(exported.messages.filter((message) => message.is_bot_message === 1)
+      .map((message) => message.content)).toEqual(["done"]);
+    expect(JSON.stringify(exported.messages)).not.toContain("Recovery continuation scheduled.");
+    expect(exported.operation_dispositions).toContainEqual(expect.objectContaining({
+      source_seq: root.sourceSeq,
+      internal_artifact_kind: "protected_recovery_scheduled",
+      terminal_message_id: null,
+    }));
+  });
+
+  test("internal scheduling evidence cannot replace ordinary or Goal terminal output", () => {
+    for (const variant of ["ordinary", "goal"] as const) {
+      const chatJid = jid(`internal-artifact-${variant}`);
+      const root = register(chatJid, "root");
+      const claimed = op.claimNextChatOperation(chatJid).operation!;
+      const internalArtifact = {
+        internal: { kind: "protected_recovery_scheduled" as const },
+      };
+      const request = variant === "ordinary"
+        ? {
+            owner: owner(claimed), outcome: "succeeded" as const, cause: "agent_completed",
+            provenance: "test", createdAt: "now", artifact: internalArtifact,
+          }
+        : {
+            owner: owner(claimed), outcome: "interrupted" as const, cause: "goal_deadline_checkpoint",
+            provenance: "test", createdAt: "now", artifact: internalArtifact,
+            successor: {
+              sourceKind: "goal_continuation" as const,
+              rootSourceSeq: root.sourceSeq,
+              parentSourceSeq: root.sourceSeq,
+              parentGeneration: 0,
+              generation: 1,
+              goalId: "goal",
+              checkpointId: "checkpoint",
+              oldTurnId: "turn",
+              carriedIntentSourceSeqs: [],
+            },
+          };
+      expect(() => op.completeChatOperation(chatJid, request)).toThrow("Internal scheduling artifact is only valid for protected recovery handoff");
+      expect(op.getChatOperation(chatJid)).toEqual(claimed);
+      expect(op.getChatOperationDisposition(root.sourceSeq)).toBeNull();
+      expect(op.peekNextAcceptedChatSource(chatJid)?.sourceSeq).toBe(root.sourceSeq);
+    }
+  });
+
   test("protected handoff is all-or-nothing at every write boundary and stale ownership writes nothing", () => {
     for (const boundary of ["artifact", "successor", "intents", "disposition", "frontier", "release"] as const) {
       const chatJid = jid(`protected-fault-${boundary}`);
@@ -478,7 +558,7 @@ describe("durable accepted-input operations", () => {
       const request = {
         owner: owner(claimed), outcome: "interrupted" as const,
         cause: "protected_recovery_continuation_registered", provenance: "test", createdAt: "now",
-        artifact: { message: terminal(chatJid, `handoff-${boundary}-${serial}`) },
+        artifact: { internal: { kind: "protected_recovery_scheduled" as const } },
         successor: { sourceKind: "protected_continuation" as const, rootSourceSeq: root.sourceSeq },
       };
       expect(() => op.completeChatOperation(chatJid, request, {
@@ -488,8 +568,8 @@ describe("durable accepted-input operations", () => {
       expect(op.getChatOperationDisposition(root.sourceSeq)).toBeNull();
       expect(db.getDb().prepare("SELECT 1 FROM chat_accepted_sources WHERE chat_jid = ? AND source_kind = 'protected_continuation'")
         .get(chatJid)).toBeNull();
-      expect(db.getDb().prepare("SELECT 1 FROM messages WHERE chat_jid = ? AND id = ?")
-        .get(chatJid, request.artifact.message.id)).toBeNull();
+      expect(db.getDb().prepare("SELECT 1 FROM messages WHERE chat_jid = ? AND is_bot_message = 1")
+        .get(chatJid)).toBeNull();
       expect(op.completeChatOperation(chatJid, request).status).toBe("completed");
     }
 
@@ -534,7 +614,7 @@ describe("durable accepted-input operations", () => {
     const acceptedAhead = register(chatJid, "accepted-ahead");
     op.completeChatOperation(chatJid, {
       owner: owner(claimed), outcome: "interrupted", cause: "protected_recovery_continuation_registered",
-      provenance: "test", createdAt: "now", artifact: { message: terminal(chatJid, `ordered-handoff-${serial}`) },
+      provenance: "test", createdAt: "now", artifact: { internal: { kind: "protected_recovery_scheduled" } },
       successor: { sourceKind: "protected_continuation", rootSourceSeq: root.sourceSeq },
     });
     const child = db.getDb().prepare(`SELECT source_seq FROM chat_accepted_sources
@@ -558,14 +638,14 @@ describe("durable accepted-input operations", () => {
     const invalidClaim = op.claimNextChatOperation(invalidChatJid).operation!;
     expect(() => op.completeChatOperation(invalidChatJid, {
       owner: owner(invalidClaim), outcome: "interrupted", cause: "generic_interruption", provenance: "test", createdAt: "now",
-      artifact: { message: terminal(invalidChatJid, `invalid-cause-handoff-${serial}`) },
+      artifact: { internal: { kind: "protected_recovery_scheduled" } },
       successor: { sourceKind: "protected_continuation", rootSourceSeq: invalidRoot.sourceSeq },
     })).toThrow("interrupted protected handoff outcome");
     expect(() => op.completeChatOperation(invalidChatJid, {
       owner: owner(invalidClaim), outcome: "interrupted", cause: "protected_recovery_continuation_registered", provenance: "test", createdAt: "now",
       artifact: { message: { ...terminal(invalidChatJid, `blank-handoff-${serial}`), content: "  " } },
       successor: { sourceKind: "protected_continuation", rootSourceSeq: invalidRoot.sourceSeq },
-    })).toThrow("non-blank scheduling artifact");
+    })).toThrow("requires internal scheduling evidence");
     expect(db.getDb().prepare("SELECT 1 FROM chat_accepted_sources WHERE chat_jid = ? AND source_kind = 'protected_continuation'")
       .get(invalidChatJid)).toBeNull();
     expect(db.getDb().prepare("SELECT 1 FROM messages WHERE chat_jid = ? AND is_bot_message = 1")
@@ -576,13 +656,13 @@ describe("durable accepted-input operations", () => {
     const claimed = op.claimNextChatOperation(chatJid).operation!;
     op.completeChatOperation(chatJid, {
       owner: owner(claimed), outcome: "interrupted", cause: "protected_recovery_continuation_registered",
-      provenance: "test", createdAt: "now", artifact: { message: terminal(chatJid, `root-handoff-${serial}`) },
+      provenance: "test", createdAt: "now", artifact: { internal: { kind: "protected_recovery_scheduled" } },
       successor: { sourceKind: "protected_continuation", rootSourceSeq: root.sourceSeq },
     });
     const child = op.claimNextChatOperation(chatJid);
     expect(() => op.completeChatOperation(chatJid, {
       owner: owner(child.operation!), outcome: "interrupted", cause: "protected_recovery_continuation_registered", provenance: "test", createdAt: "later",
-      artifact: { message: terminal(chatJid, `child-handoff-${serial}`) },
+      artifact: { internal: { kind: "protected_recovery_scheduled" } },
       successor: { sourceKind: "protected_continuation", rootSourceSeq: child.source!.sourceSeq },
     })).toThrow("non-continuation selectable prompt root");
     expect(op.getChatOperation(chatJid)).toEqual(child.operation);

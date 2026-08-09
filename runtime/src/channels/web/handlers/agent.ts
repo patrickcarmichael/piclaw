@@ -2035,7 +2035,6 @@ export async function processChat(
     outcome: ChatOperationOutcome,
     cause: string,
     provenance: string,
-    protectedSuccessorRootSourceSeq?: number,
   ): boolean => {
     if (!durableOperation) return true;
     const message = getDb().prepare("SELECT id FROM messages WHERE chat_jid = ? AND rowid = ?")
@@ -2055,9 +2054,6 @@ export async function processChat(
           cause: "steer_applied",
           provenance,
         })),
-        ...(protectedSuccessorRootSourceSeq
-          ? { successor: { sourceKind: "protected_continuation" as const, rootSourceSeq: protectedSuccessorRootSourceSeq } }
-          : {}),
       });
       durableOperationCompleted = completed.status === "completed" || completed.status === "repeated";
       if (!durableOperationCompleted) {
@@ -2085,6 +2081,37 @@ export async function processChat(
       return false;
     }
   };
+  const commitDurableProtectedHandoff = (): boolean => {
+    if (!durableOperation) return false;
+    try {
+      const completed = completeChatOperation(chatJid, {
+        owner: durableOperationOwner(durableOperation),
+        outcome: "interrupted",
+        cause: "protected_recovery_continuation_registered",
+        provenance: "web_process_chat_protected_handoff",
+        createdAt: new Date().toISOString(),
+        artifact: { internal: { kind: "protected_recovery_scheduled" } },
+        successor: { sourceKind: "protected_continuation", rootSourceSeq: durableOperation.sourceSeq },
+        intentDispositions: getPendingChatOperationIntentSources(durableOperation.operationId).map((intent) => ({
+          sourceSeq: intent.sourceSeq,
+          outcome: "succeeded" as const,
+          cause: "steer_applied",
+          provenance: "web_process_chat_protected_handoff",
+        })),
+      });
+      durableOperationCompleted = completed.status === "completed" || completed.status === "repeated";
+      return durableOperationCompleted;
+    } catch (error) {
+      log.error("Durable protected handoff completion failed", {
+        operation: "process_chat.protected_handoff_completion_failed",
+        chatJid,
+        operationId: durableOperation.operationId,
+        sourceSeq: durableOperation.sourceSeq,
+        err: error,
+      });
+      return false;
+    }
+  };
   const persistTerminalOutcome = (
     text: string,
     marker: Record<string, unknown> | null,
@@ -2095,7 +2122,6 @@ export async function processChat(
       outcome?: ChatOperationOutcome;
       cause?: string;
       provenance?: string;
-      protectedSuccessorRootSourceSeq?: number;
     } = {},
   ) => {
     // Capture thinking BEFORE broadcast via onMessageStored callback so a
@@ -2125,7 +2151,6 @@ export async function processChat(
             options.outcome ?? "succeeded",
             options.cause ?? "agent_completed",
             options.provenance ?? "web_process_chat",
-            options.protectedSuccessorRootSourceSeq,
           )
         : undefined,
     });
@@ -2828,34 +2853,7 @@ export async function processChat(
       streamState.lastRecoveryMeta = handoffOutput.recovery || null;
       clearCommittedDraft();
       if (!durableOperation || durableProtectedContinuation) return false;
-      try {
-        const marker = buildTurnOutcomeMarker({
-          kind: "recovery",
-          label: "recovery",
-          title: "Recovery continuation scheduled",
-          detail: "The unfinished request will continue in one durable ordinary turn with execution tools restored.",
-          severity: "info",
-          attemptsUsed: handoffOutput.recovery?.attemptsUsed,
-          classifier: handoffOutput.recovery?.lastClassifier ?? null,
-        });
-        terminalOutputPersistedInPromptLane = Boolean(persistTerminalOutcome(
-          "Recovery continuation scheduled.",
-          marker,
-          {
-            outcome: "interrupted",
-            cause: "protected_recovery_continuation_registered",
-            provenance: "web_process_chat_protected_handoff",
-            protectedSuccessorRootSourceSeq: durableOperation.sourceSeq,
-          },
-        ));
-      } catch (error) {
-        terminalOutputPersistedInPromptLane = false;
-        log.error("Protected recovery handoff callback failed while prompt lane was held", {
-          operation: "process_chat.protected_handoff_callback_failed",
-          chatJid,
-          err: error,
-        });
-      }
+      terminalOutputPersistedInPromptLane = commitDurableProtectedHandoff();
       if (!terminalOutputPersistedInPromptLane) {
         blockFailedRun({
           prevTs: prevCursor,
