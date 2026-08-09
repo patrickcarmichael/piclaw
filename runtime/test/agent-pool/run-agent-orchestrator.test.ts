@@ -44,6 +44,15 @@ import {
   unregisterLiveChatSshSession,
 } from "../../src/extensions/ssh-core.js";
 import { getChatTurnId } from "../../src/core/chat-context.js";
+import {
+  getMutationQuarantine,
+  setMutationQuarantine,
+} from "../../src/agent-pool/mutation-quarantine.js";
+import {
+  keychainToolSafetyPolicy,
+  withToolSafetyPolicy,
+} from "../../src/agent-pool/tool-safety-policy.js";
+import { getSessionActivitySnapshot } from "../../src/extensions/session-status.js";
 import { setEnv } from "../helpers.js";
 
 function createRuntime(session: any, retrySettings?: { enabled?: boolean; maxRetries?: number; baseDelayMs?: number; maxDelayMs?: number }): AgentSessionRuntime {
@@ -361,6 +370,230 @@ function createAssistantMessage(text: string) {
     timestamp: Date.now(),
   } as const;
 }
+
+test("runAgentPrompt contains a provider mutation loop before the third execution and redacts sensitive arguments", async () => {
+  initDatabase();
+  const chatJid = `web:mutation-loop-integration-${Date.now()}`;
+  const sensitiveCanary = "synthetic-sensitive-canary-integration-935";
+  const keychainDefinition = withToolSafetyPolicy({ name: "keychain" }, keychainToolSafetyPolicy);
+  const diagnostics: Array<Record<string, unknown>> = [];
+  const outwardEvents: unknown[] = [];
+
+  class RepeatingMutationSession {
+    private listeners: Array<(event: any) => void> = [];
+    private activeTools = ["keychain"];
+    agent: { beforeToolCall?: (context: any, signal?: AbortSignal) => Promise<any> } = {};
+    executionCount = 0;
+    blockedReason = "";
+    trackedArgs: unknown[] = [];
+    sessionManager = { getLeafId: () => "leaf-mutation-loop" };
+    model = { provider: "openai", id: "gpt-test", contextWindow: 1000 };
+    thinkingLevel = "medium";
+    isStreaming = false;
+    isCompacting = false;
+    isRetrying = false;
+    getActiveToolNames = () => [...this.activeTools];
+    setActiveToolsByName = (names: string[]) => { this.activeTools = [...names]; };
+    getToolDefinition = (name: string) => name === "keychain" ? keychainDefinition : undefined;
+    subscribe(listener: (event: any) => void) {
+      this.listeners.push(listener);
+      return () => { this.listeners = this.listeners.filter((entry) => entry !== listener); };
+    }
+    async prompt() {
+      const args = { action: "set", name: "synthetic/profile", secret: sensitiveCanary };
+      for (const listener of this.listeners) {
+        listener({
+          type: "message_update",
+          assistantMessageEvent: {
+            type: "toolcall_delta",
+            delta: sensitiveCanary,
+            partial: {
+              content: [{ type: "toolCall", id: "mutation-1", name: "keychain", arguments: args }],
+            },
+          },
+          message: {
+            role: "assistant",
+            content: [{ type: "toolCall", id: "mutation-1", name: "keychain", arguments: args }],
+          },
+        });
+        listener({
+          type: "message_end",
+          message: {
+            role: "assistant",
+            stopReason: "toolUse",
+            content: [{ type: "toolCall", id: "mutation-1", name: "keychain", arguments: args }],
+          },
+        });
+      }
+      for (let index = 1; index <= 3; index += 1) {
+        const id = `mutation-${index}`;
+        const blocked = await this.agent.beforeToolCall?.({ toolCall: { id, name: "keychain" }, args });
+        if (blocked?.block) {
+          this.blockedReason = blocked.reason;
+          break;
+        }
+        this.executionCount += 1;
+        for (const listener of this.listeners) {
+          listener({ type: "tool_execution_start", toolCallId: id, toolName: "keychain", args });
+        }
+        this.trackedArgs.push(getSessionActivitySnapshot(chatJid)?.activeTools[0]?.args);
+        for (const listener of this.listeners) {
+          listener({
+            type: "tool_execution_end",
+            toolCallId: id,
+            toolName: "keychain",
+            isError: false,
+            result: { content: [{ type: "text", text: sensitiveCanary }] },
+          });
+        }
+      }
+      expect(this.activeTools).toEqual([]);
+      for (const listener of this.listeners) {
+        listener({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "The repeated keychain mutation was contained after two successful executions; tools were disabled." } });
+        listener({ type: "message_end", message: createAssistantMessage("The repeated keychain mutation was contained after two successful executions; tools were disabled.") });
+      }
+    }
+    async abort() {}
+  }
+
+  const session = new RepeatingMutationSession();
+  const result = await runAgentPrompt("store the profile", chatJid, {
+    timeoutMs: 0,
+    skipPrePromptCompaction: true,
+    onEvent: (event) => outwardEvents.push(event),
+  }, {
+    getOrCreateRuntime: async () => createRuntime(session) as any,
+    turnCoordinator: new AgentTurnCoordinator({ takeAttachments: () => [], touchSession: () => {}, recordMessageUsage: () => {} }),
+    clearAttachments: () => {},
+    takeAttachments: () => [],
+    logsDir: createTestLogsDir(),
+    onWarn: (_message, details) => diagnostics.push(details),
+    setActiveForkBaseLeaf: () => {},
+    clearActiveForkBaseLeaf: () => {},
+  });
+
+  expect(result).toMatchObject({ status: "success", mutationContainmentTerminal: true });
+  expect(session.executionCount).toBe(2);
+  expect(session.blockedReason).toContain("Tool keychain already completed the same mutation successfully 2 times");
+  expect(session.trackedArgs).toEqual([undefined, undefined]);
+  expect(session.getActiveToolNames()).toEqual([]);
+  expect(getMutationQuarantine(chatJid)).not.toBeNull();
+  expect(JSON.stringify({ diagnostics, outwardEvents })).not.toContain(sensitiveCanary);
+});
+
+test("runAgentPrompt carries mutation quarantine across session replacement and clears it only after terminal recovery", async () => {
+  initDatabase();
+  const chatJid = `web:mutation-quarantine-recovery-${Date.now()}`;
+  setMutationQuarantine(chatJid, {
+    trigger: "repetition_limit",
+    toolName: "keychain",
+    fingerprint: "a".repeat(64),
+    successfulRepetitions: 4,
+  });
+
+  class QuarantinedReplacementSession {
+    private listeners: Array<(event: any) => void> = [];
+    private activeTools = ["read", "keychain"];
+    activeToolsSeenByPrompt: string[] | null = null;
+    promptSeen = "";
+    sessionManager = { getLeafId: () => "leaf-after-rotation" };
+    model = { provider: "openai", id: "gpt-test", contextWindow: 1000 };
+    thinkingLevel = "medium";
+    isStreaming = false;
+    isCompacting = false;
+    isRetrying = false;
+    getActiveToolNames = () => [...this.activeTools];
+    setActiveToolsByName = (names: string[]) => { this.activeTools = [...names]; };
+    getToolDefinition = () => undefined;
+    subscribe(listener: (event: any) => void) {
+      this.listeners.push(listener);
+      return () => { this.listeners = this.listeners.filter((entry) => entry !== listener); };
+    }
+    async prompt(text: string) {
+      this.promptSeen = text;
+      this.activeToolsSeenByPrompt = [...this.activeTools];
+      for (const listener of this.listeners) {
+        listener({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "Mutation loop stopped safely." } });
+        listener({ type: "message_end", message: createAssistantMessage("Mutation loop stopped safely.") });
+      }
+    }
+    async abort() {}
+  }
+
+  const session = new QuarantinedReplacementSession();
+  const result = await runAgentPrompt("continue", chatJid, {
+    timeoutMs: 0,
+    skipPrePromptCompaction: true,
+  }, {
+    getOrCreateRuntime: async () => createRuntime(session) as any,
+    turnCoordinator: new AgentTurnCoordinator({ takeAttachments: () => [], touchSession: () => {}, recordMessageUsage: () => {} }),
+    clearAttachments: () => {},
+    takeAttachments: () => [],
+    logsDir: createTestLogsDir(),
+    setActiveForkBaseLeaf: () => {},
+    clearActiveForkBaseLeaf: () => {},
+  });
+
+  expect(result).toMatchObject({
+    status: "success",
+    result: "Mutation loop stopped safely.",
+    mutationContainmentTerminal: true,
+  });
+  expect(session.activeToolsSeenByPrompt).toEqual([]);
+  expect(session.promptSeen).toStartWith("continue\n\n[Runtime safety containment: tool keychain");
+  expect(session.getActiveToolNames()).toEqual([]);
+  expect(getMutationQuarantine(chatJid)).not.toBeNull();
+});
+
+test("runAgentPrompt keeps mutation quarantine after a failed terminal recovery", async () => {
+  initDatabase();
+  const restoreEnv = setEnv({
+    PICLAW_TURN_AUTO_RECOVERY_ENABLED: "0",
+    PICLAW_TURN_TRANSIENT_RECOVERY_ENABLED: "0",
+  });
+  const chatJid = `web:mutation-quarantine-failed-${Date.now()}`;
+  setMutationQuarantine(chatJid, {
+    trigger: "tool_budget",
+    toolName: "keychain",
+    fingerprint: "b".repeat(64),
+    successfulRepetitions: 4,
+  });
+
+  class FailedQuarantineRecoverySession {
+    private activeTools = ["read", "keychain"];
+    sessionManager = { getLeafId: () => "leaf-failed-recovery" };
+    model = { provider: "openai", id: "gpt-test", contextWindow: 1000 };
+    thinkingLevel = "medium";
+    isStreaming = false;
+    isCompacting = false;
+    isRetrying = false;
+    getActiveToolNames = () => [...this.activeTools];
+    setActiveToolsByName = (names: string[]) => { this.activeTools = [...names]; };
+    getToolDefinition = () => undefined;
+    subscribe() { return () => {}; }
+    async prompt() { throw new Error("provider unavailable"); }
+    async abort() {}
+  }
+
+  const session = new FailedQuarantineRecoverySession();
+  const result = await runAgentPrompt("continue", chatJid, {
+    timeoutMs: 0,
+    skipPrePromptCompaction: true,
+  }, {
+    getOrCreateRuntime: async () => createRuntime(session, { enabled: false, maxRetries: 0 }) as any,
+    turnCoordinator: new AgentTurnCoordinator({ takeAttachments: () => [], touchSession: () => {}, recordMessageUsage: () => {} }),
+    clearAttachments: () => {},
+    takeAttachments: () => [],
+    logsDir: createTestLogsDir(),
+    setActiveForkBaseLeaf: () => {},
+    clearActiveForkBaseLeaf: () => {},
+  });
+
+  expect(result.status).toBe("error");
+  expect(session.getActiveToolNames()).toEqual([]);
+  expect(getMutationQuarantine(chatJid)).not.toBeNull();
+  restoreEnv();
+});
 
 test("runAgentPrompt clears live SSH tool redirection and stored profile at turn end", async () => {
   const chatJid = "web:ssh-turn-scope";
@@ -1654,6 +1887,7 @@ test("runAgentPrompt leaves successful post-turn maintenance to AgentPool", asyn
 });
 
 test("runAgentPrompt leaves tool-complete post-turn maintenance to AgentPool", async () => {
+  initDatabase();
   const restoreEnv = setEnv({
     PICLAW_IDLE_AUTO_COMPACTION_DELAY_MS: "5000",
   });
@@ -4084,6 +4318,7 @@ test("runAgentPrompt continues with tools after a resolved side-effecting tool",
 });
 
 test("runAgentPrompt treats terminal UI tool completion without final prose as informational", async () => {
+  initDatabase();
   const restoreEnv = setEnv({
     PICLAW_TURN_AUTO_RECOVERY_ENABLED: "1",
     PICLAW_TURN_AUTO_RECOVERY_MAX_ATTEMPTS: "2",
@@ -4157,6 +4392,7 @@ test("runAgentPrompt treats terminal UI tool completion without final prose as i
 });
 
 test("runAgentPrompt does not let a terminal side-effect tool mask an earlier tool failure", async () => {
+  initDatabase();
   const restoreEnv = setEnv({
     PICLAW_TURN_AUTO_RECOVERY_ENABLED: "1",
     PICLAW_TURN_AUTO_RECOVERY_MAX_ATTEMPTS: "2",

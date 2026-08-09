@@ -1600,6 +1600,33 @@
       "migrationDisposition": "migrated-to-domain-config"
     },
     {
+      "name": "PICLAW_MUTATION_REPETITION_LIMIT",
+      "owner": "agent-runtime",
+      "type": "integer",
+      "default": 2,
+      "bounds": "1..64 successful identical mutations",
+      "allowedValues": [],
+      "secret": false,
+      "persistence": [
+        "env",
+        "dotenv",
+        "json-config"
+      ],
+      "precedence": [
+        "process.env",
+        ".env",
+        "json-config",
+        "defaults"
+      ],
+      "status": "supported",
+      "compatibilityAliasFor": "domains.recovery.mutationRepetitionLimit",
+      "deprecation": "compatibility env alias for domains.recovery.mutationRepetitionLimit",
+      "removalVersion": "3.0.0",
+      "bootstrapAllowed": false,
+      "source": "runtime/src/core/config-runtime.ts domain schema (#935)",
+      "migrationDisposition": "migrated-to-domain-config"
+    },
+    {
       "name": "PICLAW_PACKAGE_ROOT",
       "owner": "tools",
       "type": "path",

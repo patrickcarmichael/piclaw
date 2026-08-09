@@ -362,6 +362,50 @@ test("real AgentPool suppresses maintenance when terminal output returns false o
   cleanupOperationTestChat(db, "web:throw-terminal-callback");
 });
 
+test("real AgentPool durably restores replacement-session tools only after terminal output is accepted", async () => {
+  const ws = getTestWorkspace();
+  restoreEnv = setEnv({ PICLAW_WORKSPACE: ws.workspace, PICLAW_STORE: ws.store, PICLAW_DATA: ws.data });
+  const db = await importFresh<typeof import("../src/db.js")>("../src/db.js");
+  db.initDatabase();
+  const { AgentPool } = await importFresh<typeof import("../src/agent-pool.js")>("../src/agent-pool.js");
+  const { getMutationQuarantine, setMutationQuarantine } = await import("../../src/agent-pool/mutation-quarantine.js");
+  const chatJid = `web:mutation-terminal-commit-${Date.now()}`;
+  let activeTools: string[] = [];
+  const session = new PostTurnMaintenanceSession() as PostTurnMaintenanceSession & {
+    getActiveToolNames: () => string[];
+    setActiveToolsByName: (names: string[]) => void;
+  };
+  session.getActiveToolNames = () => [...activeTools];
+  session.setActiveToolsByName = (names: string[]) => { activeTools = [...names]; };
+  setMutationQuarantine(chatJid, {
+    trigger: "repetition_limit",
+    toolName: "keychain",
+    fingerprint: "c".repeat(64),
+    successfulRepetitions: 2,
+    previousActiveToolNames: ["keychain"],
+  });
+  const pool = new AgentPool({
+    ...createAgentPoolModelOptions(),
+    createSession: async () => createRuntime(session) as any,
+  });
+  (pool as any).runAgentOwned = async () => ({
+    status: "success",
+    result: "Mutation containment reported.",
+    mutationContainmentTerminal: true,
+  });
+
+  await pool.runAgent("continue", chatJid, { onTerminalOutput: () => false });
+  expect(getMutationQuarantine(chatJid)).not.toBeNull();
+  expect(activeTools).toEqual([]);
+
+  await pool.runAgent("continue", chatJid, { onTerminalOutput: () => true });
+  expect(getMutationQuarantine(chatJid)).toBeNull();
+  expect(activeTools).toEqual(["keychain"]);
+
+  await pool.shutdown();
+  cleanupOperationTestChat(db, chatJid);
+});
+
 test("real AgentPool swallows successor legacy conflict only for post-turn maintenance", async () => {
   const ws = getTestWorkspace();
   restoreEnv = setEnv({

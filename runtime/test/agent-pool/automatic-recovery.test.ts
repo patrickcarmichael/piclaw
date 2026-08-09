@@ -740,3 +740,52 @@ test("escalates repeated thinking-only stop to compact-then-retry when context p
   expect(decision.classifier).toBe("context_pressure");
   expect(decision.strategy).toBe("compact_then_retry");
 });
+
+test("repeated mutation failures use one bounded tools-disabled finalization", () => {
+  const decision = decideTypedAutomaticRecovery({
+    config: DEFAULT_AUTOMATIC_RECOVERY_CONFIG,
+    failureCategory: "mutation_repetition",
+    recoveryAttemptsUsed: 0,
+    elapsedMs: 1000,
+    snapshot: {
+      hadToolActivity: true,
+      hadPartialOutput: false,
+      canDisableToolsForRecovery: true,
+      hasUnresolvedToolExecution: false,
+    },
+  });
+
+  expect(decision).toMatchObject({
+    recover: true,
+    classifier: "mutation_repetition",
+    strategy: "finalize",
+  });
+
+  expect(decideTypedAutomaticRecovery({
+    config: DEFAULT_AUTOMATIC_RECOVERY_CONFIG,
+    failureCategory: "mutation_repetition",
+    recoveryAttemptsUsed: 1,
+    mutationContainmentRecoveryAttemptsUsed: 0,
+    elapsedMs: 2000,
+    snapshot: {
+      hadToolActivity: true,
+      hadPartialOutput: false,
+      canDisableToolsForRecovery: true,
+      hasUnresolvedToolExecution: false,
+    },
+  })).toMatchObject({ recover: true, classifier: "mutation_repetition", strategy: "finalize" });
+
+  expect(decideTypedAutomaticRecovery({
+    config: DEFAULT_AUTOMATIC_RECOVERY_CONFIG,
+    failureCategory: "mutation_repetition",
+    recoveryAttemptsUsed: 1,
+    mutationContainmentRecoveryAttemptsUsed: 1,
+    elapsedMs: 2000,
+    snapshot: {
+      hadToolActivity: true,
+      hadPartialOutput: false,
+      canDisableToolsForRecovery: true,
+      hasUnresolvedToolExecution: false,
+    },
+  })).toMatchObject({ recover: false, classifier: "mutation_repetition", strategy: null });
+});

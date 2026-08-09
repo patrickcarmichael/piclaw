@@ -47,7 +47,11 @@ import {
   type SidePromptResult,
 } from "./agent-pool/contracts.js";
 import { runSidePrompt as runSidePromptInternal } from "./agent-pool/side-prompt-runner.js";
+import { getDefaultActiveToolNames } from "./extensions/tool-activation.js";
 import { runAgentPrompt } from "./agent-pool/run-agent-orchestrator.js";
+import { getRememberedActiveToolSubset } from "./agent-pool/active-tool-subset-memory.js";
+import { clearMutationQuarantine, getMutationQuarantine } from "./agent-pool/mutation-quarantine.js";
+import { logToolStateTransition } from "./agent-pool/tool-state-transitions.js";
 import { runWithProtectedRecoveryHandoff } from "./agent-pool/protected-recovery-handoff.js";
 import {
   clearCompactionFailureBackoff,
@@ -366,10 +370,15 @@ export class AgentPool {
     const output = await this.mutationGateway.run(chatJid, "prompt", sessionMutationAccess(options), async () => {
       const result = await this.runAgentOwned(prompt, chatJid, options);
       if (result.terminalCommit?.kind === "already_committed") {
+        if (result.mutationContainmentTerminal) await this.releaseMutationQuarantine(chatJid, options);
         return result;
       }
-      if ((result.status === "success" || result.status === "tool_complete") && options.onTerminalOutput) {
-        terminalOutputCommitted = await options.onTerminalOutput(result);
+      if (result.status === "success" || result.status === "tool_complete") {
+        if (options.onTerminalOutput) terminalOutputCommitted = await options.onTerminalOutput(result);
+        const terminalOutputAccepted = options.onTerminalOutput ? terminalOutputCommitted : true;
+        if (terminalOutputAccepted && result.mutationContainmentTerminal) {
+          await this.releaseMutationQuarantine(chatJid, options);
+        }
       } else if (result.requiresToolEnabledContinuation
         && options.protectedRecoveryHandoffMode === "durable_externalize"
         && options.onProtectedRecoveryHandoff) {
@@ -383,6 +392,55 @@ export class AgentPool {
       await this.runPostTurnMaintenance(chatJid, options);
     }
     return output;
+  }
+
+  private async releaseMutationQuarantine(chatJid: string, options: RunAgentOptions): Promise<void> {
+    let quarantine: ReturnType<typeof getMutationQuarantine>;
+    let session: AgentSession;
+    try {
+      quarantine = getMutationQuarantine(chatJid);
+      if (!quarantine) return;
+      session = await this.getOrCreate(chatJid);
+    } catch {
+      return;
+    }
+    const restoredToolNames = quarantine.previousActiveToolNames
+      ?? getRememberedActiveToolSubset(session)
+      ?? getDefaultActiveToolNames();
+    const toolControl = session as AgentSession & {
+      getActiveToolNames?: () => string[];
+      setActiveToolsByName?: (names: string[]) => void;
+    };
+    if (typeof toolControl.getActiveToolNames !== "function"
+      || typeof toolControl.setActiveToolsByName !== "function") return;
+    const previousToolNames = toolControl.getActiveToolNames();
+    const needsRestore = previousToolNames.length === 0;
+    try {
+      if (needsRestore) toolControl.setActiveToolsByName(restoredToolNames);
+      if (!clearMutationQuarantine(chatJid)) {
+        if (needsRestore) toolControl.setActiveToolsByName(previousToolNames);
+        return;
+      }
+    } catch {
+      if (needsRestore) {
+        try {
+          toolControl.setActiveToolsByName(previousToolNames);
+        } catch {
+          // The durable quarantine remains authoritative for the next turn.
+        }
+      }
+      return;
+    }
+    if (!needsRestore) return;
+    logToolStateTransition({
+      chatJid,
+      turnId: options.turnId,
+      phase: "attempt",
+      cause: "mutation_repetition_quarantine_clear",
+      previous: previousToolNames,
+      next: restoredToolNames,
+      restored: true,
+    });
   }
 
   private async runPostTurnMaintenance(chatJid: string, options: RunAgentOptions): Promise<void> {

@@ -7,6 +7,7 @@ import {
 } from "./blank-turn-detection.js";
 import { classifyOpaqueAgentFailure, type RecoveryAttemptSnapshot } from "./automatic-recovery.js";
 import type { AgentFailureCategory, AgentOutput, RunAgentOptions } from "./contracts.js";
+import type { MutationQuarantine } from "./mutation-quarantine.js";
 import { consumeAgentAbortCause } from "./abort-provenance.js";
 import { getAutoCompactionTokenStatusForSession } from "./compaction.js";
 import { debugSuppressedError, type StructuredLogger } from "../utils/logger.js";
@@ -46,6 +47,7 @@ export interface PromptAttemptFinalizationInput {
   hadToolFailureAfterSoftStop: boolean;
   toolUseSoftStopApplied: boolean;
   toolUseBudgetExceeded: boolean;
+  mutationQuarantine?: MutationQuarantine | null;
   toolExecutionCount: number;
   assistantToolUseMessageCount: number;
   toolUseMessageBudget: number;
@@ -113,6 +115,21 @@ export function finalizePromptAttemptOutput(input: PromptAttemptFinalizationInpu
     output = { status: "error", result: null, failureCategory: "stalled_work", error: `Stale-progress watchdog interrupted the run after no progress for ${input.formatTimeoutDuration(input.getProgressWatchdogTimeoutMs())}.` };
   } else if (input.timedOut) {
     output = { status: "error", result: null, failureCategory: "timeout", error: `Timed out after ${input.formatTimeoutDuration(input.timeoutMs)}` };
+  } else if (input.mutationQuarantine
+    && !input.promptThrownError
+    && !input.turnError
+    && !input.latentStateError
+    && !input.finalText
+    && input.finalAttachments.length === 0
+    && input.lastAssistantState?.stopReason !== "pending"
+    && input.lastAssistantState?.stopReason !== "aborted"
+    && input.lastAssistantState?.stopReason !== "length") {
+    output = {
+      status: "error",
+      result: null,
+      failureCategory: "mutation_repetition",
+      error: `Tool ${input.mutationQuarantine.toolName} repeated the same successful mutation ${input.mutationQuarantine.successfulRepetitions} times. Further matching calls were blocked and tools were disabled for safe terminal recovery.`,
+    };
   } else if (input.toolUseBudgetExceeded && !input.finalText && input.finalAttachments.length === 0) {
     const reportedToolSteps = input.toolExecutionCount > 0 ? input.toolExecutionCount : input.assistantToolUseMessageCount;
     const reportedToolBudget = input.toolUseMessageBudget;

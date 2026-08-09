@@ -4,6 +4,7 @@ import { setEnv } from "../helpers.js";
 
 import {
   buildRecoveryDiagnosticEntry,
+  MUTATION_CONTAINMENT_CONTINUATION_PROMPT,
   resetRecoveryLoopGuardForTests,
   runAgentRecoveryPhase,
   shouldSuppressRecoveryLoop,
@@ -120,6 +121,189 @@ test("recovery loop guard grants one recorded runtime context compaction per sta
 });
 
 describe("runAgentRecoveryPhase", () => {
+  test("uses a fresh budget and explicit tools-disabled prompt for mutation recovery", async () => {
+    const prompts: string[] = [];
+    let activeTools = ["keychain"];
+    const session = {
+      getActiveToolNames: () => [...activeTools],
+      setActiveToolsByName: (names: string[]) => { activeTools = [...names]; },
+    } as any;
+
+    const result = await runAgentRecoveryPhase({
+      prompt: "store a credential",
+      chatJid: "web:test-recovery-phase",
+      session,
+      sessionCtrl: session,
+      timeoutMs: 10_000,
+      startTime: Date.now() - 5_000,
+      modelLabel: "test/model",
+      recoveryConfig: recoveryConfig({ totalBudgetMs: 1_000 }),
+      runOptions: {},
+      logsDir: "/tmp/nonexistent-piclaw-test-logs",
+      clearAttachments: () => {},
+      runPromptAttempt: async (prompt) => {
+        prompts.push(prompt);
+        if (prompts.length === 1) {
+          return attempt({
+            output: {
+              status: "error",
+              result: null,
+              error: "Repeated mutation contained.",
+              failureCategory: "mutation_repetition",
+            },
+            promptWasPersisted: true,
+            snapshot: {
+              hadToolActivity: true,
+              hadPartialOutput: false,
+              hadCompletedTurnOutput: false,
+              hadTerminalTurnOutput: false,
+              sawCompactionIntent: false,
+              canDisableToolsForRecovery: true,
+              hasUnresolvedToolExecution: false,
+            },
+          });
+        }
+        expect(activeTools).toEqual([]);
+        return attempt({ output: output("success", undefined, "Mutation containment reported.") });
+      },
+    });
+
+    expect(prompts).toEqual(["store a credential", MUTATION_CONTAINMENT_CONTINUATION_PROMPT]);
+    expect(result).toMatchObject({ status: "success", result: "Mutation containment reported." });
+    expect(activeTools).toEqual([]);
+  });
+
+  test("resets stale recovery timer state when containment follows an unrelated retry", async () => {
+    const prompts: string[] = [];
+    const timeouts: number[] = [];
+    let activeTools = ["keychain"];
+    const session = {
+      getActiveToolNames: () => [...activeTools],
+      setActiveToolsByName: (names: string[]) => { activeTools = [...names]; },
+    } as any;
+
+    const result = await runAgentRecoveryPhase({
+      prompt: "complete work",
+      chatJid: "web:test-recovery-phase",
+      session,
+      sessionCtrl: session,
+      timeoutMs: 10_000,
+      startTime: Date.now(),
+      modelLabel: "test/model",
+      recoveryConfig: recoveryConfig({ totalBudgetMs: 100, transientRecoveryToolsEnabled: true }),
+      runOptions: {},
+      logsDir: "/tmp/nonexistent-piclaw-test-logs",
+      clearAttachments: () => {},
+      runPromptAttempt: async (prompt, timeoutMs) => {
+        prompts.push(prompt);
+        timeouts.push(timeoutMs);
+        if (prompts.length === 1) {
+          return attempt({
+            output: { status: "error", result: null, error: "network unavailable", failureCategory: "network" },
+            promptWasPersisted: true,
+          });
+        }
+        if (prompts.length === 2) {
+          await Bun.sleep(40);
+          return attempt({
+            output: { status: "error", result: null, error: "Repeated mutation contained.", failureCategory: "mutation_repetition" },
+            promptWasPersisted: true,
+            snapshot: {
+              hadToolActivity: true,
+              hadPartialOutput: false,
+              hadCompletedTurnOutput: false,
+              hadTerminalTurnOutput: false,
+              sawCompactionIntent: false,
+              canDisableToolsForRecovery: true,
+              hasUnresolvedToolExecution: false,
+            },
+          });
+        }
+        expect(activeTools).toEqual([]);
+        return attempt({ output: output("success", undefined, "Mutation containment reported.") });
+      },
+    });
+
+    expect(prompts).toEqual([
+      "complete work",
+      RECOVERY_CONTINUATION_PROMPT,
+      MUTATION_CONTAINMENT_CONTINUATION_PROMPT,
+    ]);
+    expect(timeouts[2]).toBeGreaterThanOrEqual(80);
+    expect(result).toMatchObject({
+      status: "success",
+      recovery: { attemptsUsed: 2, strategyHistory: ["retry", "finalize"] },
+    });
+    expect(activeTools).toEqual([]);
+  });
+
+  test("bounds a quarantined transient retry before phantom accounting or backoff", async () => {
+    const prompts: string[] = [];
+    const events: any[] = [];
+    let activeTools: string[] = [];
+    const session = {
+      getActiveToolNames: () => [...activeTools],
+      setActiveToolsByName: (names: string[]) => { activeTools = [...names]; },
+    } as any;
+
+    const result = await runAgentRecoveryPhase({
+      prompt: "continue quarantined recovery",
+      chatJid: "web:test-recovery-phase",
+      session,
+      sessionCtrl: session,
+      timeoutMs: 10_000,
+      startTime: Date.now(),
+      modelLabel: "test/model",
+      recoveryConfig: recoveryConfig({
+        transientRecoveryToolsEnabled: false,
+        totalBudgetMs: 20,
+        baseDelayMs: 40,
+        maxDelayMs: 40,
+      }),
+      runOptions: { onEvent: (event) => events.push(event) },
+      mutationContainmentActive: true,
+      logsDir: "/tmp/nonexistent-piclaw-test-logs",
+      clearAttachments: () => {},
+      runPromptAttempt: async (prompt) => {
+        prompts.push(prompt);
+        expect(activeTools).toEqual([]);
+        session.setActiveToolsByName(["keychain"]);
+        expect(activeTools).toEqual([]);
+        if (prompts.length === 1) {
+          return attempt({
+            output: {
+              status: "error",
+              result: null,
+              error: "503 temporarily unavailable",
+              failureCategory: "network",
+            },
+            promptWasPersisted: true,
+          });
+        }
+        return attempt({
+          output: {
+            status: "error",
+            result: null,
+            error: "network still unavailable",
+            failureCategory: "network",
+          },
+          promptWasPersisted: true,
+        });
+      },
+    });
+
+    expect(MUTATION_CONTAINMENT_CONTINUATION_PROMPT).toContain("without claiming new side effects or exposing tool arguments");
+    expect(prompts).toEqual(["continue quarantined recovery", MUTATION_CONTAINMENT_CONTINUATION_PROMPT]);
+    expect(events.filter((event) => event.type === "recovery_start")).toHaveLength(1);
+    expect(result).toMatchObject({
+      status: "error",
+      error: "network still unavailable",
+      failureCategory: "mutation_repetition",
+      recovery: { attemptsUsed: 1, strategyHistory: ["retry"] },
+    });
+    expect(activeTools).toEqual([]);
+  });
+
   test("does not begin or retry an attempt after operation cancellation", async () => {
     let attempts = 0;
     const result = await runAgentRecoveryPhase({

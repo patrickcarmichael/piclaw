@@ -40,6 +40,7 @@ export type RecoveryClassifier =
   | "completed_turn_output"
   | "context_pressure"
   | "tool_history_pressure"
+  | "mutation_repetition"
   | "thinking_only_stop"
   | "length_stop"
   | "transient"
@@ -192,6 +193,7 @@ export interface RecoveryDecisionInput {
   config: AutomaticRecoveryConfig;
   failureCategory: AgentFailureCategory;
   recoveryAttemptsUsed: number;
+  mutationContainmentRecoveryAttemptsUsed?: number;
   elapsedMs: number;
   snapshot: RecoveryAttemptSnapshot;
 }
@@ -251,6 +253,47 @@ export function decideAutomaticRecovery(input: RecoveryDecisionInput): RecoveryD
       classifier: "session_corruption",
       strategy: null,
       reason: "Provider rejected an orphan function-call output; unchanged automatic retries cannot repair the payload.",
+    };
+  }
+
+  if (failureCategory === "mutation_repetition") {
+    if (input.elapsedMs >= input.config.totalBudgetMs) {
+      return {
+        recover: false,
+        classifier: "budget_exhausted",
+        strategy: null,
+        reason: "Automatic recovery budget exhausted.",
+      };
+    }
+    if ((input.mutationContainmentRecoveryAttemptsUsed ?? 0) > 0) {
+      return {
+        recover: false,
+        classifier: "mutation_repetition",
+        strategy: null,
+        reason: "Mutation containment terminal recovery already ran once; keep the branch quarantined for an explicit continuation.",
+      };
+    }
+    if (!input.config.enabled || !input.config.transientRecoveryEnabled) {
+      return {
+        recover: false,
+        classifier: "disabled",
+        strategy: null,
+        reason: "Mutation containment remains quarantined until an explicit tools-disabled continuation.",
+      };
+    }
+    if (!input.snapshot.canDisableToolsForRecovery || input.snapshot.hasUnresolvedToolExecution) {
+      return {
+        recover: false,
+        classifier: "mutation_repetition",
+        strategy: null,
+        reason: "Mutation containment cannot finalize automatically while tool control or execution settlement is unresolved.",
+      };
+    }
+    return {
+      recover: true,
+      classifier: "mutation_repetition",
+      strategy: "finalize",
+      reason: "Repeated mutation was contained; requesting one bounded tools-disabled terminal explanation.",
     };
   }
 
