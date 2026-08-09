@@ -73,9 +73,39 @@ describe("prompt attempt finalization", () => {
     expect(snapshot.sawThinkingOnlyStop).toBe(false);
   });
 
+  test("classifies contained mutation repetition separately from ordinary tool-budget exhaustion", () => {
+    const { output } = finalizePromptAttemptOutput(baseInput({
+      hadToolActivity: true,
+      sawAssistantToolCallMessage: true,
+      toolUseBudgetExceeded: true,
+      mutationQuarantine: {
+        version: 1,
+        trigger: "repetition_limit",
+        toolName: "keychain",
+        fingerprint: "c".repeat(64),
+        successfulRepetitions: 2,
+        createdAt: "2026-08-09T00:00:00.000Z",
+      },
+    }));
+
+    expect(output).toMatchObject({
+      status: "error",
+      failureCategory: "mutation_repetition",
+    });
+    expect(output.error).toContain("Tool keychain repeated the same successful mutation 2 times");
+    expect(output.error).not.toContain("cccccccc");
+  });
+
   test("does not treat pending streaming state as a terminal success", () => {
     const { output } = finalizePromptAttemptOutput(baseInput({
-      finalText: "partial draft",
+      mutationQuarantine: {
+        version: 1,
+        trigger: "repetition_limit",
+        toolName: "keychain",
+        fingerprint: "d".repeat(64),
+        successfulRepetitions: 2,
+        createdAt: "2026-08-09T00:00:00.000Z",
+      },
       lastAssistantState: {
         stopReason: "pending",
         rawStopReason: "in_progress",

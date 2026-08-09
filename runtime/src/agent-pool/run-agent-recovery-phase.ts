@@ -37,6 +37,8 @@ import { isRotationFallbackCompactionError } from "../session-rotation.js";
 import { rememberActiveToolSubset } from "./active-tool-subset-memory.js";
 import { logToolStateTransition } from "./tool-state-transitions.js";
 
+export const MUTATION_CONTAINMENT_CONTINUATION_PROMPT = `${RECOVERY_CONTINUATION_PROMPT} Mutation safety containment is active. Tools are disabled; return a concise terminal status without claiming new side effects or exposing tool arguments.`;
+
 const MAX_RECOVERY_LOOP_GUARD_CHATS = 512;
 const MIN_RECOVERY_FINALIZATION_RESERVE_MS = 5_000;
 const MAX_RECOVERY_FINALIZATION_RESERVE_MS = 60_000;
@@ -81,6 +83,7 @@ export interface RunAgentRecoveryPhaseOptions {
   modelLabel: string | null;
   recoveryConfig: AutomaticRecoveryConfig;
   runOptions: RunAgentOptions;
+  mutationContainmentActive?: boolean;
   logsDir: string;
   runPromptAttempt: RunPromptAttemptCallback;
   onInfo?: (message: string, data: Record<string, unknown>) => void;
@@ -453,7 +456,10 @@ export async function runAgentRecoveryPhase(options: RunAgentRecoveryPhaseOption
   let activeSession = options.session;
   let activeSessionCtrl = options.sessionCtrl;
   let attemptPrompt = prompt;
-  let recoveryContinuationWithoutTools = false;
+  let mutationContainmentActive = Boolean(options.mutationContainmentActive);
+  let mutationContainmentBudgetStarted = false;
+  let mutationContainmentRecoveryAttempts = 0;
+  let recoveryContinuationWithoutTools = mutationContainmentActive;
   let lastAttemptWasGenericProtected = false;
   let successfulRecoveryCompaction = false;
   let turnToolExecutionCount = 0;
@@ -476,6 +482,8 @@ export async function runAgentRecoveryPhase(options: RunAgentRecoveryPhaseOption
       : Math.max(0, Date.now() - startTime);
   };
   const getRecoveryDecisionElapsedMs = (failureCategory: AgentFailureCategory | undefined, snapshot: RecoveryAttemptSnapshot) => {
+    if ((failureCategory === "mutation_repetition" || mutationContainmentActive)
+      && mutationContainmentRecoveryAttempts === 0) return 0;
     // #778: context-pressure compact_then_retry has two bounded phases:
     // recovery compaction is bounded by the compaction timeout; the
     // continuation prompt receives a fresh recovery budget after compaction.
@@ -542,7 +550,8 @@ export async function runAgentRecoveryPhase(options: RunAgentRecoveryPhaseOption
     // not spend a provider call producing prose that cannot be committed.
     const pendingGenericProtectedHandoff = recoveryContinuationWithoutTools
       && recoveryAttemptsUsed > 0
-      && strategyHistory.at(-1) !== "finalize";
+      && strategyHistory.at(-1) !== "finalize"
+      && !mutationContainmentActive;
     if (pendingGenericProtectedHandoff) {
       const duration = Date.now() - startTime;
       options.onInfo?.("Skipped unauthoritative tools-disabled recovery provider attempt", {
@@ -656,8 +665,12 @@ export async function runAgentRecoveryPhase(options: RunAgentRecoveryPhaseOption
       : 0;
     const currentAttemptWasGenericProtected = recoveryContinuationWithoutTools
       && recoveryAttemptsUsed > 0
-      && strategyHistory.at(-1) !== "finalize";
+      && strategyHistory.at(-1) !== "finalize"
+      && !mutationContainmentActive;
     lastAttemptWasGenericProtected = currentAttemptWasGenericProtected;
+    if (mutationContainmentActive && recoveryContinuationWithoutTools && recoveryAttemptsUsed > 0) {
+      mutationContainmentRecoveryAttempts += 1;
+    }
     let attempt: PromptAttemptResult;
     try {
       attempt = await options.runPromptAttempt(attemptPrompt, attemptTimeoutMs, turnToolExecutionCount, finalizationReserveMs);
@@ -666,7 +679,7 @@ export async function runAgentRecoveryPhase(options: RunAgentRecoveryPhaseOption
       if (recoveryOriginalSetActiveToolsByName && activeSessionCtrl) {
         activeSessionCtrl.setActiveToolsByName = recoveryOriginalSetActiveToolsByName;
       }
-      if (recoverySavedToolNames && recoveryOriginalSetActiveToolsByName) {
+      if (recoverySavedToolNames && recoveryOriginalSetActiveToolsByName && !mutationContainmentActive) {
         recoveryOriginalSetActiveToolsByName(recoverySavedToolNames);
         logToolStateTransition({
           chatJid,
@@ -780,6 +793,40 @@ export async function runAgentRecoveryPhase(options: RunAgentRecoveryPhaseOption
     const failureCategory = attempt.output.failureCategory ?? classifyOpaqueAgentFailure(errorText);
     attempt.output.failureCategory = failureCategory;
     lastRecoveryErrorText = errorText;
+    if (mutationContainmentActive && mutationContainmentRecoveryAttempts >= 1) {
+      const duration = Date.now() - startTime;
+      const reason = "The bounded mutation-containment recovery attempt failed; no further retry was scheduled.";
+      lastClassifier = "mutation_repetition";
+      recoveryDiagnostics.push(buildRecoveryDiagnosticEntry(
+        "attempt_failure",
+        recoveryAttemptsUsed + 1,
+        lastClassifier,
+        null,
+        reason,
+        errorText,
+        getRecoveryBudgetElapsedMs(),
+        attempt.snapshot,
+        failureCategory,
+      ));
+      const recovery = buildRecoveryMetadata(
+        recoveryAttemptsUsed,
+        duration,
+        false,
+        true,
+        lastClassifier,
+        strategyHistory,
+        recoveryDiagnostics,
+      );
+      writeAgentLog(options.logsDir, chatJid, duration, false, null, errorText, recovery);
+      emitAgentSessionEvent(runOptions.onEvent, {
+        type: "recovery_end",
+        outcome: "exhausted",
+        attemptsUsed: recoveryAttemptsUsed,
+        classifier: lastClassifier,
+        errorMessage: errorText,
+      });
+      return { status: "error", result: null, error: errorText, failureCategory: "mutation_repetition", recovery };
+    }
     allowPostTimeoutRecoveryWindow = recoveryAttemptsUsed === 0
       && attempt.snapshot.hadToolActivity
       && attempt.timedOut;
@@ -787,6 +834,7 @@ export async function runAgentRecoveryPhase(options: RunAgentRecoveryPhaseOption
       config: recoveryConfig,
       failureCategory,
       recoveryAttemptsUsed,
+      mutationContainmentRecoveryAttemptsUsed: mutationContainmentRecoveryAttempts,
       elapsedMs: getRecoveryDecisionElapsedMs(failureCategory, attempt.snapshot),
       snapshot: attempt.snapshot,
     });
@@ -908,14 +956,20 @@ export async function runAgentRecoveryPhase(options: RunAgentRecoveryPhaseOption
       errorMessage: errorText,
     });
 
-    if (effectiveDecision.strategy !== "compact_then_retry"
+    const startsMutationContainmentBudget = (mutationContainmentActive
+      || effectiveDecision.classifier === "mutation_repetition")
+      && !mutationContainmentBudgetStarted;
+
+    if (!startsMutationContainmentBudget
+      && effectiveDecision.strategy !== "compact_then_retry"
       && recoveryBudgetStartedAt == null
       && recoveryBudgetAccumulatedMs === 0
       && (timeoutMs <= 0 || allowPostTimeoutRecoveryWindow)) {
       startRecoveryBudget();
     }
 
-    const nextAttemptWouldBeGenericProtected = effectiveDecision.strategy !== "finalize"
+    const nextAttemptWouldBeGenericProtected = !mutationContainmentActive
+      && effectiveDecision.strategy !== "finalize"
       && shouldDisableToolsForRecoveryAttempt(
         effectiveDecision,
         attempt.snapshot,
@@ -944,16 +998,25 @@ export async function runAgentRecoveryPhase(options: RunAgentRecoveryPhaseOption
       await sleep(retryDelayMs);
     }
     if (options.isCancelled?.()) return cancelledOutput();
+    if (startsMutationContainmentBudget) {
+      recoveryBudgetAccumulatedMs = 0;
+      recoveryBudgetStartedAt = Date.now();
+      mutationContainmentBudgetStarted = true;
+    }
 
     // AgentSession persists the user message before invoking the provider.
     // Replaying the original text after a failed attempt duplicates the
     // instruction and can repeat side-effecting tools. Resume persisted
     // turns with a neutral continuation; only replay when no branch state
     // was appended (for example, a synchronous pre-prompt throw).
+    if (effectiveDecision.classifier === "mutation_repetition") mutationContainmentActive = true;
     if (attempt.promptWasPersisted || attempt.snapshot.hadToolActivity) {
-      attemptPrompt = RECOVERY_CONTINUATION_PROMPT;
+      attemptPrompt = mutationContainmentActive
+        ? MUTATION_CONTAINMENT_CONTINUATION_PROMPT
+        : RECOVERY_CONTINUATION_PROMPT;
     }
-    recoveryContinuationWithoutTools = effectiveDecision.strategy === "finalize"
+    recoveryContinuationWithoutTools = mutationContainmentActive
+      || effectiveDecision.strategy === "finalize"
       || shouldDisableToolsForRecoveryAttempt(
         effectiveDecision,
         attempt.snapshot,
@@ -976,6 +1039,7 @@ export async function runAgentRecoveryPhase(options: RunAgentRecoveryPhaseOption
           config: recoveryConfig,
           failureCategory: compactionFailureCategory,
           recoveryAttemptsUsed,
+          mutationContainmentRecoveryAttemptsUsed: mutationContainmentRecoveryAttempts,
           elapsedMs: getRecoveryBudgetElapsedMs(),
           snapshot: {
             hadToolActivity: false,

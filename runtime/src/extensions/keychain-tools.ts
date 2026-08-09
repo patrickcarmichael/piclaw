@@ -1,10 +1,14 @@
 /**
  * keychain-tools – registers a keychain tool for listing and retrieving entries.
  */
-import { Type } from "typebox";
+import { Type, type Static } from "typebox";
 import type { AgentToolResult, ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
 
 import { registerToolStatusHintProvider } from "../tool-status-hints.js";
+import {
+  keychainToolSafetyPolicy,
+  withToolSafetyPolicy,
+} from "../agent-pool/tool-safety-policy.js";
 import {
   deleteKeychainEntry,
   getKeychainEntry,
@@ -144,13 +148,13 @@ export const keychainTools: ExtensionFactory = (pi: ExtensionAPI) => {
     systemPrompt: `${event.systemPrompt}\n\n${KEYCHAIN_HINT}\n\n${buildInjectedBashEnvHint()}\n\n${buildIntegrationProfileHints()}`,
   }));
 
-  pi.registerTool({
+  pi.registerTool(withToolSafetyPolicy({
     name: "keychain",
     label: "keychain",
     description: "List keychain entries, retrieve values, store/update entries, or delete entries. Prefer env injection and keychain-backed profile references over reading secrets directly. Entries are automatically injected as environment variables (names with `/`, `-`, `.` are sanitized to `_` and uppercased) into bash and SSH commands — treat keychain get as a last resort and do NOT inline fetched secrets into shell commands.",
     promptSnippet: "keychain: list/get/set/delete secure keychain entries by name. Prefer auto-injected env vars and profile references; use keychain get only as a last resort, and never inline fetched secrets into commands.",
     parameters: KeychainToolSchema,
-    async execute(_toolCallId, params): Promise<AgentToolResult<KeychainToolDetails>> {
+    async execute(_toolCallId, params: Static<typeof KeychainToolSchema>): Promise<AgentToolResult<KeychainToolDetails>> {
       if (params.action === "list") {
         const limit = clampLimit(params.limit, 100);
         const entries = (await listAllKeychainEntries()).slice(0, limit);
@@ -261,5 +265,5 @@ export const keychainTools: ExtensionFactory = (pi: ExtensionAPI) => {
         };
       }
     },
-  });
+  }, keychainToolSafetyPolicy));
 };

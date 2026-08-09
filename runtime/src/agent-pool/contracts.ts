@@ -20,6 +20,7 @@ export type AgentFailureCategory =
   | "aborted"
   | "timeout"
   | "tool_budget"
+  | "mutation_repetition"
   | "context_pressure"
   | "output_limit"
   | "provider"
@@ -117,6 +118,8 @@ export interface AgentOutput {
   goalDeadlineCheckpoint?: GoalDeadlineCheckpointEvidence;
   /** Suppresses ordinary terminal persistence and ownerless post-turn maintenance. */
   terminalCommit?: AgentTerminalCommit;
+  /** @internal Clean terminal containment output awaiting acceptance by the durable owner. */
+  mutationContainmentTerminal?: true;
 }
 
 /** A single turn's output within a multi-turn agent run. */

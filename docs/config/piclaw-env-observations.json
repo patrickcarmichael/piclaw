@@ -51,7 +51,7 @@
   },
   "current": {
     "production": {
-      "referencedNames": 173,
+      "referencedNames": 174,
       "directReaderNames": 7,
       "directReaderOccurrences": 14,
       "helperReaderNames": 10,
@@ -60,7 +60,7 @@
       "semanticReaderOccurrences": 24
     },
     "runtimeSrc": {
-      "referencedNames": 171,
+      "referencedNames": 172,
       "directReaderNames": 7,
       "directReaderOccurrences": 14,
       "helperReaderNames": 10,
@@ -2728,6 +2728,31 @@
           "readerFiles": [
             "runtime/scripts/playwright/terminal-reopen-multicycle.ts"
           ]
+        }
+      }
+    },
+    {
+      "name": "PICLAW_MUTATION_REPETITION_LIMIT",
+      "scopes": {
+        "production": {
+          "referenced": true,
+          "directReaders": 0,
+          "helperReaders": 0,
+          "semanticReaders": 0,
+          "files": [
+            "runtime/src/core/config-runtime.ts"
+          ],
+          "readerFiles": []
+        },
+        "runtimeSrc": {
+          "referenced": true,
+          "directReaders": 0,
+          "helperReaders": 0,
+          "semanticReaders": 0,
+          "files": [
+            "runtime/src/core/config-runtime.ts"
+          ],
+          "readerFiles": []
         }
       }
     },

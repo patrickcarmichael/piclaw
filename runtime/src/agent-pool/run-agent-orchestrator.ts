@@ -41,6 +41,8 @@ import {
   getSessionLeafId,
 } from "./context-pressure-retry.js";
 import { createAttemptToolBudgetController } from "./run-agent-attempt-budget.js";
+import { getMutationQuarantine, type MutationQuarantine } from "./mutation-quarantine.js";
+import { getSessionToolSafetyPolicy } from "./tool-safety-policy.js";
 import { createAttemptContextPressureController } from "./run-agent-attempt-context.js";
 import {
   finalizePromptAttemptOutput,
@@ -430,6 +432,97 @@ function getRunObservabilityDetails(
   };
 }
 
+function redactSensitiveToolCallBlock(
+  session: AgentSession,
+  value: unknown,
+): { value: unknown; redacted: boolean } {
+  if (!value || typeof value !== "object") return { value, redacted: false };
+  const block = value as Record<string, unknown>;
+  const isToolCall = block.type === "toolCall"
+    || (typeof block.name === "string" && Object.prototype.hasOwnProperty.call(block, "arguments"));
+  if (!isToolCall) return { value, redacted: false };
+  const policy = getSessionToolSafetyPolicy(session, block.name, block.arguments);
+  if (!policy?.redactArgs) return { value, redacted: false };
+  return { value: { ...block, arguments: {} }, redacted: true };
+}
+
+function redactSensitiveToolCallContent(
+  session: AgentSession,
+  content: unknown,
+): { value: unknown; redacted: boolean } {
+  if (!Array.isArray(content)) return { value: content, redacted: false };
+  let redacted = false;
+  const value = content.map((block) => {
+    const next = redactSensitiveToolCallBlock(session, block);
+    redacted ||= next.redacted;
+    return next.value;
+  });
+  return redacted ? { value, redacted } : { value: content, redacted: false };
+}
+
+function redactSensitiveOutwardEvent(session: AgentSession, event: AgentSessionEvent): AgentSessionEvent {
+  if (event.type === "tool_execution_start" || event.type === "tool_execution_update") {
+    const toolEvent = event as AgentSessionEvent & { toolName?: unknown; args?: unknown };
+    const policy = getSessionToolSafetyPolicy(session, toolEvent.toolName, toolEvent.args);
+    return policy?.redactArgs ? { ...toolEvent, args: undefined } as AgentSessionEvent : event;
+  }
+
+  if (event.type === "tool_execution_end") {
+    const toolEvent = event as AgentSessionEvent & { toolName?: unknown; result?: unknown };
+    const policy = getSessionToolSafetyPolicy(session, toolEvent.toolName, undefined);
+    return policy?.redactResult ? { ...toolEvent, result: undefined } as AgentSessionEvent : event;
+  }
+
+  if (event.type === "message_start" || event.type === "message_end") {
+    const messageEvent = event as AgentSessionEvent & { message?: Record<string, unknown> };
+    const content = redactSensitiveToolCallContent(session, messageEvent.message?.content);
+    if (!content.redacted || !messageEvent.message) return event;
+    return {
+      ...messageEvent,
+      message: { ...messageEvent.message, content: content.value },
+    } as AgentSessionEvent;
+  }
+
+  if (event.type !== "message_update") return event;
+  const update = event as AgentSessionEvent & {
+    assistantMessageEvent?: Record<string, unknown>;
+    message?: Record<string, unknown>;
+  };
+  const assistantEvent = update.assistantMessageEvent;
+  let redacted = false;
+  let nextAssistantEvent = assistantEvent;
+  if (assistantEvent) {
+    const toolCall = redactSensitiveToolCallBlock(session, assistantEvent.toolCall);
+    if (toolCall.redacted) {
+      redacted = true;
+      nextAssistantEvent = { ...nextAssistantEvent, toolCall: toolCall.value };
+    }
+    const partial = assistantEvent.partial;
+    if (partial && typeof partial === "object") {
+      const partialRecord = partial as Record<string, unknown>;
+      const content = redactSensitiveToolCallContent(session, partialRecord.content);
+      if (content.redacted) {
+        redacted = true;
+        nextAssistantEvent = {
+          ...nextAssistantEvent,
+          partial: { ...partialRecord, content: content.value },
+        };
+      }
+    }
+  }
+  const messageContent = redactSensitiveToolCallContent(session, update.message?.content);
+  if (messageContent.redacted) redacted = true;
+  if (!redacted) return event;
+  if (nextAssistantEvent?.type === "toolcall_delta") nextAssistantEvent = { ...nextAssistantEvent, delta: "" };
+  return {
+    ...update,
+    ...(nextAssistantEvent ? { assistantMessageEvent: nextAssistantEvent } : {}),
+    ...(messageContent.redacted && update.message
+      ? { message: { ...update.message, content: messageContent.value } }
+      : {}),
+  } as AgentSessionEvent;
+}
+
 async function runPromptAttempt(
   prompt: string,
   chatJid: string,
@@ -519,6 +612,7 @@ async function runPromptAttempt(
   ].includes(toolName);
   let sawTerminalSideEffectToolActivity = false;
   let hadToolFailure = false;
+  const startedToolSafetyPolicyByCallId = new Map<string, ReturnType<typeof getSessionToolSafetyPolicy>>();
 
   const attemptContext = createAttemptContextPressureController({
     session,
@@ -556,6 +650,13 @@ async function runPromptAttempt(
     }
 
     if (event.type === "tool_execution_start") {
+      const startedTool = event as { toolCallId?: unknown; toolName?: unknown; args?: unknown };
+      if (typeof startedTool.toolCallId === "string") {
+        startedToolSafetyPolicyByCallId.set(
+          startedTool.toolCallId,
+          getSessionToolSafetyPolicy(session, startedTool.toolName, startedTool.args),
+        );
+      }
       attemptContext.establishToolStartBaseline(modelResponseSequence);
     } else if (event.type === "tool_execution_update") {
       attemptContext.publishContextUsageUpdate("tool_execution_update");
@@ -579,7 +680,8 @@ async function runPromptAttempt(
     if (event.type === "tool_execution_start") {
       const e = event as { toolCallId?: string; toolName?: string; args?: unknown };
       if (e.toolCallId && e.toolName) {
-        trackToolStartActivity(chatJid, e.toolCallId, e.toolName, e.args);
+        const toolSafetyPolicy = getSessionToolSafetyPolicy(session, e.toolName, e.args);
+        trackToolStartActivity(chatJid, e.toolCallId, e.toolName, toolSafetyPolicy?.redactArgs ? undefined : e.args);
         options.onInfo?.("Tool execution started", {
           operation: "tool.call.start",
           chatJid,
@@ -642,6 +744,7 @@ async function runPromptAttempt(
         hadPartialOutput = true;
       }
     }
+    let toolEndWasBlockedByMutation = false;
     if (
       event.type === "tool_execution_start"
       || event.type === "tool_execution_update"
@@ -650,24 +753,44 @@ async function runPromptAttempt(
       hadToolActivity = true;
       if (event.type === "tool_execution_end") {
         const toolCallId = (event as { toolCallId?: unknown }).toolCallId;
-        const { wasBlockedByBudget } = toolBudget.consumeToolExecutionEnd(toolCallId, (event as { isError?: unknown }).isError);
-        if (!wasBlockedByBudget) toolExecutionCount += 1;
-        if (!wasBlockedByBudget && toolExecutionCount >= toolUseMessageBudget) {
+        const {
+          wasBlockedByBudget,
+          wasBlockedByMutation,
+          toolSafetyPolicy,
+        } = toolBudget.consumeToolExecutionEnd(toolCallId, (event as { isError?: unknown }).isError);
+        toolEndWasBlockedByMutation = wasBlockedByMutation;
+        const startedToolSafetyPolicy = typeof toolCallId === "string"
+          ? startedToolSafetyPolicyByCallId.get(toolCallId) ?? null
+          : null;
+        if (typeof toolCallId === "string") startedToolSafetyPolicyByCallId.delete(toolCallId);
+        const resolvedToolSafetyPolicy = toolSafetyPolicy ?? startedToolSafetyPolicy;
+        const wasBlockedBeforeExecution = wasBlockedByBudget || wasBlockedByMutation;
+        if (!wasBlockedBeforeExecution) toolExecutionCount += 1;
+        const completedToolName = (event as { toolName?: unknown }).toolName;
+        const completedToolWasReadOnly = resolvedToolSafetyPolicy
+          ? resolvedToolSafetyPolicy.effect === "read_only"
+          : isRetrySafeToolName(completedToolName);
+        if (!wasBlockedBeforeExecution && !completedToolWasReadOnly) {
+          onlyReadOnlyToolActivity = false;
+        }
+        if (!wasBlockedBeforeExecution
+          && !(event as { isError?: unknown }).isError
+          && ((resolvedToolSafetyPolicy?.effect === "mutation" && resolvedToolSafetyPolicy.terminalSideEffect)
+            || isTerminalSideEffectToolName(completedToolName))) {
+          sawTerminalSideEffectToolActivity = true;
+        }
+        if (!wasBlockedBeforeExecution && toolExecutionCount >= toolUseMessageBudget) {
           toolBudget.enforceCompletedExecutionBudget();
         }
         // Accumulate tool-result content size for mid-turn context projection.
         attemptContext.addToolResultContent((event as { result?: unknown }).result);
       }
       const toolName = (event as { toolName?: unknown }).toolName;
-      if (!isRetrySafeToolName(toolName)) {
-        onlyReadOnlyToolActivity = false;
-      }
       // Track failed tool executions so recovery can make smarter decisions.
-      if (event.type === "tool_execution_end" && (event as { isError?: unknown }).isError) {
+      if (event.type === "tool_execution_end"
+        && (event as { isError?: unknown }).isError
+        && !toolEndWasBlockedByMutation) {
         hadToolFailure = true;
-      }
-      if (event.type === "tool_execution_end" && !(event as { isError?: unknown }).isError && isTerminalSideEffectToolName(toolName)) {
-        sawTerminalSideEffectToolActivity = true;
       }
       if (event.type === "tool_execution_end") {
         attemptContext.checkMidTurnContextAfterToolResult(toolName, (event as { isError?: unknown }).isError, toolExecutionCount, midTurnToolExecutionHardCeiling, toolUseMessageBudget);
@@ -749,7 +872,7 @@ async function runPromptAttempt(
         compactionErrorMessage = errorMessage.trim();
       }
     }
-    runOptions.onEvent?.(event);
+    runOptions.onEvent?.(redactSensitiveOutwardEvent(session, event));
   };
 
   const unsub = options.turnCoordinator.subscribe(session, chatJid, tracker, wrappedOnEvent);
@@ -973,6 +1096,12 @@ async function runPromptAttempt(
   // otherwise tool-only terminal stop from tool_complete to success.
   const finalText = lastAssistantState && !lastAssistantState.hadTextContent ? "" : trackedFinalText;
   const latentStateError = !finalText ? readSessionStateErrorMessage(session) : null;
+  let attemptMutationQuarantine: MutationQuarantine | null = null;
+  try {
+    attemptMutationQuarantine = getMutationQuarantine(chatJid);
+  } catch {
+    attemptMutationQuarantine = null;
+  }
 
   const finalized = finalizePromptAttemptOutput({
     session,
@@ -1002,6 +1131,7 @@ async function runPromptAttempt(
     hadToolFailureAfterSoftStop: toolBudget.state.hadToolFailureAfterSoftStop,
     toolUseSoftStopApplied: toolBudget.state.toolUseSoftStopApplied,
     toolUseBudgetExceeded: toolBudget.state.toolUseBudgetExceeded,
+    mutationQuarantine: attemptMutationQuarantine,
     toolExecutionCount,
     assistantToolUseMessageCount,
     toolUseMessageBudget,
@@ -1014,9 +1144,14 @@ async function runPromptAttempt(
     getProgressWatchdogTimeoutMs,
     log,
   });
+  const completedTerminalRecovery = finalized.output.status === "success"
+    && (hadTerminalTurnOutput || lastAssistantState?.stopReason === "stop");
+  const mutationContainmentTerminal = completedTerminalRecovery && toolBudget.state.mutationQuarantined;
 
   return {
-    output: finalized.output,
+    output: mutationContainmentTerminal
+      ? { ...finalized.output, mutationContainmentTerminal: true }
+      : finalized.output,
     promptWasPersisted: didPromptAdvanceSession(session, baselineLeafId),
     timedOut,
     toolExecutionCount,
@@ -1071,6 +1206,15 @@ export async function runAgentPrompt(
     let session = runtime.session;
     session = await maybeAutoRotateSession(session, runtime, chatJid, { ...options, isCancelled });
     if (isCancelled()) return cancelledOutput();
+    let activeMutationQuarantine: MutationQuarantine | null = null;
+    try {
+      activeMutationQuarantine = getMutationQuarantine(chatJid);
+    } catch {
+      activeMutationQuarantine = null;
+    }
+    const effectivePrompt = activeMutationQuarantine
+      ? `${prompt}\n\n[Runtime safety containment: tool ${activeMutationQuarantine.toolName} repeated the same successful mutation ${activeMutationQuarantine.successfulRepetitions} times. Tools are disabled for this recovery turn. Give a concise terminal explanation of the containment action without claiming further side effects or exposing arguments.]`
+      : prompt;
     // Protected recovery/finalization attempts deliberately clear tools. An
     // ordinary subsequent turn must never inherit that empty set: it is not a
     // user-selectable steady state and otherwise makes the agent appear broken
@@ -1084,7 +1228,18 @@ export async function runAgentPrompt(
       && typeof ordinaryToolControl.getActiveToolNames === "function"
       && typeof ordinaryToolControl.setActiveToolsByName === "function") {
       const activeToolNames = ordinaryToolControl.getActiveToolNames();
-      if (activeToolNames.length > 0) {
+      if (activeMutationQuarantine) {
+        if (activeToolNames.length > 0) rememberActiveToolSubset(session, activeToolNames);
+        ordinaryToolControl.setActiveToolsByName([]);
+        logToolStateTransition({
+          chatJid,
+          turnId: runOptions.turnId,
+          phase: "ordinary_turn",
+          cause: "mutation_repetition_quarantine_resume",
+          previous: activeToolNames,
+          next: [],
+        });
+      } else if (activeToolNames.length > 0) {
         rememberActiveToolSubset(session, activeToolNames);
       } else {
         const rememberedToolNames = getRememberedActiveToolSubset(session);
@@ -1125,7 +1280,7 @@ export async function runAgentPrompt(
     });
     if (!runOptions.skipPrePromptCompaction) {
       let prePromptCompactionFailure: string | null = null;
-      const projectedPendingInputTokens = estimatePendingInputTokens(prompt);
+      const projectedPendingInputTokens = estimatePendingInputTokens(effectivePrompt);
       await maybeAutoCompactSessionBeforePrompt(session, chatJid, options, (event) => {
         const eventAny = event as { type?: string; errorMessage?: unknown };
         if (eventAny.type === "compaction_start") {
@@ -1196,7 +1351,7 @@ export async function runAgentPrompt(
       operation: "run_agent.prompt",
       chatJid,
       model: modelLabel,
-      promptLength: prompt.length,
+      promptLength: effectivePrompt.length,
       ...getRunObservabilityDetails(runOptions),
     });
 
@@ -1232,7 +1387,7 @@ export async function runAgentPrompt(
       : baseRecoveryConfig;
 
     const runResult: AgentOutput = await withChatContext(chatJid, channel, async () => await runAgentRecoveryPhase({
-      prompt,
+      prompt: effectivePrompt,
       chatJid,
       session,
       sessionCtrl,
@@ -1241,6 +1396,7 @@ export async function runAgentPrompt(
       modelLabel,
       recoveryConfig,
       runOptions,
+      mutationContainmentActive: activeMutationQuarantine !== null,
       logsDir: options.logsDir,
       onInfo: options.onInfo,
       onWarn: options.onWarn,
@@ -1306,6 +1462,36 @@ export async function runAgentPrompt(
         turnToolExecutionCount,
       ),
     }), { turnId: runOptions.turnId });
+
+    if (runResult.status === "success" && !runOptions.toolCeilingFilter) {
+      const completedToolControl = session as unknown as {
+        getActiveToolNames?: () => string[];
+        setActiveToolsByName?: (names: string[]) => void;
+      };
+      if (typeof completedToolControl.getActiveToolNames === "function"
+        && typeof completedToolControl.setActiveToolsByName === "function"
+        && completedToolControl.getActiveToolNames().length === 0) {
+        let quarantineStillActive = false;
+        try {
+          quarantineStillActive = getMutationQuarantine(chatJid) !== null;
+        } catch {
+          quarantineStillActive = true;
+        }
+        const rememberedToolNames = getRememberedActiveToolSubset(session);
+        if (!quarantineStillActive && rememberedToolNames) {
+          completedToolControl.setActiveToolsByName(rememberedToolNames);
+          logToolStateTransition({
+            chatJid,
+            turnId: runOptions.turnId,
+            phase: "terminal_recovery",
+            cause: "restore_after_quarantine_clear",
+            previous: [],
+            next: rememberedToolNames,
+            restored: true,
+          });
+        }
+      }
+    }
 
     return runResult;
   } catch (err) {
