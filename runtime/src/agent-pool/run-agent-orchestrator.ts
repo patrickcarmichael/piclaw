@@ -934,6 +934,10 @@ async function runPromptAttempt(
         status: "tool_complete",
         result: null,
         goalDeadlineCheckpoint: goalDeadlineCheckpointEvidence,
+        terminalCommit: {
+          kind: "already_committed",
+          source: "goal_deadline_checkpoint",
+        },
         abortCause: "goal_deadline_checkpoint",
         abortOperation: "start_prompt_timeout.goal_deadline_checkpoint",
       },

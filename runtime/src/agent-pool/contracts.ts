@@ -88,6 +88,12 @@ export interface GoalDeadlineCheckpointLatch {
   triggeredAt: string;
 }
 
+/** Typed proof that terminal persistence completed inside an earlier callback. */
+export interface AgentTerminalCommit {
+  kind: "already_committed";
+  source: "goal_deadline_checkpoint";
+}
+
 export interface AgentOutput {
   status: "success" | "error" | "tool_complete";
   result: string | null;
@@ -109,6 +115,8 @@ export interface AgentOutput {
   abortOperation?: string;
   /** Typed evidence that the web durable owner committed a pre-deadline Goal checkpoint. */
   goalDeadlineCheckpoint?: GoalDeadlineCheckpointEvidence;
+  /** Suppresses ordinary terminal persistence and ownerless post-turn maintenance. */
+  terminalCommit?: AgentTerminalCommit;
 }
 
 /** A single turn's output within a multi-turn agent run. */

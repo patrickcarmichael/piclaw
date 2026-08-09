@@ -8,6 +8,7 @@
 import { createHmac } from "node:crypto";
 import { expect, test, afterEach } from "bun:test";
 import { createTempWorkspace, setEnv, waitFor } from "../../helpers.js";
+import { createAgentPoolModelOptions } from "../../model-services-fixture.js";
 
 let restoreEnv: (() => void) | null = null;
 let cleanupWorkspace: (() => void) | null = null;
@@ -2983,6 +2984,186 @@ test("durable Goal deadline checkpoint commits one visible successor and replays
       .get("web:default") as any).toMatchObject({ count: 1 });
   } finally {
     unregister();
+  }
+});
+
+test("real AgentPool committed Goal checkpoint finalizes and wakes its durable successor exactly once", async () => {
+  const ws = createTempWorkspace("piclaw-web-channel-");
+  cleanupWorkspace = ws.cleanup;
+  restoreEnv = setEnv({
+    PICLAW_WORKSPACE: ws.workspace,
+    PICLAW_STORE: ws.store,
+    PICLAW_DATA: ws.data,
+    PICLAW_TURN_AUTO_RECOVERY_ENABLED: "0",
+    PICLAW_AUTO_COMPACTION_ENABLED: "1",
+  });
+
+  const db = await import("../../../src/db.js");
+  const runtime = await import("../../../src/addons/runtime-contributions.js");
+  const { AgentPool } = await import("../../../src/agent-pool.js");
+  const { getTrackedPhasesSnapshot } = await import("../../../src/runtime/progress-watchdog.js");
+  db.initDatabase();
+  db.getDb().exec("DELETE FROM chat_goal_continuation_intents; DELETE FROM message_media; DELETE FROM messages; DELETE FROM chats; DELETE FROM chat_cursors;");
+  db.storeChatMetadata("web:default", new Date().toISOString(), "Web");
+  const accepted = db.storeAcceptedChatMessageSource({
+    id: `msg-${crypto.randomUUID()}`,
+    chat_jid: "web:default",
+    sender: "user",
+    sender_name: "User",
+    content: "checkpoint this goal with the real pool",
+    timestamp: new Date().toISOString(),
+    is_from_me: false,
+    is_bot_message: false,
+  }).source;
+
+  let rejectPrompt!: (error: Error) => void;
+  let clearQueueCalls = 0;
+  let compactCalls = 0;
+  class CheckpointSession {
+    private listeners: Array<(event: any) => void> = [];
+    sessionManager = {
+      getLeafId: () => "real-goal-checkpoint-leaf",
+      getEntries: () => [{ type: "message", message: { role: "user" } }],
+    };
+    isStreaming = false;
+    isCompacting = false;
+    isRetrying = false;
+    subscribe(listener: (event: any) => void) {
+      this.listeners.push(listener);
+      return () => { this.listeners = this.listeners.filter((entry) => entry !== listener); };
+    }
+    bindExtensions() {}
+    getContextUsage() { return null; }
+    getSteeringMessages() { return []; }
+    getFollowUpMessages() { return []; }
+    clearQueue() { clearQueueCalls += 1; }
+    async prompt() {
+      this.isStreaming = true;
+      await new Promise<void>((_resolve, reject) => { rejectPrompt = reject; });
+    }
+    async abort() {
+      this.isStreaming = false;
+      rejectPrompt(new Error("checkpoint abort"));
+    }
+    async compact() { compactCalls += 1; }
+    dispose() {}
+  }
+
+  const session = new CheckpointSession();
+  const agentPool = new AgentPool({
+    ...createAgentPoolModelOptions(),
+    createSession: async () => ({
+      session,
+      cwd: "/workspace",
+      diagnostics: [],
+      services: {},
+      modelFallbackMessage: undefined,
+      newSession: async () => ({ cancelled: false }),
+      switchSession: async () => ({ cancelled: false }),
+      fork: async () => ({ cancelled: false }),
+      importFromJsonl: async () => ({ cancelled: false }),
+      dispose: async () => session.dispose(),
+    } as any),
+  });
+  (agentPool as any).turnCoordinator.startPromptTimeout = (
+    activeSession: CheckpointSession,
+    _chatJid: string,
+    timeoutMs: number,
+    goalDeadline: { oldTurnId: string; reserveMs: number; tryLatch: (latch: any) => boolean },
+  ) => {
+    const now = Date.now();
+    const latch = {
+      checkpointId: `checkpoint-${crypto.randomUUID()}`,
+      oldTurnId: goalDeadline.oldTurnId,
+      timeoutMs,
+      reserveMs: goalDeadline.reserveMs,
+      deadlineAt: new Date(now + 60_000).toISOString(),
+      triggeredAt: new Date(now).toISOString(),
+    };
+    expect(goalDeadline.tryLatch(latch)).toBe(true);
+    const settled = (async () => {
+      await Bun.sleep(0);
+      await activeSession.abort();
+      return {
+        ...latch,
+        settledAt: new Date().toISOString(),
+        settlement: "abort_requested" as const,
+        abortError: null,
+        pendingSteering: [],
+        pendingFollowUps: [],
+      };
+    })();
+    return {
+      timeoutId: null,
+      checkpointTimeoutId: null,
+      timedOutRef: { value: false },
+      completedRef: { value: false },
+      settled,
+      finish: async () => await settled,
+    };
+  };
+
+  let scheduled = 0;
+  let releases = 0;
+  const provider = {
+    tryLatch(input: any) {
+      return { ...input, goalId: "goal-real-pool", objective: "Checkpoint safely", planFingerprint: "plan-v1", expiresAt: new Date(Date.now() + 60_000).toISOString() };
+    },
+    revalidate(lease: any) {
+      return {
+        action: "continue" as const,
+        goalId: lease.goalId,
+        objective: lease.objective,
+        planFingerprint: "plan-v1",
+        visibleText: "Goal checkpoint committed once.",
+        continuationText: "Continue the checkpointed goal",
+      };
+    },
+    markScheduled() { scheduled += 1; },
+    release() { releases += 1; },
+    resolveContinuation() { return { status: "continue" as const, content: "Continue the checkpointed goal with tools" }; },
+  };
+  const unregister = runtime.registerAddonGoalDeadlineCheckpointProvider(provider);
+
+  try {
+    const webMod = await import("../../../src/channels/web.js");
+    const web = new (webMod.WebChannel as any)({ queue: { enqueue: () => {} }, agentPool });
+    let successorWakes = 0;
+    let doneStatuses = 0;
+    const originalBroadcastEvent = web.broadcastEvent.bind(web);
+    web.broadcastEvent = (event: string, payload: Record<string, unknown>) => {
+      if (event === "agent_status" && payload.type === "done") doneStatuses += 1;
+      return originalBroadcastEvent(event, payload);
+    };
+    web.resumeChat = (chatJid: string) => {
+      expect(chatJid).toBe("web:default");
+      successorWakes += 1;
+    };
+
+    await web.processChat("web:default", "default");
+
+    const successor = db.peekNextAcceptedChatSource("web:default");
+    expect(successor).toMatchObject({ sourceKind: "goal_continuation" });
+    expect(db.getChatOperationDisposition(accepted.sourceSeq)).toMatchObject({
+      outcome: "interrupted",
+      cause: "goal_deadline_checkpoint",
+    });
+    expect(db.getDb().prepare("SELECT COUNT(*) AS count FROM chat_operation_dispositions WHERE source_seq = ?")
+      .get(accepted.sourceSeq) as any).toMatchObject({ count: 1 });
+    expect(db.getDb().prepare(`SELECT COUNT(*) AS count FROM messages
+      WHERE chat_jid = ? AND is_bot_message = 1 AND is_terminal_agent_reply = 1 AND content = ?`)
+      .get("web:default", "Goal checkpoint committed once.") as any).toMatchObject({ count: 1 });
+    expect(scheduled).toBe(1);
+    expect(releases).toBe(1);
+    expect(clearQueueCalls).toBe(1);
+    expect(doneStatuses).toBe(1);
+    expect(successorWakes).toBe(1);
+    expect(compactCalls).toBe(0);
+    expect(db.getChatOperation("web:default")).toBeNull();
+    expect(getTrackedPhasesSnapshot().filter((entry) => entry.chatJid === "web:default")).toEqual([]);
+  } finally {
+    unregister();
+    await agentPool.shutdown();
   }
 });
 

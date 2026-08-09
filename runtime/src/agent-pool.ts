@@ -365,6 +365,9 @@ export class AgentPool {
     let terminalOutputCommitted = false;
     const output = await this.mutationGateway.run(chatJid, "prompt", sessionMutationAccess(options), async () => {
       const result = await this.runAgentOwned(prompt, chatJid, options);
+      if (result.terminalCommit?.kind === "already_committed") {
+        return result;
+      }
       if ((result.status === "success" || result.status === "tool_complete") && options.onTerminalOutput) {
         terminalOutputCommitted = await options.onTerminalOutput(result);
       } else if (result.requiresToolEnabledContinuation
