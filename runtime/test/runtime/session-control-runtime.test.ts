@@ -124,6 +124,7 @@ test("inspect exposes the resolved durable operation owner and cancellation stat
   });
 
   expect(result.ok).toBe(true);
+  expect(result.operation_id).toBe(operation.operationId);
   expect(result.before?.operation).toEqual({
     operation_id: operation.operationId,
     source_seq: operation.sourceSeq,
@@ -131,6 +132,23 @@ test("inspect exposes the resolved durable operation owner and cancellation stat
     generation: operation.generation,
     cancellation: null,
   });
+});
+
+test("assess_stuck exposes the same operation token used by guarded controls", async () => {
+  const agentName = `assess-${serial + 1}`;
+  const { chatJid, operation } = createOperation(agentName);
+  const harness = createHarness({ chatJid, agentName, active: true });
+
+  const result = await harness.handler({
+    action: "assess_stuck",
+    source_chat_jid: "web:source",
+    target_agent_name: agentName,
+  });
+
+  expect(result.ok).toBe(true);
+  expect(result.assessment).toBe("streaming");
+  expect(result.operation_id).toBe(operation.operationId);
+  expect(result.before?.operation).toMatchObject({ operation_id: operation.operationId });
 });
 
 test("abort is an explicit no-op when the inspected operation is absent or stale", async () => {

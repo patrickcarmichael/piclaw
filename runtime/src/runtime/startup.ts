@@ -424,9 +424,15 @@ export function createSessionControlHandler(agentPool: AgentPool, web: WebChanne
       target_session_tree: target.sessionTree,
     };
     const before = await buildSessionControlSnapshot(agentPool, target.chatJid);
+    const operationSnapshot = before.operation as Record<string, unknown> | null;
+    const operationId = typeof operationSnapshot?.operation_id === "string"
+      ? operationSnapshot.operation_id
+      : null;
 
-    if (request.action === "inspect") return { ok: true, ...base, before };
-    if (request.action === "assess_stuck") return { ok: true, ...base, before, assessment: assessSessionSnapshot(before) };
+    if (request.action === "inspect") return { ok: true, ...base, before, operation_id: operationId };
+    if (request.action === "assess_stuck") {
+      return { ok: true, ...base, before, assessment: assessSessionSnapshot(before), operation_id: operationId };
+    }
 
     const expectedOperationId = request.expected_operation_id?.trim() || "";
     const expectedNoOp = (): SessionControlResult | null => {
