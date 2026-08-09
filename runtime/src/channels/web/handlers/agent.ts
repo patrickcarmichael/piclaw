@@ -1302,9 +1302,14 @@ export async function handleAgentMessage(
               payloadRef: `message:${persistedMessageId}`,
             });
             if (registered.status === "rejected") throw new Error(`Steer intent ownership rejected: ${registered.reason}`);
+            const fencedReplay = registered.status === "existing" && getChatOperationSettlementFence(chatJid);
             return {
               sourceSeq: registered.source.sourceSeq,
-              queueEffect: registered.status === "deferred" ? "deferred" as const : "steer" as const,
+              queueEffect: registered.status === "deferred"
+                ? "deferred" as const
+                : fencedReplay
+                  ? "existing" as const
+                  : "steer" as const,
             };
           },
           onQueueFailure: (failure: { error?: string }, registration: { sourceSeq: number }) => {
@@ -1326,6 +1331,14 @@ export async function handleAgentMessage(
           },
         }
       : {});
+    if (steerResult.existing) {
+      return channel.json({
+        user_message: interaction,
+        thread_id: threadId,
+        queued: "steer",
+      }, 201);
+    }
+
     if (steerResult.deferred && steerResult.deferredSourceSeq) {
       broadcastNewPost();
       channel.broadcastEvent("agent_followup_queued", {

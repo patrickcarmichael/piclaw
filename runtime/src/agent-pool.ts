@@ -882,10 +882,17 @@ export class AgentPool {
     text: string,
     behavior: "steer" | "followUp",
     request: SessionMutationRequest & {
-      beforeQueue?: () => { sourceSeq: number; queueEffect?: "steer" | "deferred" };
+      beforeQueue?: () => { sourceSeq: number; queueEffect?: "steer" | "deferred" | "existing" };
       onQueueFailure?: (result: { queued: boolean; error?: string }, registration: { sourceSeq: number }) => void;
     } = {},
-  ): Promise<{ queued: boolean; deferred?: boolean; error?: string; operationIntentSourceSeq?: number; deferredSourceSeq?: number }> {
+  ): Promise<{
+    queued: boolean;
+    deferred?: boolean;
+    existing?: boolean;
+    error?: string;
+    operationIntentSourceSeq?: number;
+    deferredSourceSeq?: number;
+  }> {
     const access = sessionMutationAccess(request);
     if (access.scope === "legacy") {
       try {
@@ -902,7 +909,7 @@ export class AgentPool {
       return { queued: false, error: error.message };
     }
 
-    let registration: { sourceSeq: number; queueEffect?: "steer" | "deferred" } | null = null;
+    let registration: { sourceSeq: number; queueEffect?: "steer" | "deferred" | "existing" } | null = null;
     try {
       return await this.mutationGateway.compareAndActQueue(chatJid, access, () => {
         if (!request.beforeQueue) {
@@ -917,16 +924,22 @@ export class AgentPool {
         if (accepted.queueEffect === "deferred") {
           return { queued: false, deferred: true, deferredSourceSeq: accepted.sourceSeq };
         }
+        if (accepted.queueEffect === "existing") {
+          return { queued: true, existing: true, operationIntentSourceSeq: accepted.sourceSeq };
+        }
         const result = await this.runtimeFacade.queueStreamingMessage(chatJid, text, behavior, () => {
           this.mutationGateway.assertQueueEffect(chatJid, access);
         });
         if (!result.queued) request.onQueueFailure?.(result, accepted);
         return { ...result, operationIntentSourceSeq: accepted.sourceSeq };
-      }, (accepted) => accepted.queueEffect !== "deferred");
+      }, (accepted) => accepted.queueEffect !== "deferred" && accepted.queueEffect !== "existing");
     } catch (error) {
       if (error instanceof SessionMutationRejectedError) {
         const rejected = { queued: false as const, error: error.message };
-        const accepted = registration as { sourceSeq: number; queueEffect?: "steer" | "deferred" } | null;
+        const accepted = registration as {
+          sourceSeq: number;
+          queueEffect?: "steer" | "deferred" | "existing";
+        } | null;
         if (accepted) {
           request.onQueueFailure?.(rejected, accepted);
           return { ...rejected, operationIntentSourceSeq: accepted.sourceSeq };

@@ -200,10 +200,59 @@ test("settlement-fenced operation defers an admitted steer as durable prompt wit
   const owner = ownerOf(operation);
   const run = pool.runAgent("root", chatJid, { timeoutMs: 0, operationOwner: owner });
   await waitFor(() => promptStarted, 1_000);
+  db.storeMessage({
+    id: "pre-fence-steer",
+    chat_jid: chatJid,
+    sender: "user",
+    sender_name: "User",
+    content: "accepted before the checkpoint",
+    timestamp: "2026-08-09T10:09:59.000Z",
+    is_from_me: false,
+    is_bot_message: false,
+  });
+  const preFenceInput = {
+    sourceKind: "steer" as const,
+    sourceId: "pre-fence-steer",
+    acceptedAt: "2026-08-09T10:09:59.000Z",
+    payloadRef: "message:pre-fence-steer",
+  };
+  const admitted = await pool.queueStreamingMessage(chatJid, "accepted before the checkpoint", "steer", {
+    operationOwner: owner,
+    beforeQueue: () => {
+      const registered = db.registerChatOperationIntent(chatJid, owner, preFenceInput);
+      if (registered.status === "rejected") throw new Error(registered.reason);
+      return { sourceSeq: registered.source.sourceSeq, queueEffect: "steer" as const };
+    },
+  });
+  const preFenceSourceSeq = admitted.operationIntentSourceSeq;
+  expect(preFenceSourceSeq).toEqual(expect.any(Number));
+  expect(admitted.queued).toBe(true);
+  expect(steerEffects).toBe(1);
+
   expect(db.fenceChatOperationSettlement(chatJid, owner, {
     fenceId: "checkpoint-settlement-fence",
     fencedAt: "2026-08-09T10:10:00.000Z",
   }).status).toBe("fenced");
+  const replay = await pool.queueStreamingMessage(chatJid, "accepted before the checkpoint", "steer", {
+    operationOwner: owner,
+    beforeQueue: () => {
+      const registered = db.registerChatOperationIntent(chatJid, owner, preFenceInput);
+      if (registered.status === "rejected") throw new Error(registered.reason);
+      return {
+        sourceSeq: registered.source.sourceSeq,
+        queueEffect: registered.status === "existing" && db.getChatOperationSettlementFence(chatJid)
+          ? "existing" as const
+          : "steer" as const,
+      };
+    },
+  });
+  expect(replay).toEqual({
+    queued: true,
+    existing: true,
+    operationIntentSourceSeq: preFenceSourceSeq,
+  });
+  expect(steerEffects).toBe(1);
+
   db.storeMessage({
     id: "post-fence-steer",
     chat_jid: chatJid,
@@ -237,8 +286,10 @@ test("settlement-fenced operation defers an admitted steer as durable prompt wit
     deferred: true,
     deferredSourceSeq: expect.any(Number),
   });
-  expect(steerEffects).toBe(0);
-  expect(db.getPendingChatOperationIntentSources(operation.operationId)).toEqual([]);
+  expect(steerEffects).toBe(1);
+  const pendingIntentSources = db.getPendingChatOperationIntentSources(operation.operationId);
+  expect(pendingIntentSources.map((source: any) => source.sourceId)).toEqual(["pre-fence-steer"]);
+  expect(pendingIntentSources[0].sourceSeq).toBe(preFenceSourceSeq);
   expect(db.getAcceptedChatSource(result.deferredSourceSeq!)).toMatchObject({
     sourceClass: "prompt",
     sourceKind: "message",
@@ -267,6 +318,12 @@ test("settlement-fenced operation defers an admitted steer as durable prompt wit
       is_bot_message: true,
       is_terminal_agent_reply: true,
     } },
+    intentDispositions: [{
+      sourceSeq: preFenceSourceSeq!,
+      outcome: "succeeded",
+      cause: "normal",
+      provenance: "test_settlement_fence",
+    }],
   }).status).toBe("completed");
   await pool.shutdown();
   ws.cleanup();
