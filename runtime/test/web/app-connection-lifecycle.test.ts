@@ -55,9 +55,10 @@ test('handleUiVersionDriftEvent warns when auto-reload is not possible', () => {
   expect(toasts).toEqual(['New UI available']);
 });
 
-test('handleConnectionStatusChangeEvent clears active agent state on disconnect', () => {
+test('handleConnectionStatusChangeEvent preserves active agent state on transient disconnect', () => {
   const calls: string[] = [];
-  const pendingRequestRef = { current: { id: 1 } as unknown };
+  const pendingRequest = { id: 1 };
+  const pendingRequestRef = { current: pendingRequest as unknown };
 
   handleConnectionStatusChangeEvent({
     currentChatJid: 'chat:alpha',
@@ -70,7 +71,7 @@ test('handleConnectionStatusChangeEvent clears active agent state on disconnect'
     setPendingRequest: (request) => { calls.push(`pending:${request === null ? 'null' : 'set'}`); },
     pendingRequestRef,
     clearAgentRunState: () => { calls.push('clear'); },
-    hasConnectedOnceRef: { current: false },
+    hasConnectedOnceRef: { current: true },
     viewStateRef: { current: null },
     refreshTimeline: () => { calls.push('timeline'); },
     refreshAgentStatus: () => { calls.push('refresh-status'); },
@@ -78,16 +79,36 @@ test('handleConnectionStatusChangeEvent clears active agent state on disconnect'
     refreshContextUsage: () => { calls.push('refresh-context'); },
   });
 
-  expect(calls).toEqual([
-    'conn:disconnected',
-    'status:null',
-    'draft',
-    'plan',
-    'thought',
-    'pending:null',
-    'clear',
-  ]);
-  expect(pendingRequestRef.current).toBeNull();
+  expect(calls).toEqual(['conn:disconnected']);
+  expect(pendingRequestRef.current).toBe(pendingRequest);
+});
+
+test('handleConnectionStatusChangeEvent delegates reconnect status reconciliation to SSE', () => {
+  const calls: string[] = [];
+  const pendingRequest = { id: 1 };
+  const pendingRequestRef = { current: pendingRequest as unknown };
+
+  handleConnectionStatusChangeEvent({
+    currentChatJid: 'chat:alpha',
+    status: 'connected',
+    setConnectionStatus: (status) => { calls.push(`conn:${status}`); },
+    setAgentStatus: () => { calls.push('status'); },
+    setAgentDraft: () => { calls.push('draft'); },
+    setAgentPlan: () => { calls.push('plan'); },
+    setAgentThought: () => { calls.push('thought'); },
+    setPendingRequest: () => { calls.push('pending'); },
+    pendingRequestRef,
+    clearAgentRunState: () => { calls.push('clear'); },
+    hasConnectedOnceRef: { current: true },
+    viewStateRef: { current: { currentHashtag: null, searchQuery: null, searchOpen: false } },
+    refreshTimeline: () => { calls.push('timeline'); },
+    refreshAgentStatus: () => { calls.push('unguarded-status'); },
+    refreshQueueState: () => { calls.push('queue'); },
+    refreshContextUsage: () => { calls.push('context'); },
+  });
+
+  expect(calls).toEqual(['conn:connected', 'timeline', 'queue', 'context']);
+  expect(pendingRequestRef.current).toBe(pendingRequest);
 });
 
 test('handleConnectionStatusChangeEvent skips the initial reconnect bundle during a fresh cold-open activation', () => {
@@ -121,6 +142,42 @@ test('handleConnectionStatusChangeEvent skips the initial reconnect bundle durin
     'thought',
     'pending',
     'clear',
+  ]);
+});
+
+test('handleConnectionStatusChangeEvent leaves cold-open status reconciliation to SSE', () => {
+  const calls: string[] = [];
+
+  handleConnectionStatusChangeEvent({
+    currentChatJid: 'chat:alpha',
+    status: 'connected',
+    setConnectionStatus: (status) => { calls.push(`conn:${status}`); },
+    setAgentStatus: () => { calls.push('status-state'); },
+    setAgentDraft: () => { calls.push('draft'); },
+    setAgentPlan: () => { calls.push('plan'); },
+    setAgentThought: () => { calls.push('thought'); },
+    setPendingRequest: () => { calls.push('pending'); },
+    pendingRequestRef: { current: null },
+    clearAgentRunState: () => { calls.push('clear'); },
+    hasConnectedOnceRef: { current: false },
+    viewStateRef: { current: { currentHashtag: null, searchQuery: null, searchOpen: false } },
+    refreshTimeline: () => { calls.push('timeline'); },
+    refreshAgentStatus: () => { calls.push('unguarded-status'); },
+    refreshQueueState: () => { calls.push('queue'); },
+    refreshContextUsage: () => { calls.push('context'); },
+  });
+
+  expect(calls).toEqual([
+    'conn:connected',
+    'status-state',
+    'draft',
+    'plan',
+    'thought',
+    'pending',
+    'clear',
+    'timeline',
+    'queue',
+    'context',
   ]);
 });
 

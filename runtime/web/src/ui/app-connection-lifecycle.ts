@@ -100,20 +100,15 @@ export function handleConnectionStatusChangeEvent(options: HandleConnectionStatu
     hasConnectedOnceRef,
     viewStateRef,
     refreshTimeline,
-    refreshAgentStatus,
     refreshQueueState,
     refreshContextUsage,
   } = options;
 
   setConnectionStatus(status);
   if (status !== 'connected') {
-    setAgentStatus(null);
-    setAgentDraft({ text: '', totalLines: 0 });
-    setAgentPlan('');
-    setAgentThought({ text: '', totalLines: 0 });
-    setPendingRequest(null);
-    pendingRequestRef.current = null;
-    clearAgentRunState();
+    // A transient disconnect is not authoritative turn completion. Keep live
+    // previews and approvals visible until reconnect status confirms the run
+    // ended, instead of making the Draft pane disappear on network changes.
     return;
   }
 
@@ -130,7 +125,8 @@ export function handleConnectionStatusChangeEvent(options: HandleConnectionStatu
     if (shouldRefreshMainTimeline(viewStateRef.current)) {
       refreshTimeline();
     }
-    refreshAgentStatus();
+    // The server's guaranteed `connected` SSE event owns agent-status
+    // reconciliation so its request can be invalidated by newer turn events.
     refreshQueueState();
     refreshContextUsage();
     return;
@@ -139,7 +135,6 @@ export function handleConnectionStatusChangeEvent(options: HandleConnectionStatu
   if (shouldRefreshMainTimeline(viewStateRef.current)) {
     refreshTimeline();
   }
-  refreshAgentStatus();
   refreshQueueState();
   refreshContextUsage();
 }
