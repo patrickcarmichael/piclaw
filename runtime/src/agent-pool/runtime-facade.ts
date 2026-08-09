@@ -839,6 +839,7 @@ export class AgentRuntimeFacade {
     chatJid: string,
     text: string,
     behavior: "steer" | "followUp",
+    beforeQueueEffect?: () => void,
   ): Promise<{ queued: boolean; error?: string }> {
     const session = (await this.options.getOrCreateRuntime(chatJid)).session;
     if (!session.isStreaming) return { queued: false };
@@ -847,9 +848,18 @@ export class AgentRuntimeFacade {
     try {
       return await withChatContext(chatJid, channel, async () => {
         if (behavior === "followUp") {
+          beforeQueueEffect?.();
           await promptWithContextPressureRetry(session, text, { streamingBehavior: "followUp" });
+        } else if (beforeQueueEffect) {
+          if (!session.isStreaming) return { queued: false };
+          beforeQueueEffect();
+          // AgentSession.steer expands synchronously and reaches its queue effect
+          // before its returned promise can yield; prompt() has async extension hooks.
+          await session.steer(text);
         } else {
-          await session.prompt(text, { streamingBehavior: behavior });
+          // Preserve legacy steer interception and command behavior. Durable
+          // operation steers exclusively use the guarded branch above.
+          await session.prompt(text, { streamingBehavior: "steer" });
         }
         return { queued: true };
       });

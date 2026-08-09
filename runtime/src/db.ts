@@ -156,7 +156,9 @@ export {
   acceptStoredChatMessageSource,
   storeAcceptedChatMessageSource,
   registerChatOperationIntent,
+  disposeChatOperationIntent,
   getChatOperationIntentSources,
+  getPendingChatOperationIntentSources,
   getAcceptedChatSource,
   getProtectedContinuationRootSource,
   getGoalContinuationLineage,
@@ -199,6 +201,7 @@ export type {
   GoalContinuationLineage,
   ChatOperationCompletionResult,
   ChatOperationMessageBindResult,
+  ChatOperationIntentDispositionResult,
   TerminalArtifactPolicy,
 } from "./db/chat-operations.js";
 export {

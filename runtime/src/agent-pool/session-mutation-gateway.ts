@@ -44,6 +44,9 @@ export interface SessionMutationRequest {
 
 export type SessionMutationRejectionReason = ChatOperationMismatch
   | "legacy_conflict"
+  | "operation_cancelled"
+  | "operation_intent_required"
+  | "operation_queue_behavior_mismatch"
   | "operation_mutation_forbidden"
   | "active_mutation_mismatch";
 
@@ -62,6 +65,11 @@ export class SessionMutationRejectedError extends Error {
 interface SessionMutationContext {
   chatJid: string;
   access: SessionMutationAccess;
+}
+
+interface ActiveSessionMutation {
+  access: SessionMutationAccess;
+  mutation: Exclude<SessionMutationClass, "abort">;
 }
 
 export interface SessionMutationGatewayOptions {
@@ -93,7 +101,9 @@ function sameOwner(left: ChatOperationOwner, right: ChatOperationOwner): boolean
 export class SessionMutationGateway {
   private readonly context = new AsyncLocalStorage<SessionMutationContext>();
   private readonly tails = new Map<string, Promise<void>>();
-  private readonly activeAccessByChat = new Map<string, SessionMutationAccess>();
+  private readonly queueTails = new Map<string, Promise<void>>();
+  private readonly activeMutationByChat = new Map<string, ActiveSessionMutation>();
+  private readonly queueAdmissionOpen = new Set<string>();
   private readonly getOperation: (chatJid: string) => ChatOperationState | null;
 
   constructor(options: SessionMutationGatewayOptions = {}) {
@@ -103,6 +113,10 @@ export class SessionMutationGateway {
   currentAccess(chatJid: string): SessionMutationAccess | null {
     const current = this.context.getStore();
     return current?.chatJid === chatJid ? current.access : null;
+  }
+
+  hasPendingQueue(chatJid: string): boolean {
+    return this.queueTails.has(chatJid);
   }
 
   async run<T>(
@@ -120,7 +134,17 @@ export class SessionMutationGateway {
         throw new SessionMutationRejectedError(chatJid, mutation, "generation_mismatch");
       }
       this.assertAccess(chatJid, mutation, access);
-      return await action();
+      const previous = this.activeMutationByChat.get(chatJid);
+      const active: ActiveSessionMutation = { access, mutation };
+      this.activeMutationByChat.set(chatJid, active);
+      try {
+        return await action();
+      } finally {
+        if (this.activeMutationByChat.get(chatJid) === active) {
+          if (previous) this.activeMutationByChat.set(chatJid, previous);
+          else this.activeMutationByChat.delete(chatJid);
+        }
+      }
     }
 
     // Fail fast instead of waiting behind an operation the caller cannot own.
@@ -136,10 +160,19 @@ export class SessionMutationGateway {
     try {
       // Ownership can change while this mutation waits behind the prior one.
       this.assertAccess(chatJid, mutation, access);
-      this.activeAccessByChat.set(chatJid, access);
-      return await this.context.run({ chatJid, access }, action);
+      const active: ActiveSessionMutation = { access, mutation };
+      this.activeMutationByChat.set(chatJid, active);
+      if (mutation === "prompt") this.queueAdmissionOpen.add(chatJid);
+      try {
+        return await this.context.run({ chatJid, access }, action);
+      } finally {
+        if (mutation === "prompt") {
+          this.queueAdmissionOpen.delete(chatJid);
+          await this.queueTails.get(chatJid)?.catch(() => undefined);
+        }
+        if (this.activeMutationByChat.get(chatJid) === active) this.activeMutationByChat.delete(chatJid);
+      }
     } finally {
-      if (this.activeAccessByChat.get(chatJid) === access) this.activeAccessByChat.delete(chatJid);
       release();
       if (this.tails.get(chatJid) === tail) {
         void tail.finally(() => {
@@ -163,11 +196,56 @@ export class SessionMutationGateway {
     action: () => Promise<T> | T,
   ): Promise<T> {
     this.assertAccess(chatJid, "abort", access);
-    const activeAccess = this.activeAccessByChat.get(chatJid);
-    if (!activeAccess || !this.isSameAccess(activeAccess, access)) {
-      throw new SessionMutationRejectedError(chatJid, "abort", "active_mutation_mismatch");
-    }
+    this.assertActiveOccupant(chatJid, "abort", access);
     return await this.context.run({ chatJid, access }, action);
+  }
+
+  /**
+   * Queue one steer into the exact operation currently occupying the prompt
+   * lane without waiting behind that prompt. Durable registration runs first;
+   * ownership and lane occupancy are then compared again immediately before
+   * the SDK queue effect.
+   */
+  async compareAndActQueue<T, R>(
+    chatJid: string,
+    access: SessionMutationAccess,
+    beforeQueue: () => R,
+    action: (registration: R) => Promise<T> | T,
+  ): Promise<T> {
+    this.assertQueueAdmission(chatJid, access);
+    const previous = this.queueTails.get(chatJid) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const tail = previous.catch(() => undefined).then(() => gate);
+    this.queueTails.set(chatJid, tail);
+    await previous.catch(() => undefined);
+    try {
+      this.assertQueueAdmission(chatJid, access);
+      const registration = beforeQueue();
+      this.assertQueueEffect(chatJid, access);
+      return await this.context.run({ chatJid, access }, () => action(registration));
+    } finally {
+      release();
+      if (this.queueTails.get(chatJid) === tail) {
+        void tail.finally(() => {
+          if (this.queueTails.get(chatJid) === tail) this.queueTails.delete(chatJid);
+        });
+      }
+    }
+  }
+
+  private assertQueueAdmission(chatJid: string, access: SessionMutationAccess): void {
+    this.assertOutOfBandQueueAccess(chatJid, access);
+    this.assertActiveOccupant(chatJid, "queue", access, "prompt");
+    if (!this.queueAdmissionOpen.has(chatJid)) {
+      throw new SessionMutationRejectedError(chatJid, "queue", "active_mutation_mismatch");
+    }
+  }
+
+  /** Exact synchronous guard invoked after runtime acquisition and immediately before SDK queueing. */
+  assertQueueEffect(chatJid: string, access: SessionMutationAccess): void {
+    this.assertOutOfBandQueueAccess(chatJid, access);
+    this.assertActiveOccupant(chatJid, "queue", access, "prompt");
   }
 
   /**
@@ -187,8 +265,8 @@ export class SessionMutationGateway {
     const cancellation = cancel();
     if (!cancellationApplied(cancellation)) return { cancellation, acted: false };
 
-    const activeAccess = this.activeAccessByChat.get(chatJid);
-    if (!activeAccess || !this.isSameAccess(activeAccess, access)) {
+    const active = this.activeMutationByChat.get(chatJid);
+    if (!active || !this.isSameAccess(active.access, access)) {
       return { cancellation, acted: false };
     }
     const result = await this.context.run({ chatJid, access }, action);
@@ -198,6 +276,29 @@ export class SessionMutationGateway {
   private isSameAccess(left: SessionMutationAccess, right: SessionMutationAccess): boolean {
     if (left.scope !== right.scope) return false;
     return left.scope === "legacy" || (right.scope === "operation" && sameOwner(left.owner, right.owner));
+  }
+
+  private assertActiveOccupant(
+    chatJid: string,
+    mutation: SessionMutationClass,
+    access: SessionMutationAccess,
+    requiredMutation?: ActiveSessionMutation["mutation"],
+  ): void {
+    const active = this.activeMutationByChat.get(chatJid);
+    if (!active || !this.isSameAccess(active.access, access) || (requiredMutation && active.mutation !== requiredMutation)) {
+      throw new SessionMutationRejectedError(chatJid, mutation, "active_mutation_mismatch");
+    }
+  }
+
+  private assertOutOfBandQueueAccess(chatJid: string, access: SessionMutationAccess): void {
+    if (access.scope === "legacy") {
+      this.assertAccess(chatJid, "queue", access);
+      return;
+    }
+    const active = this.getOperation(chatJid);
+    const comparison = compareChatOperationOwner(active, access.owner);
+    if (!comparison.ok) throw new SessionMutationRejectedError(chatJid, "queue", comparison.reason);
+    if (active!.cancellation) throw new SessionMutationRejectedError(chatJid, "queue", "operation_cancelled");
   }
 
   private assertAccess(

@@ -5,6 +5,8 @@ import { join } from "node:path";
 import type { AgentSessionRuntime } from "@earendil-works/pi-coding-agent";
 import { clearProviderUsageCache, peekProviderUsage } from "../../src/agent-pool/provider-usage.js";
 import { AgentRuntimeFacade } from "../../src/agent-pool/runtime-facade.js";
+import { SessionMutationGateway } from "../../src/agent-pool/session-mutation-gateway.js";
+import type { ChatOperationState } from "../../src/db.js";
 import { SESSIONS_DIR } from "../../src/core/config.js";
 import { sanitiseJid } from "../../src/agent-pool/session.js";
 import { initDatabase } from "../../src/db.js";
@@ -613,6 +615,203 @@ test("AgentRuntimeFacade compacts and retries context pressure while queueing fo
   expect(prompts).toEqual([
     { text: "continue", behavior: "followUp" },
     { text: "continue", behavior: "followUp" },
+  ]);
+});
+
+test("AgentRuntimeFacade preserves the legacy prompt-based steer path", async () => {
+  const prompts: Array<{ text: string; behavior: string }> = [];
+  let directSteerEffects = 0;
+  const session = {
+    isStreaming: true,
+    steer: async () => { directSteerEffects += 1; },
+    prompt: async (text: string, options?: { streamingBehavior?: string }) => {
+      prompts.push({ text, behavior: options?.streamingBehavior ?? "" });
+    },
+  };
+  const fixture = createFacade();
+  fixture.pool.set("web:legacy-steer", { runtime: createRuntime(session), lastUsed: Date.now() });
+
+  await expect(fixture.facade.queueStreamingMessage("web:legacy-steer", "legacy steer", "steer"))
+    .resolves.toEqual({ queued: true });
+  expect(prompts).toEqual([{ text: "legacy steer", behavior: "steer" }]);
+  expect(directSteerEffects).toBe(0);
+});
+
+test("AgentRuntimeFacade runs the exact-owner guard after deferred runtime acquisition and before SDK queueing", async () => {
+  let resolveRuntime!: (runtime: AgentSessionRuntime) => void;
+  const runtimeAcquisition = new Promise<AgentSessionRuntime>((resolve) => { resolveRuntime = resolve; });
+  let acquisitionStarted!: () => void;
+  const acquisitionStart = new Promise<void>((resolve) => { acquisitionStarted = resolve; });
+  let steerEffects = 0;
+  let ordinaryPromptEffects = 0;
+  const session = {
+    isStreaming: true,
+    steer: async () => { steerEffects += 1; },
+    prompt: async () => { ordinaryPromptEffects += 1; },
+  };
+  const fixture = createFacade({
+    getOrCreateRuntime: async () => {
+      acquisitionStarted();
+      return runtimeAcquisition;
+    },
+  });
+  let active: ChatOperationState = {
+    chatJid: "web:deferred-queue",
+    operationId: "op-deferred",
+    sourceSeq: 71,
+    phase: "running",
+    generation: 0,
+    cancellation: null,
+  };
+  const originalOwner = {
+    operationId: active.operationId,
+    sourceSeq: active.sourceSeq,
+    phase: active.phase,
+    generation: active.generation,
+  };
+  const access = { scope: "operation" as const, owner: originalOwner };
+  const gateway = new SessionMutationGateway({ getOperation: () => active });
+  let releasePrompt!: () => void;
+  const promptRelease = new Promise<void>((resolve) => { releasePrompt = resolve; });
+  let promptEntered!: () => void;
+  const promptEntry = new Promise<void>((resolve) => { promptEntered = resolve; });
+  const prompt = gateway.run(active.chatJid, "prompt", access, async () => {
+    promptEntered();
+    await promptRelease;
+  });
+  await promptEntry;
+
+  const queued = gateway.compareAndActQueue(active.chatJid, access, () => ({ sourceSeq: 72 }), () => (
+    fixture.facade.queueStreamingMessage(active.chatJid, "too late", "steer", () => {
+      gateway.assertQueueEffect(active.chatJid, access);
+    })
+  ));
+  await acquisitionStart;
+  active = { ...active, phase: "blocked", generation: 1 };
+  resolveRuntime(createRuntime(session));
+
+  await expect(queued).resolves.toMatchObject({ queued: false, error: expect.stringContaining("phase_mismatch") });
+  expect(steerEffects).toBe(0);
+  expect(ordinaryPromptEffects).toBe(0);
+  releasePrompt();
+  await prompt;
+});
+
+test("AgentRuntimeFacade uses the synchronous-pre-effect steer path instead of async prompt preflight", async () => {
+  let steerEffects = 0;
+  let promptPreflights = 0;
+  const session = {
+    isStreaming: true,
+    steer: async () => { steerEffects += 1; },
+    prompt: async () => {
+      promptPreflights += 1;
+      await Bun.sleep(10);
+    },
+  };
+  const fixture = createFacade();
+  fixture.pool.set("web:direct-steer", { runtime: createRuntime(session), lastUsed: Date.now() });
+  let guards = 0;
+
+  await expect(fixture.facade.queueStreamingMessage("web:direct-steer", "steer now", "steer", () => {
+    guards += 1;
+  })).resolves.toEqual({ queued: true });
+  expect(guards).toBe(1);
+  expect(steerEffects).toBe(1);
+  expect(promptPreflights).toBe(0);
+});
+
+test("operation-owned slash steer fails truthfully without extension-command prompt fallback", async () => {
+  let ordinaryPromptEffects = 0;
+  let steerAttempts = 0;
+  const session = {
+    isStreaming: true,
+    steer: async (text: string) => {
+      steerAttempts += 1;
+      throw new Error(`Cannot queue command: ${text}`);
+    },
+    prompt: async () => { ordinaryPromptEffects += 1; },
+  };
+  const fixture = createFacade();
+  fixture.pool.set("web:slash-steer", { runtime: createRuntime(session), lastUsed: Date.now() });
+  let guards = 0;
+
+  await expect(fixture.facade.queueStreamingMessage("web:slash-steer", "/extension-command", "steer", () => {
+    guards += 1;
+  })).resolves.toEqual({ queued: false, error: "Cannot queue command: /extension-command" });
+  expect(guards).toBe(1);
+  expect(steerAttempts).toBe(1);
+  expect(ordinaryPromptEffects).toBe(0);
+});
+
+test("operation steer reports a missing SDK steer API without prompt fallback", async () => {
+  let ordinaryPromptEffects = 0;
+  const session = {
+    isStreaming: true,
+    prompt: async () => { ordinaryPromptEffects += 1; },
+  };
+  const fixture = createFacade();
+  fixture.pool.set("web:missing-steer", { runtime: createRuntime(session), lastUsed: Date.now() });
+  let guards = 0;
+
+  const result = await fixture.facade.queueStreamingMessage("web:missing-steer", "cannot queue", "steer", () => {
+    guards += 1;
+  });
+  expect(result.queued).toBe(false);
+  expect(result.error).toContain("steer");
+  expect(guards).toBe(1);
+  expect(ordinaryPromptEffects).toBe(0);
+});
+
+test("operation steer cannot cross an async prompt boundary into a stale ordinary-prompt fallback", async () => {
+  let releasePrompt!: () => void;
+  const promptGate = new Promise<void>((resolve) => { releasePrompt = resolve; });
+  let promptEntered!: () => void;
+  const promptEntry = new Promise<void>((resolve) => { promptEntered = resolve; });
+  let streaming = true;
+  let ordinaryPromptEffects = 0;
+  let steerEffects = 0;
+  const order: string[] = [];
+  const session = {
+    get isStreaming() { return streaming; },
+    prompt: async () => {
+      order.push("legacy-prompt-enter");
+      promptEntered();
+      await promptGate;
+      if (!streaming) {
+        order.push("legacy-ordinary-prompt-fallback");
+        ordinaryPromptEffects += 1;
+      }
+    },
+    steer: async () => {
+      order.push("steer-effect");
+      steerEffects += 1;
+    },
+  };
+  const fixture = createFacade();
+  fixture.pool.set("web:stale-steer", { runtime: createRuntime(session), lastUsed: Date.now() });
+
+  order.push("legacy-owner-guard");
+  const unsafeOldPath = session.prompt();
+  await promptEntry;
+  streaming = false;
+  order.push("legacy-owner-released");
+  releasePrompt();
+  await unsafeOldPath;
+  expect(ordinaryPromptEffects).toBe(1);
+
+  streaming = true;
+  await expect(fixture.facade.queueStreamingMessage("web:stale-steer", "safe steer", "steer", () => {
+    order.push("exact-owner-guard");
+  })).resolves.toEqual({ queued: true });
+  expect(steerEffects).toBe(1);
+  expect(ordinaryPromptEffects).toBe(1);
+  expect(order).toEqual([
+    "legacy-owner-guard",
+    "legacy-prompt-enter",
+    "legacy-owner-released",
+    "legacy-ordinary-prompt-fallback",
+    "exact-owner-guard",
+    "steer-effect",
   ]);
 });
 

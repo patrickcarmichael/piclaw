@@ -870,19 +870,63 @@ export class AgentPool {
     return this.branchManager.getAgentHandleForChat(chatJid);
   }
 
+  hasPendingStreamingQueue(chatJid: string): boolean {
+    return this.mutationGateway.hasPendingQueue(chatJid);
+  }
+
   async queueStreamingMessage(
     chatJid: string,
     text: string,
     behavior: "steer" | "followUp",
-    request: SessionMutationRequest & { beforeQueue?: () => void } = {},
-  ): Promise<{ queued: boolean; error?: string }> {
+    request: SessionMutationRequest & {
+      beforeQueue?: () => { sourceSeq: number };
+      onQueueFailure?: (result: { queued: boolean; error?: string }, registration: { sourceSeq: number }) => void;
+    } = {},
+  ): Promise<{ queued: boolean; error?: string; operationIntentSourceSeq?: number }> {
+    const access = sessionMutationAccess(request);
+    if (access.scope === "legacy") {
+      try {
+        return await this.mutationGateway.run(chatJid, "queue", access, () => (
+          this.runtimeFacade.queueStreamingMessage(chatJid, text, behavior)
+        ));
+      } catch (error) {
+        if (error instanceof SessionMutationRejectedError) return { queued: false, error: error.message };
+        throw error;
+      }
+    }
+    if (behavior !== "steer") {
+      const error = new SessionMutationRejectedError(chatJid, "queue", "operation_queue_behavior_mismatch");
+      return { queued: false, error: error.message };
+    }
+
+    let registration: { sourceSeq: number } | null = null;
     try {
-      return await this.mutationGateway.run(chatJid, "queue", sessionMutationAccess(request), () => {
-        request.beforeQueue?.();
-        return this.runtimeFacade.queueStreamingMessage(chatJid, text, behavior);
+      return await this.mutationGateway.compareAndActQueue(chatJid, access, () => {
+        if (!request.beforeQueue) {
+          throw new SessionMutationRejectedError(chatJid, "queue", "operation_intent_required");
+        }
+        registration = request.beforeQueue();
+        if (!Number.isSafeInteger(registration.sourceSeq) || registration.sourceSeq <= 0) {
+          throw new Error("Durable queue registration must return a positive source sequence");
+        }
+        return registration;
+      }, async (accepted) => {
+        const result = await this.runtimeFacade.queueStreamingMessage(chatJid, text, behavior, () => {
+          this.mutationGateway.assertQueueEffect(chatJid, access);
+        });
+        if (!result.queued) request.onQueueFailure?.(result, accepted);
+        return { ...result, operationIntentSourceSeq: accepted.sourceSeq };
       });
     } catch (error) {
-      if (error instanceof SessionMutationRejectedError) return { queued: false, error: error.message };
+      if (error instanceof SessionMutationRejectedError) {
+        const rejected = { queued: false as const, error: error.message };
+        const accepted = registration as { sourceSeq: number } | null;
+        if (accepted) {
+          request.onQueueFailure?.(rejected, accepted);
+          return { ...rejected, operationIntentSourceSeq: accepted.sourceSeq };
+        }
+        return rejected;
+      }
       throw error;
     }
   }

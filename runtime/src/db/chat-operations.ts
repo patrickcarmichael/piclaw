@@ -95,6 +95,10 @@ export type ChatOperationMessageBindResult =
   | { status: "bound" }
   | { status: "rejected"; reason: ChatOperationMismatch | "message_missing" | "message_operation_mismatch" };
 
+export type ChatOperationIntentDispositionResult =
+  | { status: "disposed" | "repeated"; disposition: ChatOperationDisposition }
+  | { status: "rejected"; reason: ChatOperationMismatch | "operation_cancelled"; operation: ChatOperationState | null };
+
 export type ChatOperationCompletionBoundary = "artifact" | "successor" | "intents" | "disposition" | "frontier" | "release";
 export interface ChatOperationCompletionHooks {
   /** Synchronous transactional revalidation. Throwing rolls back every write. */
@@ -341,6 +345,14 @@ export function getChatOperationIntentSources(operationId: string): AcceptedChat
   if (!operationId.trim()) return [];
   return (getDb().prepare(`SELECT * FROM chat_accepted_sources
     WHERE operation_id = ? AND selectable = 0 ORDER BY source_seq`).all(operationId) as SourceRow[]).map(sourceFromRow);
+}
+
+export function getPendingChatOperationIntentSources(operationId: string): AcceptedChatSource[] {
+  if (!operationId.trim()) return [];
+  return (getDb().prepare(`SELECT s.* FROM chat_accepted_sources s
+    WHERE s.operation_id = ? AND s.selectable = 0
+      AND NOT EXISTS (SELECT 1 FROM chat_operation_dispositions d WHERE d.source_seq = s.source_seq)
+    ORDER BY s.source_seq`).all(operationId) as SourceRow[]).map(sourceFromRow);
 }
 
 export function getAcceptedChatSource(sourceSeq: number): AcceptedChatSource | null {
@@ -693,6 +705,43 @@ function insertDisposition(source: AcceptedChatSource, operationId: string, outc
   return getChatOperationDisposition(source.sourceSeq)!;
 }
 
+/** Settle one accepted intent after its external queue effect failed. */
+export function disposeChatOperationIntent(
+  chatJid: string,
+  owner: ChatOperationOwner,
+  request: { sourceSeq: number; outcome: ChatOperationOutcome; cause: string; provenance: string; createdAt: string },
+): ChatOperationIntentDispositionResult {
+  if (!Number.isSafeInteger(request.sourceSeq) || request.sourceSeq <= 0
+    || !request.cause.trim() || !request.provenance.trim() || !request.createdAt.trim()) {
+    throw new ChatOperationInvariantError("Intent disposition fields are invalid");
+  }
+  const db = getDb();
+  return db.transaction(() => {
+    const active = getChatOperation(chatJid);
+    const comparison = compareChatOperationOwner(active, owner);
+    if (!comparison.ok) return { status: "rejected", reason: comparison.reason, operation: active } as const;
+    if (active!.cancellation) return { status: "rejected", reason: "operation_cancelled", operation: active } as const;
+    const source = getAcceptedChatSource(request.sourceSeq);
+    if (!source || source.chatJid !== chatJid || source.sourceClass !== "intent"
+      || source.sourceKind !== "steer" || source.operationId !== active!.operationId) {
+      throw new ChatOperationInvariantError("Intent does not belong to active operation");
+    }
+    const existing = getChatOperationDisposition(source.sourceSeq);
+    if (existing) {
+      if (existing.operationId !== active!.operationId || existing.outcome !== request.outcome
+        || existing.cause !== request.cause || existing.provenance !== request.provenance) {
+        throw new ChatOperationInvariantError("Conflicting repeated intent disposition");
+      }
+      return { status: "repeated", disposition: existing } as const;
+    }
+    return {
+      status: "disposed",
+      disposition: insertDisposition(source, active!.operationId, request.outcome, request.cause,
+        request.provenance, request.createdAt, null),
+    } as const;
+  }).immediate();
+}
+
 export function skipBlockedChatOperation(
   chatJid: string,
   owner: ChatOperationOwner,
@@ -710,8 +759,10 @@ export function skipBlockedChatOperation(
         return { status: "rejected", reason: "phase_mismatch", operation: active } as const;
       }
     }
-    const intentDispositions = (db.prepare(`SELECT source_seq FROM chat_accepted_sources
-      WHERE operation_id = ? AND selectable = 0 ORDER BY source_seq`).all(owner.operationId) as Array<{ source_seq: number }>)
+    const intentDispositions = (db.prepare(`SELECT s.source_seq FROM chat_accepted_sources s
+      WHERE s.operation_id = ? AND s.selectable = 0
+        AND NOT EXISTS (SELECT 1 FROM chat_operation_dispositions d WHERE d.source_seq = s.source_seq)
+      ORDER BY s.source_seq`).all(owner.operationId) as Array<{ source_seq: number }>)
       .map(({ source_seq: sourceSeq }) => ({
         sourceSeq,
         outcome: "skipped" as const,
@@ -918,8 +969,10 @@ export function completeChatOperation(
     }
     hooks.afterWrite?.("successor");
 
-    const pendingIntentRows = db.prepare(`SELECT source_seq FROM chat_accepted_sources
-      WHERE operation_id = ? AND selectable = 0 ORDER BY source_seq`)
+    const pendingIntentRows = db.prepare(`SELECT s.source_seq FROM chat_accepted_sources s
+      WHERE s.operation_id = ? AND s.selectable = 0
+        AND NOT EXISTS (SELECT 1 FROM chat_operation_dispositions d WHERE d.source_seq = s.source_seq)
+      ORDER BY s.source_seq`)
       .all(active.operationId) as Array<{ source_seq: number }>;
     const requestedIntentSeqs = new Set((request.intentDispositions ?? []).map((intent) => intent.sourceSeq));
     if (requestedIntentSeqs.size !== (request.intentDispositions ?? []).length
@@ -931,14 +984,6 @@ export function completeChatOperation(
       const intentSource = getAcceptedChatSource(intent.sourceSeq);
       if (!intentSource || intentSource.sourceClass !== "intent" || intentSource.operationId !== active.operationId) {
         throw new ChatOperationInvariantError("Intent does not belong to active operation");
-      }
-      const existing = getChatOperationDisposition(intent.sourceSeq);
-      if (existing) {
-        if (existing.operationId !== active.operationId || existing.outcome !== intent.outcome
-          || existing.cause !== intent.cause || existing.provenance !== intent.provenance) {
-          throw new ChatOperationInvariantError("Conflicting repeated intent disposition");
-        }
-        continue;
       }
       insertDisposition(intentSource, active.operationId, intent.outcome, intent.cause, intent.provenance, request.createdAt, null);
     }

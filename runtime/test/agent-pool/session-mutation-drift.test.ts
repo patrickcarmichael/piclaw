@@ -78,7 +78,7 @@ const expectedGatewayMethodNames = new Set([
   "runAgent", "applyControlCommand", "cancelOperationAndAbort", "emergencyRotateSession", "runSessionMutation",
   "restoreSessionPosition", "disposeChatSession", "getSessionForIntrospection", "renameChatBranch",
   "pruneChatBranch", "mergeChatBranchIntoParent", "renameChatJid", "restoreChatBranch",
-  "permanentPurgeChatBranch", "queueStreamingMessage", "removeQueuedFollowupMessage", "applySlashCommand",
+  "permanentPurgeChatBranch", "hasPendingStreamingQueue", "queueStreamingMessage", "removeQueuedFollowupMessage", "applySlashCommand",
 ]);
 
 type Inventory = Record<string, Record<string, number>>;
@@ -210,7 +210,7 @@ const expectedDirect: Inventory = {
   "agent-pool/run-agent-attempt-context.ts": { abort: 2 },
   "agent-pool/run-agent-orchestrator.ts": { abort: 3, clearQueue: 1, maybeAutoCompactSessionBeforePrompt: 1, prompt: 1, rotateSession: 4, setActiveToolsByName: 1 },
   "agent-pool/run-agent-recovery-phase.ts": { compact: 1 },
-  "agent-pool/runtime-facade.ts": { clearQueue: 2, navigateTree: 1, prompt: 2 },
+  "agent-pool/runtime-facade.ts": { clearQueue: 2, navigateTree: 1, prompt: 2, steer: 1 },
   "agent-pool/session-manager.ts": { dispose: 1, newSession: 2, setActiveToolsByName: 1, setModel: 1, setSessionName: 1, setThinkingLevel: 2, switchSession: 1 },
   "agent-pool/session.ts": { reload: 1, setAutoCompactionEnabled: 1 },
   "agent-pool/side-prompt-runner.ts": { abort: 2, prompt: 1 },
@@ -228,7 +228,7 @@ const expectedCallers: Inventory = {
   "channels/web/cards/adaptive-card-side-prompt-service.ts": { applyControlCommand: 1 },
   "channels/web/core/web-channel-runtime-public-surface-service.ts": { queueStreamingMessage: 1 },
   "channels/web/handlers/addons.ts": { applySlashCommand: 1 },
-  "channels/web/handlers/agent.ts": { applyControlCommand: 3, applySlashCommand: 1, cancelOperationAndAbort: 1, queueStreamingMessage: 2, runAgent: 1 },
+  "channels/web/handlers/agent.ts": { applyControlCommand: 3, applySlashCommand: 1, cancelOperationAndAbort: 1, hasPendingStreamingQueue: 1, queueStreamingMessage: 2, runAgent: 1 },
   "channels/web/runtime/process-chat-control-runtime.ts": { applyControlCommand: 1 },
   "channels/web/runtime/process-chat-preflight-runtime.ts": { emergencyRotateSession: 2, runSessionMutation: 2 },
   "channels/web/runtime/queued-followup-lifecycle-service.ts": { removeQueuedFollowupMessage: 1 },
