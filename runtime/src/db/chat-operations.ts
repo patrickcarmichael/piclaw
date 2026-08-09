@@ -59,7 +59,8 @@ export type ChatOperationMismatch =
   | "phase_mismatch"
   | "generation_mismatch";
 
-export type ChatOperationRejection = ChatOperationMismatch | "invalid_transition" | "operation_cancelled";
+export type ChatOperationRejection = ChatOperationMismatch | "invalid_transition" | "operation_cancelled"
+  | "operation_settling" | "settlement_fence_mismatch";
 
 export interface ChatOperationDisposition {
   sourceSeq: number;
@@ -91,7 +92,8 @@ export type ChatOperationCancelResult =
 
 export type ChatOperationCompletionResult =
   | { status: "completed" | "repeated"; disposition: ChatOperationDisposition }
-  | { status: "rejected"; reason: ChatOperationMismatch | "cancelled_outcome_required" | "cancellation_required"; operation: ChatOperationState | null };
+  | { status: "rejected"; reason: ChatOperationMismatch | "cancelled_outcome_required" | "cancellation_required"
+      | "operation_settling" | "settlement_fence_mismatch"; operation: ChatOperationState | null };
 
 export type ChatOperationMessageBindResult =
   | { status: "bound" }
@@ -103,9 +105,38 @@ export type ChatOperationIntentDispositionResult =
 
 export type ChatOperationCompletionBoundary = "artifact" | "successor" | "intents" | "disposition" | "frontier" | "release";
 export interface ChatOperationCompletionHooks {
-  /** Synchronous transactional revalidation. Throwing rolls back every write. */
+  /** Runs immediately before the completion transaction begins. */
+  beforeTransaction?(): void;
+  /** Synchronous transactional revalidation. Throwing rolls back every completion write. */
   beforeWrite?(): void;
   afterWrite?(boundary: ChatOperationCompletionBoundary): void;
+}
+
+export interface ChatOperationSettlementFence {
+  fenceId: string;
+  fencedAt: string;
+  operationId: string;
+  sourceSeq: number;
+  phase: ChatOperationPhase;
+  generation: number;
+  intents: AcceptedChatSource[];
+}
+
+export type ChatOperationSettlementFenceResult =
+  | { status: "fenced" | "existing"; fence: ChatOperationSettlementFence }
+  | { status: "rejected"; reason: ChatOperationMismatch | "operation_cancelled" | "operation_already_settling" };
+
+export interface ChatOperationSettlementFenceHooks {
+  /** Deterministic seam before the atomic fence/snapshot transaction. */
+  beforeTransaction?(): void;
+  /** Deterministic seam inside the transaction before the fence and intent snapshot. */
+  beforeSnapshot?(): void;
+  afterWrite?(boundary: "fence" | "snapshot"): void;
+}
+
+export interface ChatOperationIntentRegistrationHooks {
+  /** Throwing rolls back either accepted classification. */
+  afterWrite?(classification: "intent" | "deferred"): void;
 }
 
 export class ChatOperationInvariantError extends Error {
@@ -318,7 +349,11 @@ export function storeAcceptedChatMessageSource(message: NewMessage, acceptedAt =
 
 export function registerChatOperationIntent(chatJid: string, expected: ChatOperationOwner, input: {
   sourceKind: "steer"; sourceId: string; acceptedAt: string; payloadRef: string;
-}): { status: "registered" | "existing"; source: AcceptedChatSource } | { status: "rejected"; reason: ChatOperationMismatch | "operation_cancelled" } {
+}, hooks: ChatOperationIntentRegistrationHooks = {}):
+  | { status: "registered" | "existing"; source: AcceptedChatSource }
+  | { status: "disposed"; source: AcceptedChatSource; disposition: ChatOperationDisposition }
+  | { status: "deferred"; source: AcceptedChatSource; fenceId: string }
+  | { status: "rejected"; reason: ChatOperationMismatch | "operation_cancelled" } {
   for (const value of [chatJid, input.sourceId, input.acceptedAt, input.payloadRef]) {
     if (!value.trim()) throw new Error("Accepted intent fields must be non-empty");
   }
@@ -328,6 +363,54 @@ export function registerChatOperationIntent(chatJid: string, expected: ChatOpera
     const comparison = compareChatOperationOwner(active, expected);
     if (!comparison.ok) return { status: "rejected", reason: comparison.reason } as const;
     if (active!.cancellation) return { status: "rejected", reason: "operation_cancelled" } as const;
+
+    const existingRows = db.prepare(`SELECT * FROM chat_accepted_sources
+      WHERE chat_jid = ? AND source_id = ? AND source_kind IN ('steer', 'message') ORDER BY source_seq`)
+      .all(chatJid, input.sourceId) as SourceRow[];
+    if (existingRows.length > 1) throw new ChatOperationInvariantError("Steer identity has multiple accepted classifications");
+    if (existingRows.length === 1) {
+      const source = sourceFromRow(existingRows[0]);
+      if (source.acceptedAt !== input.acceptedAt || source.payloadRef !== input.payloadRef) {
+        throw new ChatOperationInvariantError("Steer identity was reused with different immutable fields");
+      }
+      if (source.sourceKind === "steer") {
+        if (source.sourceClass !== "intent" || source.selectable || source.operationId !== active!.operationId) {
+          throw new ChatOperationInvariantError("Intent identity was reused with different immutable fields");
+        }
+        const disposition = getChatOperationDisposition(source.sourceSeq);
+        if (disposition) return { status: "disposed", source, disposition } as const;
+        return { status: "existing", source } as const;
+      }
+      if (source.sourceClass !== "prompt" || !source.selectable || source.operationId !== null
+        || source.frontierMessageId !== input.sourceId || source.frontierCursorTs !== input.acceptedAt) {
+        throw new ChatOperationInvariantError("Deferred steer identity was reused with different immutable fields");
+      }
+      const fence = getChatOperationSettlementFence(chatJid);
+      if (!fence) throw new ChatOperationInvariantError("Deferred steer exists without an active settlement fence");
+      return { status: "deferred", source, fenceId: fence.fenceId } as const;
+    }
+
+    const fence = getChatOperationSettlementFence(chatJid);
+    if (fence) {
+      const message = db.prepare("SELECT timestamp, is_bot_message FROM messages WHERE chat_jid = ? AND id = ?")
+        .get(chatJid, input.sourceId) as { timestamp: string; is_bot_message: number } | undefined;
+      if (!message || message.is_bot_message === 1 || message.timestamp !== input.acceptedAt
+        || input.payloadRef !== `message:${input.sourceId}`) {
+        throw new ChatOperationInvariantError("Deferred steer requires its exact durable user message");
+      }
+      const accepted = registerAcceptedChatSource({
+        chatJid,
+        sourceClass: "prompt",
+        sourceKind: "message",
+        sourceId: input.sourceId,
+        acceptedAt: input.acceptedAt,
+        payloadRef: input.payloadRef,
+        frontier: { messageId: input.sourceId, cursorTs: message.timestamp },
+      });
+      hooks.afterWrite?.("deferred");
+      return { status: "deferred", source: accepted.source, fenceId: fence.fenceId } as const;
+    }
+
     const inserted = db.prepare(`INSERT INTO chat_accepted_sources
       (chat_jid, source_class, source_kind, source_id, accepted_at, selectable, payload_ref,
        frontier_message_id, frontier_cursor_ts, operation_id)
@@ -340,6 +423,7 @@ export function registerChatOperationIntent(chatJid: string, expected: ChatOpera
       || source.payloadRef !== input.payloadRef || source.operationId !== active!.operationId) {
       throw new ChatOperationInvariantError("Intent identity was reused with different immutable fields");
     }
+    hooks.afterWrite?.("intent");
     return { status: inserted.changes > 0 ? "registered" : "existing", source } as const;
   }).immediate();
 }
@@ -559,6 +643,78 @@ export function getChatOperation(chatJid: string): ChatOperationState | null {
   return operationFromRow(row);
 }
 
+export function getChatOperationSettlementFence(chatJid: string): ChatOperationSettlementFence | null {
+  const row = getDb().prepare(`SELECT operation_id, operation_source_seq, operation_phase, operation_generation,
+    operation_settling_fence_id, operation_settling_fenced_at FROM chat_cursors WHERE chat_jid = ?`)
+    .get(chatJid) as {
+      operation_id: string | null; operation_source_seq: number | null; operation_phase: string | null;
+      operation_generation: number | null; operation_settling_fence_id: string | null;
+      operation_settling_fenced_at: string | null;
+    } | undefined;
+  if (!row?.operation_settling_fence_id && !row?.operation_settling_fenced_at) return null;
+  if (!row.operation_id || !row.operation_source_seq || !isValue(CHAT_OPERATION_PHASES, row.operation_phase)
+    || !Number.isInteger(row.operation_generation) || row.operation_generation! < 0
+    || !row.operation_settling_fence_id?.trim() || !row.operation_settling_fenced_at?.trim()) {
+    throw new ChatOperationInvariantError(`Invalid settlement fence for ${chatJid}`);
+  }
+  return {
+    fenceId: row.operation_settling_fence_id,
+    fencedAt: row.operation_settling_fenced_at,
+    operationId: row.operation_id,
+    sourceSeq: row.operation_source_seq,
+    phase: row.operation_phase,
+    generation: row.operation_generation!,
+    intents: getPendingChatOperationIntentSources(row.operation_id),
+  };
+}
+
+export function fenceChatOperationSettlement(
+  chatJid: string,
+  expected: ChatOperationOwner,
+  input: { fenceId: string; fencedAt: string },
+  hooks: ChatOperationSettlementFenceHooks = {},
+): ChatOperationSettlementFenceResult {
+  if (!chatJid.trim() || !input.fenceId.trim() || !input.fencedAt.trim()) {
+    throw new ChatOperationInvariantError("Settlement fence fields must be non-empty");
+  }
+  hooks.beforeTransaction?.();
+  const db = getDb();
+  return db.transaction(() => {
+    const active = getChatOperation(chatJid);
+    const comparison = compareChatOperationOwner(active, expected);
+    if (!comparison.ok) return { status: "rejected", reason: comparison.reason } as const;
+    if (active!.cancellation) return { status: "rejected", reason: "operation_cancelled" } as const;
+    const existing = getChatOperationSettlementFence(chatJid);
+    if (existing) {
+      if (existing.fenceId !== input.fenceId || existing.fencedAt !== input.fencedAt) {
+        return { status: "rejected", reason: "operation_already_settling" } as const;
+      }
+      return { status: "existing", fence: existing } as const;
+    }
+    hooks.beforeSnapshot?.();
+    const fenced = db.prepare(`UPDATE chat_cursors
+      SET operation_settling_fence_id = ?, operation_settling_fenced_at = ?
+      WHERE chat_jid = ? AND operation_id = ? AND operation_source_seq = ?
+        AND operation_phase = ? AND operation_generation = ?
+        AND operation_cancel_cause IS NULL AND operation_settling_fence_id IS NULL
+        AND operation_settling_fenced_at IS NULL`)
+      .run(input.fenceId, input.fencedAt, chatJid, expected.operationId, expected.sourceSeq,
+        expected.phase, expected.generation);
+    if (fenced.changes !== 1) {
+      const observed = getChatOperation(chatJid);
+      const mismatch = compareChatOperationOwner(observed, expected);
+      if (!mismatch.ok) return { status: "rejected", reason: mismatch.reason } as const;
+      if (observed!.cancellation) return { status: "rejected", reason: "operation_cancelled" } as const;
+      return { status: "rejected", reason: "operation_already_settling" } as const;
+    }
+    hooks.afterWrite?.("fence");
+    const fence = getChatOperationSettlementFence(chatJid);
+    if (!fence) throw new ChatOperationInvariantError("Settlement fence disappeared before its intent snapshot");
+    hooks.afterWrite?.("snapshot");
+    return { status: "fenced", fence } as const;
+  }).immediate();
+}
+
 export function getChatOperationDisposition(sourceSeq: number): ChatOperationDisposition | null {
   return dispositionFromRow(getDb().prepare("SELECT * FROM chat_operation_dispositions WHERE source_seq = ?")
     .get(sourceSeq) as DispositionRow | undefined);
@@ -610,7 +766,8 @@ export function claimNextChatOperation(chatJid: string): ChatOperationClaimResul
       ON CONFLICT(chat_jid) DO UPDATE SET operation_id = excluded.operation_id,
         operation_source_seq = excluded.operation_source_seq, operation_phase = excluded.operation_phase,
         operation_generation = excluded.operation_generation,
-        operation_cancel_cause = NULL, operation_cancel_requested_at = NULL
+        operation_cancel_cause = NULL, operation_cancel_requested_at = NULL,
+        operation_settling_fence_id = NULL, operation_settling_fenced_at = NULL
       WHERE chat_cursors.operation_id IS NULL AND chat_cursors.preflight_message_id IS NULL
         AND chat_cursors.inflight_message_id IS NULL AND chat_cursors.failed_ts IS NULL
         AND chat_cursors.compaction_active_started_at IS NULL
@@ -624,16 +781,62 @@ export function claimNextChatOperation(chatJid: string): ChatOperationClaimResul
 function applyTransition(chatJid: string, expected: ChatOperationOwner, phase: ChatOperationPhase): ChatOperationTransitionResult {
   const current = getChatOperation(chatJid);
   if (!current) return { status: "rejected", reason: "no_operation", operation: null };
+  const comparison = compareChatOperationOwner(current, expected);
+  if (!comparison.ok) return { status: "rejected", reason: comparison.reason, operation: current };
+  if (getChatOperationSettlementFence(chatJid)) {
+    return { status: "rejected", reason: "operation_settling", operation: current };
+  }
   const planned = transitionChatOperationState(current, expected, phase);
   if (planned.status === "rejected") return planned;
   const next = planned.operation;
   const result = getDb().prepare(`UPDATE chat_cursors SET operation_phase = ?, operation_generation = ?
-    WHERE chat_jid = ? AND operation_id = ? AND operation_source_seq = ? AND operation_phase = ? AND operation_generation = ?`)
+    WHERE chat_jid = ? AND operation_id = ? AND operation_source_seq = ? AND operation_phase = ? AND operation_generation = ?
+      AND operation_settling_fence_id IS NULL`)
     .run(next.phase, next.generation, chatJid, expected.operationId, expected.sourceSeq, expected.phase, expected.generation);
   if (result.changes === 1) return planned;
   const observed = getChatOperation(chatJid);
   const mismatch = compareChatOperationOwner(observed, expected);
-  return { status: "rejected", reason: mismatch.ok ? "generation_mismatch" : mismatch.reason, operation: observed };
+  if (!mismatch.ok) return { status: "rejected", reason: mismatch.reason, operation: observed };
+  return {
+    status: "rejected",
+    reason: getChatOperationSettlementFence(chatJid) ? "operation_settling" : "generation_mismatch",
+    operation: observed,
+  };
+}
+
+/**
+ * Abort an in-progress settlement checkpoint by blocking only its exact owner
+ * under the matching persisted fence. Cancellation always wins this race.
+ */
+export function blockChatOperationSettlement(
+  chatJid: string,
+  expected: ChatOperationOwner,
+  settlementFenceId: string,
+): ChatOperationTransitionResult {
+  if (!settlementFenceId.trim()) throw new Error("Settlement fence id must be non-empty");
+  const current = getChatOperation(chatJid);
+  if (!current) return { status: "rejected", reason: "no_operation", operation: null };
+  const comparison = compareChatOperationOwner(current, expected);
+  if (!comparison.ok) return { status: "rejected", reason: comparison.reason, operation: current };
+  const fence = getChatOperationSettlementFence(chatJid);
+  if (fence?.fenceId !== settlementFenceId) {
+    return { status: "rejected", reason: "settlement_fence_mismatch", operation: current };
+  }
+  const planned = transitionChatOperationState(current, expected, "blocked");
+  if (planned.status === "rejected") return planned;
+  const next = planned.operation;
+  const result = getDb().prepare(`UPDATE chat_cursors SET operation_phase = ?, operation_generation = ?,
+      operation_settling_fence_id = NULL, operation_settling_fenced_at = NULL
+    WHERE chat_jid = ? AND operation_id = ? AND operation_source_seq = ? AND operation_phase = ? AND operation_generation = ?
+      AND operation_cancel_cause IS NULL AND operation_settling_fence_id = ?`)
+    .run(next.phase, next.generation, chatJid, expected.operationId, expected.sourceSeq, expected.phase,
+      expected.generation, settlementFenceId);
+  if (result.changes === 1) return planned;
+  const observed = getChatOperation(chatJid);
+  const mismatch = compareChatOperationOwner(observed, expected);
+  if (!mismatch.ok) return { status: "rejected", reason: mismatch.reason, operation: observed };
+  if (observed?.cancellation) return { status: "rejected", reason: "operation_cancelled", operation: observed };
+  return { status: "rejected", reason: "settlement_fence_mismatch", operation: observed };
 }
 
 export const promoteChatOperation = (chatJid: string, owner: ChatOperationOwner, phase: "preflight" | "running") =>
@@ -768,6 +971,7 @@ export interface ChatOperationCompletion {
   cause: string;
   provenance: string;
   createdAt: string;
+  settlementFenceId?: string;
   artifact?: { messageId: string; message?: never } | { message: NewMessage; messageId?: never };
   successor?: ChatOperationSuccessor;
   intentDispositions?: Array<{ sourceSeq: number; outcome: ChatOperationOutcome; cause: string; provenance: string }>;
@@ -863,6 +1067,7 @@ export function completeChatOperation(
   request: ChatOperationCompletion,
   hooks: ChatOperationCompletionHooks = {},
 ): ChatOperationCompletionResult {
+  hooks.beforeTransaction?.();
   const db = getDb();
   return db.transaction(() => {
     const existing = getChatOperationDisposition(request.owner.sourceSeq);
@@ -944,6 +1149,13 @@ export function completeChatOperation(
     }
     if (!active.cancellation && request.outcome === "cancelled") {
       return { status: "rejected", reason: "cancellation_required", operation: active } as const;
+    }
+    const fence = getChatOperationSettlementFence(chatJid);
+    if (!active.cancellation && fence && request.settlementFenceId !== fence.fenceId) {
+      return { status: "rejected", reason: "operation_settling", operation: active } as const;
+    }
+    if (!active.cancellation && request.settlementFenceId && fence?.fenceId !== request.settlementFenceId) {
+      return { status: "rejected", reason: "settlement_fence_mismatch", operation: active } as const;
     }
     const source = getAcceptedChatSource(active.sourceSeq);
     if (!source || source.operationId !== active.operationId) throw new ChatOperationInvariantError("Active source binding mismatch");
@@ -1146,7 +1358,8 @@ export function completeChatOperation(
         WHEN ? IS NULL OR cursor_ts > ? THEN cursor_ts ELSE ? END,
       operation_id = NULL, operation_source_seq = NULL,
       operation_phase = NULL, operation_generation = NULL, operation_cancel_cause = NULL,
-      operation_cancel_requested_at = NULL WHERE chat_jid = ? AND operation_id = ? AND operation_source_seq = ?
+      operation_cancel_requested_at = NULL, operation_settling_fence_id = NULL,
+      operation_settling_fenced_at = NULL WHERE chat_jid = ? AND operation_id = ? AND operation_source_seq = ?
       AND operation_phase = ? AND operation_generation = ?`)
       .run(source.frontierCursorTs, source.frontierCursorTs, source.frontierCursorTs,
         chatJid, active.operationId, active.sourceSeq, active.phase, active.generation);

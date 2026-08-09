@@ -168,6 +168,8 @@ export {
   getContinuationCarriedIntentSources,
   getGoalContinuationCarriedIntentSources,
   getChatOperation,
+  getChatOperationSettlementFence,
+  fenceChatOperationSettlement,
   getResumableDurableChatJids,
   getBlockedDurableChatJids,
   peekNextAcceptedChatSource,
@@ -176,6 +178,7 @@ export {
   waitChatOperation,
   resumeChatOperation,
   blockChatOperation,
+  blockChatOperationSettlement,
   retryBlockedChatOperation,
   skipBlockedChatOperation,
   cancelChatOperation,
@@ -207,6 +210,10 @@ export type {
   ChatOperationCompletionResult,
   ChatOperationMessageBindResult,
   ChatOperationIntentDispositionResult,
+  ChatOperationSettlementFence,
+  ChatOperationSettlementFenceResult,
+  ChatOperationSettlementFenceHooks,
+  ChatOperationIntentRegistrationHooks,
   TerminalArtifactPolicy,
 } from "./db/chat-operations.js";
 export {

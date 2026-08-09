@@ -43,7 +43,7 @@ describe("chat operation ownership drift", () => {
       "db/chat-branches.ts": 5,
       "db/chat-cursors.ts": 15,
       "db/chat-operation-lifecycle.ts": 1,
-      "db/chat-operations.ts": 3,
+      "db/chat-operations.ts": 5,
       "dream.ts": 3,
     });
   });

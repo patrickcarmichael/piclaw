@@ -211,6 +211,7 @@ export class SessionMutationGateway {
     access: SessionMutationAccess,
     beforeQueue: () => R,
     action: (registration: R) => Promise<T> | T,
+    requiresQueueEffect: (registration: R) => boolean = () => true,
   ): Promise<T> {
     this.assertQueueAdmission(chatJid, access);
     const previous = this.queueTails.get(chatJid) ?? Promise.resolve();
@@ -222,7 +223,7 @@ export class SessionMutationGateway {
     try {
       this.assertQueueAdmission(chatJid, access);
       const registration = beforeQueue();
-      this.assertQueueEffect(chatJid, access);
+      if (requiresQueueEffect(registration)) this.assertQueueEffect(chatJid, access);
       return await this.context.run({ chatJid, access }, () => action(registration));
     } finally {
       release();

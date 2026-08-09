@@ -14,6 +14,7 @@ import {
   getBlockedDurableChatJids,
   getChatCompactionBackoff,
   getChatOperation,
+  getChatOperationSettlementFence,
   getDb,
   getDeferredQueuedFollowups,
   getInflightRuns,
@@ -32,6 +33,7 @@ import {
   type AgentReplyState,
   type ChatOperationCompletion,
   type ChatOperationCompletionResult,
+  type ChatOperationSettlementFence,
   type ChatOperationState,
   type DeferredQueuedFollowupRecord,
   type InflightRun,
@@ -206,6 +208,7 @@ export interface WebRecoveryStore {
   getRecoverableDurableRuns?(): RecoverableDurableRun[];
   getLatestAgentReplyForOperation?(chatJid: string, operationId: string): PersistedAgentReply | null;
   getPendingChatOperationIntentSources?(operationId: string): AcceptedChatSource[];
+  getChatOperationSettlementFence?(chatJid: string): ChatOperationSettlementFence | null;
   completeChatOperation?(chatJid: string, request: ChatOperationCompletion): ChatOperationCompletionResult;
   getDeferredQueuedFollowups(chatJid: string): DeferredQueuedFollowupRecord[];
   getMessagesSince(chatJid: string, since: string, assistantName: string): unknown[];
@@ -270,6 +273,7 @@ const defaultStore: WebRecoveryStore = {
   getRecoverableDurableRuns,
   getLatestAgentReplyForOperation,
   getPendingChatOperationIntentSources,
+  getChatOperationSettlementFence,
   completeChatOperation,
   getDeferredQueuedFollowups,
   getMessagesSince,
@@ -399,6 +403,7 @@ function recoverDurableRunningOperations(
   for (const { operation, source } of runs) {
     const reply = store.getLatestAgentReplyForOperation(operation.chatJid, operation.operationId);
     const pendingIntents = store.getPendingChatOperationIntentSources?.(operation.operationId) ?? [];
+    const settlementFence = store.getChatOperationSettlementFence?.(operation.chatJid) ?? null;
     const draft = reply ? null : (ctx.getDraftRecovery?.(operation.chatJid) ?? null);
     const sourceMessageId = source.frontierMessageId ?? source.sourceId;
     const recoveryMessage = reply
@@ -427,6 +432,7 @@ function recoverDurableRunningOperations(
         cause,
         provenance: "web_startup_recovery",
         createdAt: new Date().toISOString(),
+        ...(settlementFence ? { settlementFenceId: settlementFence.fenceId } : {}),
         artifact: reply
           ? { messageId: reply.messageId }
           : recoveryMessage
