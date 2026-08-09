@@ -47,6 +47,38 @@ describe("WebAgentMessageEntryService", () => {
     });
   });
 
+  test("forwards the durable-acceptance callback through the trusted entry seam", async () => {
+    const accepted: unknown[] = [];
+    const service = new WebAgentMessageEntryService({
+      defaultChatJid: "web:default",
+      defaultAgentId: "default",
+      forwardAgentMessageRequest: async (_req, _pathname, _chatJid, _agentId, onAccepted) => {
+        onAccepted?.({
+          chat_jid: "web:branch",
+          row_id: 42,
+          thread_id: 42,
+          accepted_at: "2026-08-08T22:00:00.000Z",
+          created: true,
+        });
+        return Response.json({ created: true }, { status: 201 });
+      },
+    });
+
+    await service.handleAgentMessage(
+      new Request("https://example.com/agent/default/message?chat_jid=web%3Abranch", { method: "POST" }),
+      "/agent/default/message",
+      (acceptance) => accepted.push(acceptance),
+    );
+
+    expect(accepted).toEqual([{
+      chat_jid: "web:branch",
+      row_id: 42,
+      thread_id: 42,
+      accepted_at: "2026-08-08T22:00:00.000Z",
+      created: true,
+    }]);
+  });
+
   test("returns the forwarded response unchanged", async () => {
     const forwardedResponse = new Response("accepted", { status: 202 });
     const service = new WebAgentMessageEntryService({

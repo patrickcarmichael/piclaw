@@ -488,6 +488,92 @@ describe("durable accepted-input operations", () => {
     })).toEqual({ status: "rejected", reason: "no_operation" });
   });
 
+  test("queue failure disposition is exact-owner, idempotent, completion-compatible, and cancellation-safe", () => {
+    const chatJid = jid("intent-queue-failure"); register(chatJid, "root");
+    const claimed = op.claimNextChatOperation(chatJid).operation!;
+    const intent = op.registerChatOperationIntent(chatJid, owner(claimed), {
+      sourceKind: "steer", sourceId: "failed-queue", acceptedAt: "now", payloadRef: "steer:failed-queue",
+    });
+    if (intent.status === "rejected") throw new Error("expected intent");
+    const request = {
+      sourceSeq: intent.source.sourceSeq, outcome: "failed" as const, cause: "steer_queue_failed",
+      provenance: "web_compose_steer_queue_failure", createdAt: "2026-08-08T20:01:00.000Z",
+    };
+    const disposed = op.disposeChatOperationIntent(chatJid, owner(claimed), request);
+    expect(disposed.status).toBe("disposed");
+    expect(op.disposeChatOperationIntent(chatJid, owner(claimed), request)).toEqual({
+      status: "repeated",
+      disposition: disposed.status === "disposed" ? disposed.disposition : null,
+    });
+    const pending = op.registerChatOperationIntent(chatJid, owner(claimed), {
+      sourceKind: "steer", sourceId: "pending-queue", acceptedAt: "later", payloadRef: "steer:pending-queue",
+    });
+    if (pending.status === "rejected") throw new Error("expected pending intent");
+    expect(op.getPendingChatOperationIntentSources(claimed.operationId).map((source) => source.sourceSeq))
+      .toEqual([pending.source.sourceSeq]);
+    expect(() => op.completeChatOperation(chatJid, {
+      owner: owner(claimed), outcome: "succeeded", cause: "normal", provenance: "provider", createdAt: "now",
+      artifact: { message: terminal(chatJid, `missing-pending-bot-${serial}`) }, intentDispositions: [],
+    })).toThrow("Completion must dispose every pending operation intent exactly once");
+    const completed = op.completeChatOperation(chatJid, {
+      owner: owner(claimed), outcome: "succeeded", cause: "normal", provenance: "provider", createdAt: "now",
+      artifact: { message: terminal(chatJid, `failed-queue-bot-${serial}`) },
+      intentDispositions: [{
+        sourceSeq: pending.source.sourceSeq, outcome: "succeeded", cause: "steer_applied", provenance: "provider",
+      }],
+    });
+    expect(completed.status).toBe("completed");
+    expect(op.getChatOperation(chatJid)).toBeNull();
+    expect(op.getPendingChatOperationIntentSources(claimed.operationId)).toEqual([]);
+    expect(op.getChatOperationDisposition(intent.source.sourceSeq)).toMatchObject(request);
+    expect(op.getChatOperationDisposition(pending.source.sourceSeq)).toMatchObject({ outcome: "succeeded", cause: "steer_applied" });
+
+    const cancelledChat = jid("intent-queue-cancel"); register(cancelledChat, "root");
+    const cancelOwner = op.claimNextChatOperation(cancelledChat).operation!;
+    const cancelledIntent = op.registerChatOperationIntent(cancelledChat, owner(cancelOwner), {
+      sourceKind: "steer", sourceId: "cancelled-queue", acceptedAt: "now", payloadRef: "steer:cancelled-queue",
+    });
+    if (cancelledIntent.status === "rejected") throw new Error("expected intent");
+    expect(op.disposeChatOperationIntent(cancelledChat, owner(cancelOwner), {
+      ...request, sourceSeq: cancelledIntent.source.sourceSeq,
+    }).status).toBe("disposed");
+    const cancellation = op.cancelChatOperation(cancelledChat, owner(cancelOwner), { cause: "remote_abort", requestedAt: "now" });
+    if (cancellation.status === "rejected") throw new Error("expected cancellation");
+    expect(op.completeChatOperation(cancelledChat, {
+      owner: owner(cancellation.operation), outcome: "cancelled", cause: "remote_abort", provenance: "test_cancel",
+      createdAt: "2026-08-08T20:02:00.000Z", intentDispositions: [],
+    }).status).toBe("completed");
+    expect(op.getChatOperation(cancelledChat)).toBeNull();
+    expect(op.getPendingChatOperationIntentSources(cancelOwner.operationId)).toEqual([]);
+    expect(op.getChatOperationDisposition(cancelledIntent.source.sourceSeq)).toMatchObject({
+      outcome: "failed", cause: "steer_queue_failed", provenance: "web_compose_steer_queue_failure",
+    });
+
+    const blockedChat = jid("intent-queue-blocked"); register(blockedChat, "root");
+    const blockedOwner = op.claimNextChatOperation(blockedChat).operation!;
+    const blockedIntent = op.registerChatOperationIntent(blockedChat, owner(blockedOwner), {
+      sourceKind: "steer", sourceId: "blocked-queue", acceptedAt: "now", payloadRef: "steer:blocked-queue",
+    });
+    if (blockedIntent.status === "rejected") throw new Error("expected intent");
+    expect(op.disposeChatOperationIntent(blockedChat, owner(blockedOwner), {
+      ...request, sourceSeq: blockedIntent.source.sourceSeq,
+    }).status).toBe("disposed");
+    const blocked = op.blockChatOperation(blockedChat, owner(blockedOwner));
+    if (blocked.status !== "applied") throw new Error("expected block");
+    const retried = op.retryBlockedChatOperation(blockedChat, owner(blocked.operation));
+    if (retried.status !== "applied") throw new Error("expected retry");
+    const reblocked = op.blockChatOperation(blockedChat, owner(retried.operation));
+    if (reblocked.status !== "applied") throw new Error("expected reblock");
+    expect(op.skipBlockedChatOperation(blockedChat, owner(reblocked.operation), {
+      cause: "operator_skip_failed", provenance: "test_skip", createdAt: "2026-08-08T20:03:00.000Z",
+    }).status).toBe("completed");
+    expect(op.getChatOperation(blockedChat)).toBeNull();
+    expect(op.getPendingChatOperationIntentSources(blockedOwner.operationId)).toEqual([]);
+    expect(op.getChatOperationDisposition(blockedIntent.source.sourceSeq)).toMatchObject({
+      outcome: "failed", cause: "steer_queue_failed", provenance: "web_compose_steer_queue_failure",
+    });
+  });
+
   test("rename preserves operation lookup, cleanup retains terminal evidence, and explicit branch deletion removes it", () => {
     const chatJid = jid("lifecycle"); const renamed = `operation:renamed-lifecycle:${serial}`;
     db.storeChatMetadata(chatJid, "2026-08-07T22:00:00Z", "Lifecycle");

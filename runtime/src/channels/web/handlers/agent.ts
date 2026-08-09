@@ -9,6 +9,7 @@
  */
 
 import type { WebChannelLike } from "../core/web-channel-contracts.js";
+import type { AgentMessageAcceptanceHandler } from "../messaging/agent-message-acceptance.js";
 import {
   getIdentityConfig,
   getRoutingConfig,
@@ -34,11 +35,12 @@ import {
   blockChatOperation,
   claimNextChatOperation,
   completeChatOperation,
+  disposeChatOperationIntent,
   getAcceptedChatSource,
   getChatCursor,
   getChatOperation,
   getChatOperationDisposition,
-  getChatOperationIntentSources,
+  getPendingChatOperationIntentSources,
   getGoalContinuationCarriedIntentSources,
   getGoalContinuationLineage,
   getProtectedContinuationRootSource,
@@ -168,7 +170,7 @@ function completeCancelledDurableOperation(
     cause: operation.cancellation.cause,
     provenance,
     createdAt: new Date().toISOString(),
-    intentDispositions: getChatOperationIntentSources(operation.operationId).map((intent) => ({
+    intentDispositions: getPendingChatOperationIntentSources(operation.operationId).map((intent) => ({
       sourceSeq: intent.sourceSeq,
       outcome: "cancelled" as const,
       cause: operation.cancellation!.cause,
@@ -672,7 +674,8 @@ export async function handleAgentMessage(
   req: Request,
   pathname: string,
   chatJid: string,
-  defaultAgentId: string
+  defaultAgentId: string,
+  onAccepted?: AgentMessageAcceptanceHandler,
 ): Promise<Response> {
   const agentId = pathname.split("/")[2] || defaultAgentId;
   const browserObservability = getBrowserObservabilityContext(req);
@@ -768,7 +771,7 @@ export async function handleAgentMessage(
       }),
     });
 
-    const forwardRes = await handleAgentMessage(channel, forwardReq, pathname, mentionTarget.chat_jid, defaultAgentId);
+    const forwardRes = await handleAgentMessage(channel, forwardReq, pathname, mentionTarget.chat_jid, defaultAgentId, onAccepted);
     if (!forwardRes.ok) {
       return forwardRes;
     }
@@ -1123,6 +1126,15 @@ export async function handleAgentMessage(
   };
 
   let threadId = resolveThreadId(normalized.threadId, interaction.id);
+  onAccepted?.({
+    chat_jid: chatJid,
+    row_id: interaction.id,
+    // Busy steer handling may rethread this row onto the inflight root after
+    // acceptance, so do not expose the provisional self-root as final metadata.
+    thread_id: requestMode === "steer" ? null : threadId ?? null,
+    accepted_at: interaction.timestamp,
+    created: true,
+  });
 
   const identity = getIdentityConfig();
   const withAgentProfile = createAgentProfileBuilder(
@@ -1234,25 +1246,61 @@ export async function handleAgentMessage(
     const persistedMessageId = interaction.id
       ? (getDb().prepare("SELECT id FROM messages WHERE rowid = ?").get(interaction.id) as { id: string } | undefined)?.id ?? null
       : null;
-    const steerResult = await channel.agentPool.queueStreamingMessage(chatJid, content, "steer", activeOperation && persistedMessageId
+    const operationOwner = activeOperation ? durableOperationOwner(activeOperation) : null;
+    const steerResult = await channel.agentPool.queueStreamingMessage(chatJid, content, "steer", operationOwner && persistedMessageId
       ? {
-          operationOwner: durableOperationOwner(activeOperation),
+          operationOwner,
           beforeQueue: () => {
-            const registered = registerChatOperationIntent(chatJid, durableOperationOwner(activeOperation), {
+            const registered = registerChatOperationIntent(chatJid, operationOwner, {
               sourceKind: "steer",
               sourceId: persistedMessageId,
               acceptedAt: interaction.timestamp,
               payloadRef: `message:${persistedMessageId}`,
             });
             if (registered.status === "rejected") throw new Error(`Steer intent ownership rejected: ${registered.reason}`);
+            return { sourceSeq: registered.source.sourceSeq };
+          },
+          onQueueFailure: (failure: { error?: string }, registration: { sourceSeq: number }) => {
+            const observed = getChatOperation(chatJid);
+            if (!observed || observed.operationId !== operationOwner.operationId || observed.sourceSeq !== operationOwner.sourceSeq) {
+              throw new Error("Steer queue failure lost its durable operation");
+            }
+            const disposed = disposeChatOperationIntent(chatJid, durableOperationOwner(observed), {
+              sourceSeq: registration.sourceSeq,
+              outcome: "failed",
+              cause: "steer_queue_failed",
+              provenance: "web_compose_steer_queue_failure",
+              createdAt: new Date().toISOString(),
+            });
+            if (disposed.status === "rejected" && disposed.reason !== "operation_cancelled") {
+              throw new Error(`Steer queue failure disposition rejected: ${disposed.reason}`);
+            }
+            if (!failure.error) failure.error = "SDK queue rejected the steer";
           },
         }
       : {});
     if (!steerResult.queued) {
-      return null;
+      if (!operationOwner) return null;
+      if ((persistSteer || operationOwner) && interaction.id) {
+        getDb().prepare("UPDATE messages SET is_steering_message = 1 WHERE rowid = ?").run(interaction.id);
+      }
+      const queued = steerResult.operationIntentSourceSeq ? "steer_failed" : "steer_rejected";
+      channel.broadcastEvent("agent_steer_failed", {
+        chat_jid: chatJid,
+        thread_id: threadId ?? null,
+        source,
+        queued,
+        error: steerResult.error ?? "SDK queue rejected the steer",
+      });
+      return channel.json({
+        user_message: interaction,
+        thread_id: threadId,
+        queued,
+        error: steerResult.error ?? "SDK queue rejected the steer",
+      }, 201);
     }
 
-    if (persistSteer && interaction.id) {
+    if ((persistSteer || operationOwner) && interaction.id) {
       getDb().prepare("UPDATE messages SET is_steering_message = 1 WHERE rowid = ?").run(interaction.id);
     }
 
@@ -1658,7 +1706,7 @@ export async function processChat(
         cause: "protected_continuation_invalid_lineage",
         provenance: "web_process_chat_protected_refusal",
         createdAt,
-        intentDispositions: getChatOperationIntentSources(durableOperation.operationId).map((intent) => ({
+        intentDispositions: getPendingChatOperationIntentSources(durableOperation.operationId).map((intent) => ({
           sourceSeq: intent.sourceSeq,
           outcome: "failed" as const,
           cause: "protected_continuation_invalid_lineage",
@@ -1769,7 +1817,7 @@ export async function processChat(
         cause: "goal_continuation_no_longer_active",
         provenance: "web_process_chat_goal_continuation",
         createdAt: new Date().toISOString(),
-        intentDispositions: getChatOperationIntentSources(durableOperation!.operationId).map((intent) => ({
+        intentDispositions: getPendingChatOperationIntentSources(durableOperation!.operationId).map((intent) => ({
           sourceSeq: intent.sourceSeq,
           outcome: "skipped" as const,
           cause: "goal_continuation_no_longer_active",
@@ -1889,7 +1937,7 @@ export async function processChat(
         provenance,
         createdAt: new Date().toISOString(),
         artifact: { messageId: message.id },
-        intentDispositions: getChatOperationIntentSources(durableOperation.operationId).map((intent) => ({
+        intentDispositions: getPendingChatOperationIntentSources(durableOperation.operationId).map((intent) => ({
           sourceSeq: intent.sourceSeq,
           outcome: "succeeded" as const,
           cause: "steer_applied",
@@ -2380,6 +2428,11 @@ export async function processChat(
       clearCommittedDraft();
     },
     onTerminalOutput: (terminalOutput) => {
+      if (durableOperation
+        && typeof channel.agentPool.hasPendingStreamingQueue === "function"
+        && channel.agentPool.hasPendingStreamingQueue(chatJid)) {
+        return false;
+      }
       try {
         terminalOutputPersistedInPromptLane = persistSuccessfulOutputBeforeMaintenance(terminalOutput);
         return terminalOutputPersistedInPromptLane;
@@ -2455,7 +2508,7 @@ export async function processChat(
               });
               return false;
             }
-            const intents = getChatOperationIntentSources(operation.operationId);
+            const intents = getPendingChatOperationIntentSources(operation.operationId);
             const intentMessages = intents.map((intent) => {
               if (intent.sourceKind !== "steer" || !intent.payloadRef.startsWith("message:")) return null;
               const messageId = intent.payloadRef.slice("message:".length);

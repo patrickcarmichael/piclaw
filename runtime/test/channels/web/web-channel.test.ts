@@ -542,6 +542,8 @@ test("direct chat tool relay persists steering rows when the target session is s
   ];
   const events: Array<{ type: string; data: any }> = [];
   const queuedSteers: Array<{ chatJid: string; text: string; behavior: string }> = [];
+  let releaseSteer!: () => void;
+  const steerGate = new Promise<void>((resolve) => { releaseSteer = resolve; });
 
   const webMod = await import("../../../src/channels/web.js");
   const agentPool = {
@@ -553,6 +555,7 @@ test("direct chat tool relay persists steering rows when the target session is s
     isActive: (chatJid: string) => chatJid === "web:target",
     queueStreamingMessage: async (chatJid: string, text: string, behavior: string) => {
       queuedSteers.push({ chatJid, text, behavior });
+      await steerGate;
       return { queued: true };
     },
     getContextUsageForChat: async () => null,
@@ -567,21 +570,28 @@ test("direct chat tool relay persists steering rows when the target session is s
 
   const { createDirectChatToolRelayHandler } = await import("../../../src/extensions/chat-tool-runtime.js");
   const relay = createDirectChatToolRelayHandler(agentPool as any, {
-    handleAgentMessage: (req, pathname) => (web as any).handleAgentMessage(req, pathname),
+    handleAgentMessage: (req, pathname, onAccepted) => (web as any).handleAgentMessage(req, pathname, onAccepted),
   }, {
     getAgentDisplayName: () => "Smith",
     getChatBranchByChatJid: (chatJid) => knownChats.find((chat) => chat.chat_jid === chatJid) ?? null,
     getChatBranchByAgentName: (agentName) => knownChats.find((chat) => chat.agent_name === agentName) ?? null,
+    ackTimeoutMs: 50,
   });
 
-  const result = await relay({
-    source_chat_jid: "web:source",
-    target_agent_name: "@target",
-    content: "Please adjust the active direct run.",
-    mode: "steer",
-  });
+  const result = await Promise.race([
+    relay({
+      source_chat_jid: "web:source",
+      target_agent_name: "@target",
+      content: "Please adjust the active direct run.",
+      mode: "steer",
+    }),
+    Bun.sleep(100).then(() => { throw new Error("sender remained blocked behind the recipient steer queue"); }),
+  ]);
 
-  expect(result.queued).toBe("steer");
+  expect(result.queued).toBeUndefined();
+  expect(result.delivery_disposition).toBe("accepted");
+  expect(result.acknowledged).toBe(true);
+  expect(result.thread_id).toBeNull();
   expect(result.relayed).toBe(true);
   expect(result.created).toBe(true);
   expect(result.row_id).toBeTruthy();
@@ -589,6 +599,9 @@ test("direct chat tool relay persists steering rows when the target session is s
   expect(queuedSteers[0].chatJid).toBe("web:target");
   expect(queuedSteers[0].behavior).toBe("steer");
   expect(events.some((event) => event.type === "new_post" && event.data?.chat_jid === "web:target")).toBe(true);
+
+  releaseSteer();
+  await Bun.sleep(0);
 
   const timeline = db.getTimeline("web:target", 10);
   expect(timeline).toHaveLength(1);
@@ -4610,6 +4623,89 @@ test("processChat atomically promotes intermediate-only durable output in the te
     is_terminal_agent_reply: 1,
     operation_id: disposition!.operationId,
   }]);
+});
+
+test("processChat defers durable terminal completion until admitted steer failure accounting settles", async () => {
+  const ws = createTempWorkspace("piclaw-web-channel-");
+  cleanupWorkspace = ws.cleanup;
+  restoreEnv = setEnv({ PICLAW_WORKSPACE: ws.workspace, PICLAW_STORE: ws.store, PICLAW_DATA: ws.data });
+
+  const db = await import("../../../src/db.js");
+  db.initDatabase();
+  db.getDb().exec("DELETE FROM message_media; DELETE FROM messages; DELETE FROM chats; DELETE FROM chat_cursors;");
+  db.storeChatMetadata("web:default", new Date().toISOString(), "Web");
+  const source = db.storeAcceptedChatMessageSource({
+    id: `msg-${crypto.randomUUID()}`,
+    chat_jid: "web:default",
+    sender: "user",
+    sender_name: "User",
+    content: "finish after steer accounting",
+    timestamp: new Date().toISOString(),
+    is_from_me: false,
+    is_bot_message: false,
+  }).source;
+
+  let pendingQueue = false;
+  let intentSourceSeq = 0;
+  let operationDuringPromptLaneCallback: unknown = null;
+  const webMod = await import("../../../src/channels/web.js");
+  const web = new (webMod.WebChannel as any)({
+    queue: { enqueue: () => {} },
+    agentPool: {
+      setSessionBinder: () => {},
+      hasPendingStreamingQueue: () => pendingQueue,
+      runAgent: async (_prompt: string, _chatJid: string, options: any) => {
+        const operation = db.getChatOperation("web:default");
+        if (!operation) throw new Error("expected active durable operation");
+        const owner = {
+          operationId: operation.operationId,
+          sourceSeq: operation.sourceSeq,
+          phase: operation.phase,
+          generation: operation.generation,
+        };
+        const registered = db.registerChatOperationIntent("web:default", owner, {
+          sourceKind: "steer",
+          sourceId: "suspended-failed-steer",
+          acceptedAt: new Date().toISOString(),
+          payloadRef: "message:suspended-failed-steer",
+        });
+        if (registered.status === "rejected") throw new Error(registered.reason);
+        intentSourceSeq = registered.source.sourceSeq;
+        pendingQueue = true;
+        const output = { status: "success" as const, result: "Terminal after failed steer.", attachments: [] };
+        expect(await options.onTerminalOutput?.(output)).toBe(false);
+        operationDuringPromptLaneCallback = db.getChatOperation("web:default");
+        expect(db.disposeChatOperationIntent("web:default", owner, {
+          sourceSeq: intentSourceSeq,
+          outcome: "failed",
+          cause: "steer_queue_failed",
+          provenance: "test_suspended_web_steer_failure",
+          createdAt: new Date().toISOString(),
+        }).status).toBe("disposed");
+        pendingQueue = false;
+        return output;
+      },
+      getContextUsageForChat: async () => null,
+    },
+  });
+
+  await web.processChat("web:default", "default");
+
+  expect(operationDuringPromptLaneCallback).not.toBeNull();
+  expect(db.getChatOperation("web:default")).toBeNull();
+  expect(db.getChatOperationDisposition(intentSourceSeq)).toMatchObject({
+    outcome: "failed",
+    cause: "steer_queue_failed",
+    provenance: "test_suspended_web_steer_failure",
+  });
+  expect(db.getChatOperationDisposition(source.sourceSeq)).toMatchObject({
+    outcome: "succeeded",
+    cause: "agent_completed",
+    provenance: "web_process_chat",
+  });
+  const terminal = db.getDb().prepare(`SELECT content, is_terminal_agent_reply FROM messages
+    WHERE chat_jid = ? AND is_bot_message = 1 ORDER BY rowid DESC LIMIT 1`).get("web:default");
+  expect(terminal).toEqual({ content: "Terminal after failed steer.", is_terminal_agent_reply: 1 });
 });
 
 test("prompt-lane terminal commit failure rolls back, broadcasts nothing, blocks durable ownership, and suppresses maintenance", async () => {

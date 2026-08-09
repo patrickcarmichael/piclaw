@@ -173,6 +173,8 @@ describe("chat tool extension", () => {
       target_address: "@research",
       content: "hello",
       mode: "auto",
+      idempotency_key: " local-once ",
+      in_reply_to: " local-parent ",
     }));
 
     expect(calls).toEqual([{
@@ -180,6 +182,8 @@ describe("chat tool extension", () => {
       target_agent_name: "research",
       content: "hello",
       mode: "auto",
+      idempotency_key: "local-once",
+      in_reply_to: "local-parent",
     }]);
     expect(result.details).toMatchObject({
       relayed: true,
@@ -187,6 +191,28 @@ describe("chat tool extension", () => {
       target_address: "@research",
       target_agent_name: "research",
     });
+  });
+
+  test("distinguishes missing acknowledgement from acknowledgement timeout", async () => {
+    const { tool, chatToolModule } = await getTool();
+    chatToolModule.setChatToolRelayFn(async (request) => ({
+      status: "indeterminate",
+      relayed: false,
+      source_chat_jid: request.source_chat_jid,
+      target_chat_jid: "web:target",
+      target_agent_name: "research",
+      acknowledged: false,
+      delivery_disposition: "indeterminate",
+    }));
+
+    const result = await withChatContext(chatJid, "web", () => tool.execute("x", {
+      target_agent_name: "research",
+      content: "hello",
+      idempotency_key: "missing-ack",
+    }));
+
+    expect(result.content[0].text).toContain("durable acceptance was not acknowledged");
+    expect(result.content[0].text).not.toContain("timed out");
   });
 
   test("dispatches one-hop bang addresses with transport metadata", async () => {

@@ -718,8 +718,12 @@ export function installWebChannelPrototype(
     handleAgentMessage: {
       configurable: true,
       writable: true,
-      value: withLifecycleSpecialSurface(defaults, (service, req: Request, pathname: string) =>
-        service.handleAgentMessage(req, pathname)),
+      value: withLifecycleSpecialSurface(defaults, (
+        service,
+        req: Request,
+        pathname: string,
+        onAccepted?: Parameters<WebChannelLike["handleAgentMessage"]>[2],
+      ) => service.handleAgentMessage(req, pathname, onAccepted)),
     },
     processChat: {
       configurable: true,

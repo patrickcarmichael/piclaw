@@ -247,4 +247,138 @@ describe("SessionMutationGateway", () => {
     release.resolve();
     await running;
   });
+
+  test("admits an exact-owner queue effect out of band only for the matching prompt occupant", async () => {
+    const active = operation();
+    const gateway = new SessionMutationGateway({ getOperation: () => active });
+    const entered = deferred();
+    const release = deferred();
+    const running = gateway.run("web:test", "prompt", { scope: "operation", owner: owner(active) }, async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    await entered.promise;
+
+    const events: string[] = [];
+    await gateway.compareAndActQueue(
+      "web:test",
+      { scope: "operation", owner: owner(active) },
+      () => { events.push("register"); },
+      () => { events.push("queue"); },
+    );
+    expect(events).toEqual(["register", "queue"]);
+
+    release.resolve();
+    await running;
+  });
+
+  test("rejects same-owner queue effects while compaction, rotation, or recovery occupies the lane", async () => {
+    const active = operation();
+    const gateway = new SessionMutationGateway({ getOperation: () => active });
+    let effects = 0;
+
+    for (const mutation of ["compaction", "rotation", "recovery"] as const) {
+      const entered = deferred();
+      const release = deferred();
+      const running = gateway.run("web:test", mutation, { scope: "operation", owner: owner(active) }, async () => {
+        entered.resolve();
+        await release.promise;
+      });
+      await entered.promise;
+      await expect(gateway.compareAndActQueue(
+        "web:test",
+        { scope: "operation", owner: owner(active) },
+        () => { effects += 1; },
+        () => { effects += 1; },
+      )).rejects.toMatchObject({ reason: "active_mutation_mismatch" });
+      release.resolve();
+      await running;
+    }
+    expect(effects).toBe(0);
+  });
+
+  test("tracks inherited recovery occupancy and restores the enclosing prompt occupant", async () => {
+    const active = operation();
+    const gateway = new SessionMutationGateway({ getOperation: () => active });
+    const recoveryEntered = deferred();
+    const releaseRecovery = deferred();
+    const recoveryDone = deferred();
+    const releasePrompt = deferred();
+    let registrations = 0;
+    let effects = 0;
+
+    const prompt = gateway.run("web:test", "prompt", { scope: "operation", owner: owner(active) }, async () => {
+      await gateway.runInheritedOrLegacy("web:test", "recovery", async () => {
+        recoveryEntered.resolve();
+        await releaseRecovery.promise;
+      });
+      recoveryDone.resolve();
+      await releasePrompt.promise;
+    });
+    await recoveryEntered.promise;
+
+    await expect(gateway.compareAndActQueue(
+      "web:test",
+      { scope: "operation", owner: owner(active) },
+      () => { registrations += 1; },
+      () => { effects += 1; },
+    )).rejects.toMatchObject({ reason: "active_mutation_mismatch" });
+    releaseRecovery.resolve();
+    await recoveryDone.promise;
+
+    await gateway.compareAndActQueue(
+      "web:test",
+      { scope: "operation", owner: owner(active) },
+      () => { registrations += 1; },
+      () => { effects += 1; },
+    );
+    expect(registrations).toBe(1);
+    expect(effects).toBe(1);
+    releasePrompt.resolve();
+    await prompt;
+  });
+
+  test("rechecks exact ownership after durable queue registration and before the SDK effect", async () => {
+    let active = operation();
+    const gateway = new SessionMutationGateway({ getOperation: () => active });
+    const entered = deferred();
+    const release = deferred();
+    const running = gateway.run("web:test", "prompt", { scope: "operation", owner: owner(active) }, async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    await entered.promise;
+
+    let queued = false;
+    await expect(gateway.compareAndActQueue(
+      "web:test",
+      { scope: "operation", owner: owner(active) },
+      () => { active = operation(1); },
+      () => { queued = true; },
+    )).rejects.toMatchObject({ reason: "generation_mismatch" });
+    expect(queued).toBe(false);
+
+    release.resolve();
+    await running;
+  });
+
+  test("rejects stale and legacy out-of-band queue callers before registration or SDK effects", async () => {
+    const active = operation(1);
+    const gateway = new SessionMutationGateway({ getOperation: () => active });
+    let effects = 0;
+
+    await expect(gateway.compareAndActQueue(
+      "web:test",
+      { scope: "operation", owner: owner(operation()) },
+      () => { effects += 1; },
+      () => { effects += 1; },
+    )).rejects.toMatchObject({ reason: "generation_mismatch" });
+    await expect(gateway.compareAndActQueue(
+      "web:test",
+      { scope: "legacy" },
+      () => { effects += 1; },
+      () => { effects += 1; },
+    )).rejects.toMatchObject({ reason: "legacy_conflict" });
+    expect(effects).toBe(0);
+  });
 });
