@@ -144,6 +144,99 @@ test("SSEClient invalidates stale connection callbacks and preserves one deliver
   }
 });
 
+test("SSE remount and chat switch keep Abort bound to the latest visible operation", async () => {
+  const OriginalEventSource = globalThis.EventSource;
+  const originalFetch = globalThis.fetch;
+  const instances: FakeEventSource[] = [];
+  let visibleStatus: any = null;
+  let seenUrl = "";
+  let seenBody: any = null;
+
+  class FakeEventSource {
+    onopen: (() => void) | null = null;
+    onerror: (() => void) | null = null;
+    listeners = new Map<string, Array<(event: { data: string }) => void>>();
+    constructor(_url: string) {
+      instances.push(this);
+    }
+    addEventListener(event: string, listener: (event: { data: string }) => void) {
+      const current = this.listeners.get(event) ?? [];
+      current.push(listener);
+      this.listeners.set(event, current);
+    }
+    emit(event: string, data: unknown) {
+      for (const listener of this.listeners.get(event) ?? []) {
+        listener({ data: JSON.stringify(data) });
+      }
+    }
+    close() {}
+  }
+
+  globalThis.EventSource = FakeEventSource as any;
+  globalThis.fetch = (async (url, init) => {
+    seenUrl = String(url);
+    seenBody = init?.body ? JSON.parse(String(init.body)) : null;
+    return new Response(JSON.stringify({ status: "ok" }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }) as typeof fetch;
+
+  try {
+    const mountA = new SSEClient((type, data) => {
+      if (type === "agent_status") visibleStatus = data;
+    }, () => {}, { chatJid: "web:branch-a" });
+    mountA.connect();
+    instances[0].emit("agent_status", {
+      type: "thinking",
+      operation_id: "operation-a",
+      operation_authority: "durable",
+    });
+    expect(visibleStatus.operation_id).toBe("operation-a");
+
+    mountA.disconnect();
+    const remountA = new SSEClient((type, data) => {
+      if (type === "agent_status") visibleStatus = data;
+    }, () => {}, { chatJid: "web:branch-a" });
+    remountA.connect();
+    instances[0].emit("agent_status", {
+      type: "thinking",
+      operation_id: "operation-stale",
+      operation_authority: "durable",
+    });
+    instances[1].emit("agent_status", {
+      type: "tool",
+      operation_id: "operation-a-remount",
+      operation_authority: "durable",
+    });
+    expect(visibleStatus.operation_id).toBe("operation-a-remount");
+
+    remountA.disconnect();
+    const mountB = new SSEClient((type, data) => {
+      if (type === "agent_status") visibleStatus = data;
+    }, () => {}, { chatJid: "web:branch-b" });
+    mountB.connect();
+    instances[1].emit("agent_status", {
+      type: "tool",
+      operation_id: "operation-a-late",
+      operation_authority: "durable",
+    });
+    instances[2].emit("agent_status", {
+      type: "tool",
+      operation_id: "operation-b",
+      operation_authority: "durable",
+    });
+
+    await abortAgentOperation("default", "web:branch-b", visibleStatus.operation_id);
+    expect(seenUrl).toBe("/agent/default/message?chat_jid=web%3Abranch-b");
+    expect(seenBody.expected_operation_id).toBe("operation-b");
+    mountB.disconnect();
+  } finally {
+    globalThis.EventSource = OriginalEventSource;
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("SSEClient no longer registers stale agent_request listeners", () => {
   const OriginalEventSource = globalThis.EventSource;
   const seenEvents: string[] = [];

@@ -57,14 +57,18 @@ test("remote cancellation persists before aborting only the exact gateway occupa
   const promptGate = new Promise<void>((resolve) => { releasePrompt = resolve; });
   let cancellationSeenByAbort: unknown = null;
   let abortCalls = 0;
+  let queuedToolCalls = 0;
+  let aborted = false;
   class BlockingSession {
     subscribe() { return () => {}; }
     async prompt() {
       promptStarted = true;
       await promptGate;
+      if (!aborted) queuedToolCalls += 1;
     }
     async abort() {
       abortCalls += 1;
+      aborted = true;
       cancellationSeenByAbort = db.getChatOperation(chatJid)?.cancellation ?? null;
       releasePrompt();
     }
@@ -92,6 +96,8 @@ test("remote cancellation persists before aborting only the exact gateway occupa
   expect(db.getChatOperation(chatJid)?.cancellation).toEqual(cancellationSeenByAbort);
 
   await run;
+  expect(queuedToolCalls).toBe(0);
+  expect(db.getChatOperation(chatJid)?.cancellation).toEqual(cancellationSeenByAbort);
   await pool.shutdown();
   ws.cleanup();
 });

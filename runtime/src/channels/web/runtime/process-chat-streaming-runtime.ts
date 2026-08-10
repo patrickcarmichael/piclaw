@@ -66,7 +66,11 @@ export async function createProcessChatStreamingRuntime(options: {
       const isToolStatus = payload?.type === "tool_call" || payload?.type === "tool_status";
       const toolName = typeof payload?.tool_name === "string" ? payload.tool_name.trim() : "";
       let nextPayload = isToolStatus && toolName ? options.withResolvedToolStatusHints(chatJid, payload) : payload;
-      if (options.operationId) nextPayload = { ...nextPayload, operation_id: options.operationId };
+      nextPayload = {
+        ...nextPayload,
+        operation_authority: options.operationId ? "durable" : "legacy",
+        ...(options.operationId ? { operation_id: options.operationId } : {}),
+      };
       nextPayload = options.withAgentStatusProgressMetadata(nextPayload, channel.getAgentStatus(chatJid));
       channel.updateAgentStatus(chatJid, nextPayload);
       emitter.status(nextPayload);

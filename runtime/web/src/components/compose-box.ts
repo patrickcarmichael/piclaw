@@ -267,6 +267,13 @@ export function isComposeSubmitAbortMode(mode) {
     return mode === 'abort' || mode === 'compacting';
 }
 
+export function resolveComposeAbortAuthority(activeOperationId, operationAuthority) {
+    const operationId = typeof activeOperationId === 'string' ? activeOperationId.trim() : '';
+    if (operationId) return { mode: 'exact', operationId };
+    if (operationAuthority === 'legacy') return { mode: 'legacy', operationId: null };
+    return { mode: 'unavailable', operationId: null };
+}
+
 export function resolveComposeExtensionWorkingDisplay(workingState, frameIndex = 0) {
     // Extension can hide the entire working loader row via setWorkingVisible(false)
     if (workingState?.visible === false) {
@@ -1116,6 +1123,7 @@ export function ComposeBox({
     onMessageResponse,
     isAgentActive = false,
     activeOperationId = null,
+    activeOperationAuthority = null,
     activeChatAgents = [],
     currentChatJid = 'web:default',
     connectionStatus = 'connected',
@@ -2363,15 +2371,21 @@ export function ComposeBox({
     };
 
     const handleAbortActiveOperation = async () => {
-        const operationId = typeof activeOperationId === 'string' ? activeOperationId.trim() : '';
-        if (!operationId) {
+        const authority = resolveComposeAbortAuthority(activeOperationId, activeOperationAuthority);
+        if (authority.mode === 'legacy') {
             await handleSubmit('/abort', 'steer', { clearAfterSubmit: false, includeMedia: false, includeFileRefs: false, includeFolderRefs: false, includeMessageRefs: false, recordHistory: false });
+            return;
+        }
+        if (authority.mode === 'unavailable') {
+            const message = 'The active operation identity is not available; no cancellation was sent.';
+            setSubmitError(message);
+            onSubmitError?.(message);
             return;
         }
         setSubmitError(null);
         setSubmitNotice(null);
         try {
-            const response = await abortAgentOperation(currentAgentId, currentChatJid, operationId);
+            const response = await abortAgentOperation(currentAgentId, currentChatJid, authority.operationId);
             onMessageResponse?.(response);
             setSubmitNotice(resolveUiOnlyCommandNotice('/abort', response));
             onPost?.(response);

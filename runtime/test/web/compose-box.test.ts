@@ -20,6 +20,7 @@ import {
   resolveComposePrefillRequest,
   resolveComposeSubmitButtonState,
   resolveComposeAbortButtonState,
+  resolveComposeAbortAuthority,
   shouldStartSpeechPushToTalk,
   shouldStopSpeechPushToTalk,
   isComposeSubmitAbortMode,
@@ -604,6 +605,25 @@ test('resolveComposeAbortButtonState stays coherent across idle, stop, and compa
     title: 'Stop response',
     ariaLabel: 'Stop response',
     disabled: false,
+  });
+});
+
+test('resolveComposeAbortAuthority never treats a transient missing operation id as legacy ownership', () => {
+  expect(resolveComposeAbortAuthority('operation-123', 'durable')).toEqual({
+    mode: 'exact',
+    operationId: 'operation-123',
+  });
+  expect(resolveComposeAbortAuthority(null, 'legacy')).toEqual({
+    mode: 'legacy',
+    operationId: null,
+  });
+  expect(resolveComposeAbortAuthority(null, 'durable')).toEqual({
+    mode: 'unavailable',
+    operationId: null,
+  });
+  expect(resolveComposeAbortAuthority(null, null)).toEqual({
+    mode: 'unavailable',
+    operationId: null,
   });
 });
 

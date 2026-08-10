@@ -26,7 +26,11 @@ describe("process chat streaming runtime", () => {
     expect(events).toEqual(expect.arrayContaining([
       expect.objectContaining({
         type: "agent_status",
-        payload: expect.objectContaining({ type: "thinking", operation_id: "op-1" }),
+        payload: expect.objectContaining({
+          type: "thinking",
+          operation_id: "op-1",
+          operation_authority: "durable",
+        }),
       }),
     ]));
   });
@@ -51,6 +55,7 @@ describe("process chat streaming runtime", () => {
           detail: "Repeated identical failures reached the loop-guard limit.",
           classifier: "recovery_suppressed",
           recovery_suppressed_reason: "Repeated identical failures reached the loop-guard limit.",
+          operation_authority: "legacy",
         }),
       }),
     ]));
