@@ -2,7 +2,9 @@ import { describe, expect, test } from "bun:test";
 import "../../helpers.ts";
 import {
   beginChatRun,
+  cancelChatOperation,
   claimNextChatOperation,
+  completeChatOperation,
   disposeChatOperationIntent,
   fenceChatOperationSettlement,
   getChatCursor,
@@ -16,6 +18,37 @@ import {
   storeMessage,
 } from "../../../src/db.js";
 import { handleAgentMessage } from "../../../src/channels/web/handlers/agent.ts";
+
+function cleanupActiveOperation(chatJid: string): void {
+  let operation = getChatOperation(chatJid);
+  if (!operation) return;
+  const owner = {
+    operationId: operation.operationId,
+    sourceSeq: operation.sourceSeq,
+    phase: operation.phase,
+    generation: operation.generation,
+  };
+  if (!operation.cancellation) {
+    const cancellation = cancelChatOperation(chatJid, owner, {
+      cause: "test_cleanup",
+      requestedAt: "2026-08-08T09:02:00.000Z",
+    });
+    if (cancellation.status !== "applied") return;
+    operation = cancellation.operation;
+  }
+  completeChatOperation(chatJid, {
+    owner: {
+      operationId: operation.operationId,
+      sourceSeq: operation.sourceSeq,
+      phase: operation.phase,
+      generation: operation.generation,
+    },
+    outcome: "cancelled",
+    cause: operation.cancellation?.cause ?? "test_cleanup",
+    provenance: "agent_message_handler_test_cleanup",
+    createdAt: "2026-08-08T09:02:01.000Z",
+  });
+}
 
 describe("web agent message handler", () => {
   test("handles /meters as a UI-only command while still returning command output as an assistant message", async () => {
@@ -157,6 +190,7 @@ describe("web agent message handler", () => {
   });
 
   test("handles /abort as a UI-only hard stop without writing a timeline command message", async () => {
+    initDatabase();
     const broadcasts: Array<{ event: string; payload: unknown }> = [];
     const applyCalls: Array<{ chatJid: string; command: { type: string; raw: string } }> = [];
     let storeMessageCalls = 0;
@@ -206,18 +240,8 @@ describe("web agent message handler", () => {
   });
 
   test("routes durable /abort through cancellation before physical session abort", async () => {
-    initDatabase();
     const chatJid = "web:durable-local-abort";
-    registerAcceptedChatSource({
-      chatJid,
-      sourceClass: "prompt",
-      sourceKind: "queued_followup",
-      sourceId: "local-abort-source",
-      acceptedAt: "2026-08-08T09:00:00.000Z",
-      payloadRef: "followup:local-abort-source",
-    });
-    const operation = claimNextChatOperation(chatJid).operation;
-    if (!operation) throw new Error("expected operation");
+    const operation = { operationId: "operation-exact" };
     const cancellationCalls: unknown[][] = [];
     const resumes: string[] = [];
     let legacyAbortCalls = 0;
@@ -227,7 +251,7 @@ describe("web agent message handler", () => {
         isActive: () => true,
         cancelOperationAndAbort: async (...args: unknown[]) => {
           cancellationCalls.push(args);
-          return { status: "cancelled", physicallyAborted: true, operation: getChatOperation(chatJid) };
+          return { status: "cancelled", physicallyAborted: true, operation };
         },
         applyControlCommand: async () => {
           legacyAbortCalls += 1;
@@ -249,7 +273,7 @@ describe("web agent message handler", () => {
     const response = await handleAgentMessage(channel, new Request("https://example.com/agent/default/message", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content: "/abort" }),
+      body: JSON.stringify({ content: "/abort", expected_operation_id: operation.operationId }),
     }), "/agent/default/message", chatJid, "default");
     const body = await response.json();
 
@@ -260,6 +284,52 @@ describe("web agent message handler", () => {
       status: "success",
       cancellation_status: "cancelled",
       physically_aborted: true,
+    });
+  });
+
+  test("rejects a stale compose abort without cancelling the replacement operation", async () => {
+    const chatJid = "web:stale-local-abort";
+    const operation = { operationId: "operation-replacement" };
+    const cancellationCalls: unknown[][] = [];
+    const resumes: string[] = [];
+    const channel = {
+      agentPool: {
+        isStreaming: () => true,
+        isActive: () => true,
+        cancelOperationAndAbort: async (_chatJid: string, expectedOperationId: string, cause: string) => {
+          cancellationCalls.push([_chatJid, expectedOperationId, cause]);
+          return expectedOperationId === operation.operationId
+            ? { status: "cancelled", physicallyAborted: true, operation }
+            : { status: "no_op", reason: "operation_mismatch", physicallyAborted: false, operation };
+        },
+      },
+      resumeChat: (nextChatJid: string) => { resumes.push(nextChatJid); },
+      json: (payload: unknown, status = 200) => new Response(JSON.stringify(payload), {
+        status,
+        headers: { "Content-Type": "application/json" },
+      }),
+      enqueueQueuedFollowupItem: () => 0,
+      getQueuedFollowupCount: () => 0,
+      broadcastEvent: () => {},
+      storeMessage: () => null,
+      sendMessage: async () => {},
+    } as any;
+
+    const response = await handleAgentMessage(channel, new Request("https://example.com/agent/default/message", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content: "/abort", expected_operation_id: "op-stale" }),
+    }), "/agent/default/message", chatJid, "default");
+    const body = await response.json();
+
+    expect(response.status).toBe(409);
+    expect(cancellationCalls).toEqual([[chatJid, "op-stale", "user_abort"]]);
+    expect(resumes).toEqual([]);
+    expect(body).toMatchObject({
+      error: "The active operation changed before cancellation; no action was taken.",
+      reason: "operation_mismatch",
+      expected_operation_id: "op-stale",
+      observed_operation_id: operation.operationId,
     });
   });
 
@@ -887,6 +957,7 @@ describe("web agent message handler", () => {
       payload: expect.objectContaining({ queued: "steer_failed" }),
     }));
     expect(broadcasts.some((entry) => entry.event === "agent_steer_queued")).toBe(false);
+    cleanupActiveOperation(chatJid);
   });
 
   test("returns typed 400s for malformed agent message payload classes", async () => {
@@ -923,6 +994,16 @@ describe("web agent message handler", () => {
         name: "thread id wrong type",
         body: JSON.stringify({ content: "hello", thread_id: "nan" }),
         expectedError: "'thread_id' must be a positive integer or null",
+      },
+      {
+        name: "expected operation id wrong type",
+        body: JSON.stringify({ content: "/abort", expected_operation_id: 42 }),
+        expectedError: "'expected_operation_id' must be a string",
+      },
+      {
+        name: "expected operation id empty",
+        body: JSON.stringify({ content: "/abort", expected_operation_id: "   " }),
+        expectedError: "'expected_operation_id' must be between 1 and 128 characters",
       },
       {
         name: "content blocks wrong shape",

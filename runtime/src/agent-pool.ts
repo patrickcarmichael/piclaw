@@ -545,12 +545,31 @@ export class AgentPool {
   ): Promise<OperationCancellationControlResult> {
     const operation = getChatOperation(chatJid);
     if (!operation) {
+      log.warn("Operation abort rejected because no active operation exists", {
+        operation: "operation_abort.rejected",
+        chatJid,
+        expectedOperationId,
+        reason: "no_active_operation",
+      });
       return { status: "no_op", reason: "no_active_operation", operation: null, physicallyAborted: false };
     }
     if (operation.operationId !== expectedOperationId) {
+      log.warn("Operation abort rejected because ownership changed", {
+        operation: "operation_abort.rejected",
+        chatJid,
+        expectedOperationId,
+        observedOperationId: operation.operationId,
+        reason: "operation_mismatch",
+      });
       return { status: "no_op", reason: "operation_mismatch", operation, physicallyAborted: false };
     }
     if (operation.cancellation) {
+      log.info("Operation abort was already durably accepted", {
+        operation: "operation_abort.rejected",
+        chatJid,
+        expectedOperationId,
+        reason: "already_cancelled",
+      });
       return { status: "no_op", reason: "already_cancelled", operation, physicallyAborted: false };
     }
 
@@ -576,6 +595,12 @@ export class AgentPool {
     );
     const cancellation = abort.cancellation;
     if (cancellation.status !== "applied") {
+      log.warn("Operation abort lost its durable ownership race", {
+        operation: "operation_abort.rejected",
+        chatJid,
+        expectedOperationId,
+        reason: cancellation.reason,
+      });
       return {
         status: "no_op",
         reason: cancellation.reason,
@@ -584,10 +609,17 @@ export class AgentPool {
       };
     }
     const abortResult = abort.result;
+    const physicallyAborted = abort.acted && abortResult?.status === "success";
+    log.info("Operation abort persisted before physical cancellation", {
+      operation: "operation_abort.accepted",
+      chatJid,
+      expectedOperationId,
+      physicallyAborted,
+    });
     return {
       status: "cancelled",
       operation: cancellation.operation,
-      physicallyAborted: abort.acted && abortResult?.status === "success",
+      physicallyAborted,
       ...(abortResult ? { abortResult } : {}),
     };
   }

@@ -8,7 +8,7 @@
 import { expect, test } from "bun:test";
 import "../../helpers.js";
 
-import { SSEClient, streamSidePrompt } from "../../../web/src/api.ts";
+import { abortAgentOperation, SSEClient, streamSidePrompt } from "../../../web/src/api.ts";
 
 test("SSEClient scheduleReconnect triggers cooldown", () => {
   const client = new SSEClient(() => {}, () => {});
@@ -71,6 +71,79 @@ test("SSEClient connects to a chat-scoped SSE stream when chatJid is provided", 
   }
 });
 
+test("SSEClient invalidates stale connection callbacks and preserves one delivery per independent client", () => {
+  const OriginalEventSource = globalThis.EventSource;
+  const instances: FakeEventSource[] = [];
+
+  class FakeEventSource {
+    onopen: (() => void) | null = null;
+    onerror: (() => void) | null = null;
+    listeners = new Map<string, Array<(event: { data: string }) => void>>();
+    closed = false;
+    constructor(_url: string) {
+      instances.push(this);
+    }
+    addEventListener(event: string, listener: (event: { data: string }) => void) {
+      const current = this.listeners.get(event) ?? [];
+      current.push(listener);
+      this.listeners.set(event, current);
+    }
+    emit(event: string, data: unknown = {}) {
+      for (const listener of this.listeners.get(event) ?? []) {
+        listener({ data: JSON.stringify(data) });
+      }
+    }
+    close() {
+      this.closed = true;
+    }
+  }
+
+  globalThis.EventSource = FakeEventSource as any;
+  try {
+    const firstEvents: Array<{ type: string; data: any }> = [];
+    const secondEvents: string[] = [];
+    const first = new SSEClient((type, data) => firstEvents.push({ type, data }), () => {}, { chatJid: "web:branch-a" });
+    const second = new SSEClient((type) => secondEvents.push(type), () => {}, { chatJid: "web:branch-a" });
+    first.connect();
+    second.connect();
+    const stale = instances[0];
+    const independent = instances[1];
+
+    stale.onopen?.();
+    independent.onopen?.();
+    stale.onerror?.();
+    expect(stale.closed).toBe(true);
+    first.reconnectIfNeeded();
+    const authoritative = instances[2];
+    authoritative.onopen?.();
+
+    stale.emit("agent_draft_delta", { turn_id: "turn-old", delta: "duplicate" });
+    stale.emit("agent_status", { type: "thinking", operation_id: "operation-old" });
+    stale.emit("new_post", { id: "post-old" });
+    stale.onopen?.();
+    stale.onerror?.();
+    authoritative.emit("agent_draft_delta", { turn_id: "turn-new", delta: "continued" });
+    authoritative.emit("agent_status", { type: "thinking", operation_id: "operation-new" });
+    authoritative.emit("new_post", { id: "post-new" });
+    independent.emit("agent_status", { type: "thinking" });
+
+    expect(firstEvents).toEqual([
+      { type: "agent_draft_delta", data: { turn_id: "turn-new", delta: "continued" } },
+      { type: "agent_status", data: { type: "thinking", operation_id: "operation-new" } },
+      { type: "new_post", data: { id: "post-new" } },
+    ]);
+    expect(secondEvents).toEqual(["agent_status"]);
+
+    first.disconnect();
+    stale.emit("agent_status", { type: "thinking" });
+    authoritative.emit("agent_status", { type: "thinking" });
+    expect(firstEvents).toHaveLength(3);
+    second.disconnect();
+  } finally {
+    globalThis.EventSource = OriginalEventSource;
+  }
+});
+
 test("SSEClient no longer registers stale agent_request listeners", () => {
   const OriginalEventSource = globalThis.EventSource;
   const seenEvents: string[] = [];
@@ -99,6 +172,49 @@ test("SSEClient no longer registers stale agent_request listeners", () => {
     expect(seenEvents).toContain("extension_ui_error");
   } finally {
     globalThis.EventSource = OriginalEventSource;
+  }
+});
+
+test("abortAgentOperation submits the exact operation owner for the active chat", async () => {
+  const originalFetch = globalThis.fetch;
+  let seenUrl = "";
+  let seenBody: any = null;
+  globalThis.fetch = (async (url, init) => {
+    seenUrl = String(url);
+    seenBody = init?.body ? JSON.parse(String(init.body)) : null;
+    return new Response(JSON.stringify({ status: "ok" }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }) as typeof fetch;
+
+  try {
+    await abortAgentOperation("default", "web:branch-a", "operation-123");
+    expect(seenUrl).toBe("/agent/default/message?chat_jid=web%3Abranch-a");
+    expect(seenBody).toMatchObject({
+      content: "/abort",
+      expected_operation_id: "operation-123",
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("abortAgentOperation surfaces stale-owner rejection text to the compose caller", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({
+    error: "The active operation changed before cancellation; no action was taken.",
+    reason: "operation_mismatch",
+  }), {
+    status: 409,
+    headers: { "Content-Type": "application/json" },
+  })) as typeof fetch;
+
+  try {
+    await expect(abortAgentOperation("default", "web:branch-a", "operation-stale"))
+      .rejects.toThrow("The active operation changed before cancellation; no action was taken.");
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 });
 

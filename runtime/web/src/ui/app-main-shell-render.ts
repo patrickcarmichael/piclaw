@@ -610,6 +610,7 @@ export function renderMainShell(options: MainShellRenderOptions): any {
           onModelChange=${setActiveModel}
           onModelStateChange=${applyModelState}
           statusNotice=${isCompactionStatus(agentStatus) ? agentStatus : null}
+          activeOperationId=${agentStatus?.operation_id ?? null}
           extensionWorkingState=${extensionWorkingState}
           prefillRequest=${composePrefillRequest}
         />

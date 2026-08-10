@@ -289,6 +289,21 @@ export async function sendAgentMessage(agentId, content, threadId = null, mediaI
     });
 }
 
+export async function abortAgentOperation(agentId, chatJid, expectedOperationId) {
+    const normalizedAgentId = typeof agentId === 'string' && agentId.trim() ? agentId.trim() : 'default';
+    const normalizedChatJid = typeof chatJid === 'string' && chatJid.trim() ? chatJid.trim() : 'web:default';
+    const operationId = typeof expectedOperationId === 'string' ? expectedOperationId.trim() : '';
+    if (!operationId) throw new Error('Missing active operation identity.');
+    return request(`/agent/${encodeURIComponent(normalizedAgentId)}/message?chat_jid=${encodeURIComponent(normalizedChatJid)}`, {
+        method: 'POST',
+        body: JSON.stringify({
+            content: '/abort',
+            expected_operation_id: operationId,
+            client_context: { screen_hint: resolveScreenSizeHint() },
+        }),
+    });
+}
+
 export async function getAgentCommands(chatJid = 'web:default') {
     const normalized = typeof chatJid === 'string' && chatJid.trim() ? chatJid.trim() : 'web:default';
     return deduplicatedGet(`/agent/commands?chat_jid=${encodeURIComponent(normalized)}`);
@@ -1063,6 +1078,8 @@ export class SSEClient {
     lastActivityAt: number;
     staleCheckTimer: ReturnType<typeof setInterval> | null;
     staleThresholdMs: number;
+    connectionGeneration: number;
+    stopped: boolean;
 
     constructor(onEvent, onStatusChange, options: ApiOptions = {}) {
         this.onEvent = onEvent;
@@ -1078,6 +1095,14 @@ export class SSEClient {
         this.lastActivityAt = 0;
         this.staleCheckTimer = null;
         this.staleThresholdMs = 70000;
+        this.connectionGeneration = 0;
+        this.stopped = false;
+    }
+
+    isAuthoritativeConnection(source: EventSource, generation: number) {
+        return !this.stopped
+            && this.connectionGeneration === generation
+            && this.eventSource === source;
     }
 
     markActivity() {
@@ -1091,10 +1116,10 @@ export class SSEClient {
         }
     }
 
-    startStaleMonitor() {
+    startStaleMonitor(source: EventSource, generation: number) {
         this.clearStaleMonitor();
         this.staleCheckTimer = setInterval(() => {
-            if (this.status !== 'connected') return;
+            if (!this.isAuthoritativeConnection(source, generation) || this.status !== 'connected') return;
             if (!this.lastActivityAt) return;
             if (Date.now() - this.lastActivityAt <= this.staleThresholdMs) return;
             console.warn('SSE connection went stale; forcing reconnect');
@@ -1104,10 +1129,15 @@ export class SSEClient {
 
     forceReconnect() {
         this.connecting = false;
-        if (this.eventSource) {
-            this.eventSource.close();
-            this.eventSource = null;
-        }
+        this.connectionGeneration += 1;
+        console.debug('SSE connection generation invalidated', {
+            chatJid: this.chatJid,
+            generation: this.connectionGeneration,
+            reason: 'forced_reconnect',
+        });
+        const source = this.eventSource;
+        this.eventSource = null;
+        source?.close();
         this.clearStaleMonitor();
         this.status = 'disconnected';
         this.onStatusChange('disconnected');
@@ -1118,35 +1148,55 @@ export class SSEClient {
     connect() {
         if (this.connecting) return;
         if (this.eventSource && this.status === 'connected') return;
+        this.stopped = false;
         this.connecting = true;
-        if (this.eventSource) {
-            this.eventSource.close();
-        }
+        this.connectionGeneration += 1;
+        const generation = this.connectionGeneration;
+        const previousSource = this.eventSource;
+        this.eventSource = null;
+        previousSource?.close();
         this.clearStaleMonitor();
         
         const query = this.chatJid ? `?chat_jid=${encodeURIComponent(this.chatJid)}` : '';
-        this.eventSource = new EventSource(API_BASE + '/sse/stream' + query);
+        const source = new EventSource(API_BASE + '/sse/stream' + query);
+        this.eventSource = source;
+        console.debug('SSE connection generation created', { chatJid: this.chatJid, generation });
 
         const bindJsonEvent = (eventType) => {
-            this.eventSource.addEventListener(eventType, (e) => {
+            source.addEventListener(eventType, (e) => {
+                if (!this.isAuthoritativeConnection(source, generation)) return;
                 this.markActivity();
                 this.onEvent(eventType, JSON.parse(e.data));
             });
         };
         
-        this.eventSource.onopen = () => {
+        source.onopen = () => {
+            if (!this.isAuthoritativeConnection(source, generation)) return;
             this.connecting = false;
             this.reconnectDelay = 1000;
             this.reconnectAttempts = 0;
             this.cooldownUntil = 0;
             this.status = 'connected';
+            console.debug('SSE connection generation authoritative', { chatJid: this.chatJid, generation });
             this.markActivity();
-            this.startStaleMonitor();
+            this.startStaleMonitor(source, generation);
             this.onStatusChange('connected');
         };
         
-        this.eventSource.onerror = () => {
+        source.onerror = () => {
+            if (!this.isAuthoritativeConnection(source, generation)) return;
             this.connecting = false;
+            this.connectionGeneration += 1;
+            this.eventSource = null;
+            // EventSource reconnects natively after errors. This client owns
+            // backoff/replacement, so close the failed source before scheduling
+            // another generation or both paths can deliver concurrently.
+            source.close();
+            console.debug('SSE connection generation invalidated', {
+                chatJid: this.chatJid,
+                generation,
+                reason: 'connection_error',
+            });
             this.clearStaleMonitor();
             this.status = 'disconnected';
             this.onStatusChange('disconnected');
@@ -1155,13 +1205,15 @@ export class SSEClient {
         };
         
         // Event handlers
-        this.eventSource.addEventListener('connected', () => {
+        source.addEventListener('connected', () => {
+            if (!this.isAuthoritativeConnection(source, generation)) return;
             this.markActivity();
             console.log('SSE connected');
             this.onEvent('connected', {});
         });
 
-        this.eventSource.addEventListener('heartbeat', () => {
+        source.addEventListener('heartbeat', () => {
+            if (!this.isAuthoritativeConnection(source, generation)) return;
             this.markActivity();
         });
         
@@ -1215,7 +1267,10 @@ export class SSEClient {
         const cooldownDelay = Math.max(this.cooldownUntil - now, 0);
         const delay = Math.max(this.reconnectDelay, cooldownDelay);
         
+        const generation = this.connectionGeneration;
         this.reconnectTimeout = setTimeout(() => {
+            if (this.stopped || this.connectionGeneration !== generation) return;
+            this.reconnectTimeout = null;
             console.log('Reconnecting SSE...');
             this.connect();
         }, delay);
@@ -1241,7 +1296,14 @@ export class SSEClient {
     }
     
     disconnect() {
+        this.stopped = true;
         this.connecting = false;
+        this.connectionGeneration += 1;
+        console.debug('SSE connection generation invalidated', {
+            chatJid: this.chatJid,
+            generation: this.connectionGeneration,
+            reason: 'disconnect',
+        });
         this.clearStaleMonitor();
         if (this.eventSource) {
             this.eventSource.close();

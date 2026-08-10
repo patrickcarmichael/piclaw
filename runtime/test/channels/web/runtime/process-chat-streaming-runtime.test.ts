@@ -16,14 +16,19 @@ function channel(events: Array<{ type: string; payload: any }>) {
 }
 
 describe("process chat streaming runtime", () => {
-  test("tracks compaction/recovery state and emits profiled streaming events", async () => {
+  test("tracks compaction/recovery state and emits operation-owned streaming events", async () => {
     const events: Array<{ type: string; payload: any }> = [];
-    const runtime = await createProcessChatStreamingRuntime({ channel: channel(events), chatJid: "web:test", agentId: "default", threadId: "thread-1", turnId: "turn-1", runStartedAt: "2026-01-01T00:00:00.000Z", sourceMessageId: "m1", withResolvedToolStatusHints: (_jid, payload) => payload, withAgentStatusProgressMetadata: (payload) => payload });
+    const runtime = await createProcessChatStreamingRuntime({ channel: channel(events), chatJid: "web:test", agentId: "default", threadId: "thread-1", turnId: "turn-1", operationId: "op-1", runStartedAt: "2026-01-01T00:00:00.000Z", sourceMessageId: "m1", withResolvedToolStatusHints: (_jid, payload) => payload, withAgentStatusProgressMetadata: (payload) => payload });
     runtime.streamingHandler({ type: "compaction_end", errorMessage: "context full" });
     runtime.streamingHandler({ type: "recovery_start" });
     runtime.streamingHandler({ type: "recovery_end", outcome: "exhausted" });
     expect(runtime.state).toMatchObject({ sawCompactionEvent: true, sawRecoveryEvent: true, lastCompactionErrorMessage: "context full", lastRecoveryOutcome: "exhausted" });
-    expect(events.some((event) => event.type === "agent_status" && event.payload.type === "thinking")).toBe(true);
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: "agent_status",
+        payload: expect.objectContaining({ type: "thinking", operation_id: "op-1" }),
+      }),
+    ]));
   });
 
   test("renders intentional zero-attempt recovery suppression distinctly from exhaustion", async () => {
