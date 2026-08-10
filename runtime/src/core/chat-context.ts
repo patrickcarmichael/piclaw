@@ -25,6 +25,8 @@ export interface ChatContext {
   channel: string;
   /** Exact agent turn identity when running inside a prompt lifecycle. */
   turnId?: string;
+  /** True only for a turn admitted from an active owner-facing web request. */
+  ownerAuthorizedWebSession?: boolean;
 }
 
 /** Node.js AsyncLocalStorage instance that carries the ChatContext. */
@@ -40,9 +42,14 @@ export async function withChatContext<T>(
   chatJid: string,
   channel: string,
   fn: () => Promise<T>,
-  options?: { turnId?: string },
+  options?: { turnId?: string; ownerAuthorizedWebSession?: boolean },
 ): Promise<T> {
-  return storage.run({ chatJid, channel, ...(options?.turnId ? { turnId: options.turnId } : {}) }, fn);
+  return storage.run({
+    chatJid,
+    channel,
+    ...(options?.turnId ? { turnId: options.turnId } : {}),
+    ...(options?.ownerAuthorizedWebSession === true ? { ownerAuthorizedWebSession: true } : {}),
+  }, fn);
 }
 
 /**

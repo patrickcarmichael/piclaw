@@ -1,7 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import { handleAgentRoutes } from "../../../src/channels/web/http/dispatch-agent.js";
+import {
+  createTrustedAgentMessageRequestContext,
+  isOwnerAuthorizedAgentMessageRequestContext,
+} from "../../../src/channels/web/messaging/agent-message-provenance.js";
 
 describe("web http agent dispatch", () => {
+  test("does not treat absent or trusted internal relay context as owner authorization", () => {
+    expect(isOwnerAuthorizedAgentMessageRequestContext(undefined)).toBe(false);
+    expect(isOwnerAuthorizedAgentMessageRequestContext(createTrustedAgentMessageRequestContext({ source: "chat_tool" })))
+      .toBe(false);
+  });
+
   test("returns null for non-agent routes", async () => {
     const channel = {} as any;
     const req = new Request("https://example.com/timeline", { method: "GET" });
@@ -20,8 +30,10 @@ describe("web http agent dispatch", () => {
   });
 
   test("dispatches dynamic /agent/:id/message routes before exact matches and preserves the routed request", async () => {
+    let receivedContext: object | undefined;
     const channel = {
-      handleAgentMessage: async (req: Request, path: string) => {
+      handleAgentMessage: async (req: Request, path: string, _onAccepted: unknown, context: object | undefined) => {
+        receivedContext = context;
         const url = new URL(req.url);
         return new Response(`${path}:${url.searchParams.get("chat_jid") ?? ""}`, { status: 202 });
       },
@@ -31,6 +43,7 @@ describe("web http agent dispatch", () => {
     const response = await handleAgentRoutes(channel, req, "/agent/roster/message", new URL(req.url));
     expect(response?.status).toBe(202);
     expect(await response?.text()).toBe("/agent/roster/message:web:branch");
+    expect(isOwnerAuthorizedAgentMessageRequestContext(receivedContext)).toBe(true);
   });
 
   test("dispatches remaining agent endpoints", async () => {

@@ -20,6 +20,20 @@ export interface TrustedAgentMessageProvenance {
 export type AgentMessageRequestContext = object;
 
 const trustedContexts = new WeakMap<object, TrustedAgentMessageProvenance>();
+const ownerAuthorizedContexts = new WeakSet<object>();
+
+/** Brand a request admitted through the owner-facing HTTP dispatch boundary. */
+export function createOwnerAuthorizedAgentMessageRequestContext(): AgentMessageRequestContext {
+  const context = Object.freeze({});
+  ownerAuthorizedContexts.add(context);
+  return context;
+}
+
+export function isOwnerAuthorizedAgentMessageRequestContext(
+  context: AgentMessageRequestContext | undefined,
+): boolean {
+  return Boolean(context && typeof context === "object" && ownerAuthorizedContexts.has(context));
+}
 
 export function createTrustedAgentMessageRequestContext(
   provenance: TrustedAgentMessageProvenance = {},

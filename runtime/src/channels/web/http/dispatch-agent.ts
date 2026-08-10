@@ -28,6 +28,7 @@ import {
 } from "../handlers/general-settings.js";
 import { getQuickActionsSettingsData, saveQuickActionsSettings } from "../handlers/quick-actions-settings.js";
 import { handleScheduledTasksManagementAction, handleScheduledTasksManagementList } from "../handlers/scheduled-tasks-management.js";
+import { createOwnerAuthorizedAgentMessageRequestContext } from "../messaging/agent-message-provenance.js";
 import { getWorkspaceSettingsData, saveWorkspaceSettings } from "../handlers/workspace-settings.js";
 import { getServerUiState, setServerUiMetersConfig, setServerUiOutputConfig, setServerUiThemeConfig } from "../ui-state.js";
 import {
@@ -721,7 +722,8 @@ export async function handleAgentRoutes(
   url: URL
 ): Promise<Response | null> {
   if (req.method === "POST" && pathname.startsWith("/agent/") && pathname.endsWith("/message")) {
-    return await channel.handleAgentMessage(req, pathname);
+    const ownerContext = createOwnerAuthorizedAgentMessageRequestContext();
+    return await channel.handleAgentMessage(req, pathname, undefined, ownerContext);
   }
 
   if ((req.method === "GET" || req.method === "HEAD") && pathname.startsWith("/agent/addons/assets/")) {

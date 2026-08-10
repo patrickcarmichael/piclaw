@@ -96,6 +96,23 @@ describe("messages tool extension", () => {
     return withChatContext(chatJid, "web", () => tool.execute("x", params));
   }
 
+  test("secure_delete requires owner-facing web provenance, not just a web chat context", async () => {
+    const { tool } = await getTool();
+    const scheduledLike = await withChatContext(chatJid, "web", () => tool.execute("x", {
+      action: "secure_delete",
+      row_ids: [1],
+      dry_run: true,
+    }));
+    expect(scheduledLike.details).toMatchObject({ error: "owner_authorization_required", applied: false });
+
+    const ownerFacing = await withChatContext(chatJid, "web", () => tool.execute("x", {
+      action: "secure_delete",
+      row_ids: [1],
+      dry_run: true,
+    }), { ownerAuthorizedWebSession: true });
+    expect(ownerFacing.details.error).not.toBe("owner_authorization_required");
+  });
+
   test("registers the messages tool", async () => {
     const { tool } = await getTool();
     expect(tool).toBeDefined();

@@ -53,10 +53,12 @@ interface StoredMessageRow {
   thread_id: number | null;
   timestamp: string;
   is_bot_message: number;
+  content_erased: number;
+  content_erased_at: string | null;
 }
 
 /** Column list used in SELECT queries to ensure a consistent shape. */
-const MESSAGE_COLUMNS = "rowid, chat_jid, sender, sender_name, content, screen_hint, content_blocks, link_previews, annotations, thread_id, timestamp, is_bot_message";
+const MESSAGE_COLUMNS = "rowid, chat_jid, sender, sender_name, content, screen_hint, content_blocks, link_previews, annotations, thread_id, timestamp, is_bot_message, content_erased, content_erased_at";
 
 function ensureMonotonicMessageTimestamp(chatJid: string, requestedTimestamp: string): string {
   const requestedMs = Date.parse(requestedTimestamp);
@@ -107,6 +109,10 @@ function buildInteraction(row: StoredMessageRow, mediaIds: number[] = []): Inter
   const annotations = parseJsonArray(row.annotations);
   if (annotations?.length) data.annotations = annotations;
   if (row.thread_id !== null && row.thread_id !== undefined) data.thread_id = row.thread_id;
+  if (row.content_erased === 1) {
+    data.content_erased = true;
+    data.content_erased_at = row.content_erased_at;
+  }
   return {
     id: row.rowid,
     chat_jid: row.chat_jid,
@@ -176,8 +182,11 @@ export function storeMessage(msg: NewMessage): number {
   const contentBlocks = msg.content_blocks ? JSON.stringify(msg.content_blocks) : null;
   const linkPreviews = msg.link_previews ? JSON.stringify(msg.link_previews) : null;
   const existingBinding = db.prepare(
-    "SELECT operation_id FROM messages WHERE id = ? AND chat_jid = ?",
-  ).get(msg.id, msg.chat_jid) as { operation_id: string | null } | undefined;
+    "SELECT operation_id, content_erased FROM messages WHERE id = ? AND chat_jid = ?",
+  ).get(msg.id, msg.chat_jid) as { operation_id: string | null; content_erased: number } | undefined;
+  if (existingBinding?.content_erased === 1) {
+    throw new Error("Message content was securely erased and cannot be restored");
+  }
   const suppliedBinding = Object.prototype.hasOwnProperty.call(msg, "operation_id") ? msg.operation_id : undefined;
   if (existingBinding?.operation_id) {
     if (suppliedBinding === null) throw new Error("Message operation_id cannot be cleared");
