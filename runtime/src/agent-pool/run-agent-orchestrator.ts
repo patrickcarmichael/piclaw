@@ -1461,7 +1461,10 @@ export async function runAgentPrompt(
         modelLabel,
         turnToolExecutionCount,
       ),
-    }), { turnId: runOptions.turnId });
+    }), {
+      turnId: runOptions.turnId,
+      ownerAuthorizedWebSession: runOptions.ownerAuthorizedWebSession === true,
+    });
 
     if (runResult.status === "success" && !runOptions.toolCeilingFilter) {
       const completedToolControl = session as unknown as {

@@ -185,6 +185,8 @@ export interface RunAgentOptions {
   onGoalDeadlineCheckpoint?: (evidence: GoalDeadlineCheckpointEvidence) => boolean | Promise<boolean>;
   /** Stable runtime turn identifier for observability/correlation. */
   turnId?: string;
+  /** Owner-facing web request provenance; never set for scheduled/background turns. */
+  ownerAuthorizedWebSession?: boolean;
   /** Optional browser/user correlation identifier supplied by the caller. */
   userId?: string;
   /** Optional browser session correlation identifier supplied by the caller. */

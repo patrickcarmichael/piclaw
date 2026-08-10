@@ -49,6 +49,16 @@ export {
   replaceMessageContent,
 } from "./db/messages.js";
 export {
+  inspectSecureEraseMessageThreads,
+  secureEraseMessageThreads,
+} from "./db/secure-erasure.js";
+export type {
+  SecureEraseMessagePlan,
+  SecureEraseMessageResult,
+  SecureEraseMessageRoot,
+  SecureEraseOperationEvidence,
+} from "./db/secure-erasure.js";
+export {
   attachMediaToMessage,
   getMediaIdsForMessage,
   createMedia,

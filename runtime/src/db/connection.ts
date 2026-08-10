@@ -191,6 +191,9 @@ function createSchema(database: Database): void {
       is_terminal_agent_reply INTEGER DEFAULT 0,
       is_steering_message INTEGER DEFAULT 0,
       operation_id TEXT,
+      content_erased INTEGER NOT NULL DEFAULT 0,
+      content_erased_at TEXT,
+      content_erasure_id TEXT,
       PRIMARY KEY (id, chat_jid),
       FOREIGN KEY (chat_jid) REFERENCES chats(jid)
     );
@@ -213,6 +216,9 @@ function createSchema(database: Database): void {
       content='messages',
       content_rowid='rowid'
     );
+    -- FTS5 has its own secure-delete mode; PRAGMA secure_delete alone does not
+    -- guarantee that deleted terms are removed from FTS segment blocks.
+    INSERT INTO messages_fts(messages_fts, rank) VALUES('secure-delete', 1);
 
     -- Trigger: populate FTS on message insert.
     CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
@@ -232,6 +238,28 @@ function createSchema(database: Database): void {
       VALUES ('delete', old.rowid, old.content, old.chat_jid, old.sender, old.sender_name, old.timestamp, old.is_bot_message);
       INSERT INTO messages_fts(rowid, content, chat_jid, sender, sender_name, timestamp, is_bot_message)
       VALUES (new.rowid, new.content, new.chat_jid, new.sender, new.sender_name, new.timestamp, new.is_bot_message);
+    END;
+
+    CREATE TABLE IF NOT EXISTS message_secure_erasure_audit (
+      erasure_id TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL,
+      actor TEXT NOT NULL,
+      policy TEXT NOT NULL,
+      confirmation_token TEXT NOT NULL UNIQUE,
+      scope_token TEXT NOT NULL,
+      erased_row_ids_json TEXT NOT NULL,
+      operation_source_seqs_json TEXT NOT NULL,
+      operation_ids_json TEXT NOT NULL
+    );
+    CREATE TRIGGER IF NOT EXISTS message_secure_erasure_audit_update_exclusion
+    BEFORE UPDATE ON message_secure_erasure_audit
+    BEGIN
+      SELECT RAISE(ABORT, 'secure erasure audit is immutable');
+    END;
+    CREATE TRIGGER IF NOT EXISTS message_secure_erasure_audit_delete_exclusion
+    BEFORE DELETE ON message_secure_erasure_audit
+    BEGIN
+      SELECT RAISE(ABORT, 'secure erasure audit is immutable');
     END;
 
     CREATE TABLE IF NOT EXISTS media (
@@ -284,6 +312,36 @@ function createSchema(database: Database): void {
     -- created_at < cutoff) skip the full table scan once row counts grow.
     CREATE INDEX IF NOT EXISTS idx_thinking_content_created_at
       ON thinking_content(created_at);
+
+    -- Erased message identities are immutable across message-owned side tables.
+    -- This prevents later API calls from reattaching searchable media or
+    -- persisted reasoning to a content-free tombstone.
+    CREATE TRIGGER IF NOT EXISTS message_media_erased_message_insert_exclusion
+    BEFORE INSERT ON message_media
+    WHEN EXISTS (SELECT 1 FROM messages WHERE rowid = new.message_rowid AND content_erased = 1)
+    BEGIN
+      SELECT RAISE(ABORT, 'securely erased message tombstone cannot receive media');
+    END;
+    CREATE TRIGGER IF NOT EXISTS message_media_erased_message_update_exclusion
+    BEFORE UPDATE ON message_media
+    WHEN EXISTS (SELECT 1 FROM messages WHERE rowid = new.message_rowid AND content_erased = 1)
+    BEGIN
+      SELECT RAISE(ABORT, 'securely erased message tombstone cannot receive media');
+    END;
+    CREATE TRIGGER IF NOT EXISTS thinking_content_erased_message_insert_exclusion
+    BEFORE INSERT ON thinking_content
+    WHEN EXISTS (SELECT 1 FROM messages
+      WHERE rowid = CAST(new.message_id AS INTEGER) AND content_erased = 1)
+    BEGIN
+      SELECT RAISE(ABORT, 'securely erased message tombstone cannot receive thinking content');
+    END;
+    CREATE TRIGGER IF NOT EXISTS thinking_content_erased_message_update_exclusion
+    BEFORE UPDATE ON thinking_content
+    WHEN EXISTS (SELECT 1 FROM messages
+      WHERE rowid = CAST(new.message_id AS INTEGER) AND content_erased = 1)
+    BEGIN
+      SELECT RAISE(ABORT, 'securely erased message tombstone cannot receive thinking content');
+    END;
 
     CREATE TABLE IF NOT EXISTS tool_outputs (
       id TEXT PRIMARY KEY,
@@ -679,8 +737,12 @@ function ensureMessageColumns(database: Database): void {
   ensureColumn("is_steering_message", "INTEGER DEFAULT 0");
   ensureColumn("operation_id");
   ensureColumn("annotations");
+  ensureColumn("content_erased", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn("content_erased_at");
+  ensureColumn("content_erasure_id");
   database.exec(`
     CREATE INDEX IF NOT EXISTS idx_messages_operation_id ON messages(operation_id);
+    CREATE INDEX IF NOT EXISTS idx_messages_content_erasure_id ON messages(content_erasure_id);
     CREATE TRIGGER IF NOT EXISTS messages_operation_id_immutable
     BEFORE UPDATE OF operation_id ON messages
     WHEN old.operation_id IS NOT NULL
@@ -718,6 +780,58 @@ function ensureMessageColumns(database: Database): void {
       AND (new.is_bot_message != 1 OR new.is_terminal_agent_reply != 1)
     BEGIN
       SELECT RAISE(ABORT, 'terminal operation evidence is immutable');
+    END;
+    CREATE TRIGGER IF NOT EXISTS messages_secure_erasure_delete_exclusion
+    BEFORE DELETE ON messages
+    WHEN old.content_erased = 1
+    BEGIN
+      SELECT RAISE(ABORT, 'securely erased message tombstone cannot be deleted');
+    END;
+    CREATE TRIGGER IF NOT EXISTS messages_secure_erasure_insert_flag_valid
+    BEFORE INSERT ON messages
+    WHEN new.content_erased NOT IN (0, 1)
+    BEGIN
+      SELECT RAISE(ABORT, 'invalid secure erasure flag');
+    END;
+    CREATE TRIGGER IF NOT EXISTS messages_secure_erasure_update_flag_valid
+    BEFORE UPDATE OF content_erased ON messages
+    WHEN new.content_erased NOT IN (0, 1)
+    BEGIN
+      SELECT RAISE(ABORT, 'invalid secure erasure flag');
+    END;
+    CREATE TRIGGER IF NOT EXISTS messages_secure_erasure_insert_shape
+    BEFORE INSERT ON messages
+    WHEN new.content_erased = 1
+      AND (new.content IS NOT '' OR new.sender IS NOT '[erased]' OR new.sender_name IS NOT '[erased]'
+        OR new.screen_hint IS NOT NULL OR new.content_blocks IS NOT NULL OR new.link_previews IS NOT NULL
+        OR new.annotations IS NOT NULL OR new.content_erased_at IS NULL OR new.content_erasure_id IS NULL)
+    BEGIN
+      SELECT RAISE(ABORT, 'securely erased message must use the canonical tombstone');
+    END;
+    CREATE TRIGGER IF NOT EXISTS messages_secure_erasure_shape
+    BEFORE UPDATE OF content_erased ON messages
+    WHEN old.content_erased = 0 AND new.content_erased = 1
+      AND (new.content IS NOT '' OR new.sender IS NOT '[erased]' OR new.sender_name IS NOT '[erased]'
+        OR new.screen_hint IS NOT NULL OR new.content_blocks IS NOT NULL OR new.link_previews IS NOT NULL
+        OR new.annotations IS NOT NULL OR new.content_erased_at IS NULL OR new.content_erasure_id IS NULL)
+    BEGIN
+      SELECT RAISE(ABORT, 'securely erased message must use the canonical tombstone');
+    END;
+    CREATE TRIGGER IF NOT EXISTS messages_secure_erasure_immutable
+    BEFORE UPDATE ON messages
+    WHEN old.content_erased = 1 AND (
+      new.id IS NOT old.id OR new.chat_jid IS NOT old.chat_jid OR new.thread_id IS NOT old.thread_id
+      OR new.timestamp IS NOT old.timestamp OR new.is_from_me IS NOT old.is_from_me
+      OR new.is_bot_message IS NOT old.is_bot_message
+      OR new.is_terminal_agent_reply IS NOT old.is_terminal_agent_reply
+      OR new.is_steering_message IS NOT old.is_steering_message OR new.operation_id IS NOT old.operation_id
+      OR new.content_erased IS NOT 1 OR new.content IS NOT old.content OR new.sender IS NOT old.sender
+      OR new.sender_name IS NOT old.sender_name OR new.screen_hint IS NOT old.screen_hint
+      OR new.content_blocks IS NOT old.content_blocks OR new.link_previews IS NOT old.link_previews
+      OR new.annotations IS NOT old.annotations OR new.content_erased_at IS NOT old.content_erased_at
+      OR new.content_erasure_id IS NOT old.content_erasure_id)
+    BEGIN
+      SELECT RAISE(ABORT, 'securely erased message content is immutable');
     END;
   `);
 }

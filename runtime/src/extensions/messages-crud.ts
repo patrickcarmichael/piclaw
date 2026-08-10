@@ -7,12 +7,14 @@ import type { AgentToolResult, ExtensionAPI, ExtensionFactory } from "@earendil-
 import {
   attachMediaToMessage,
   deleteThreadByRowId,
+  inspectSecureEraseMessageThreads,
+  secureEraseMessageThreads,
   getDb,
   getMediaIdsForMessage,
   storeChatMetadata,
   storeMessage,
 } from "../db.js";
-import { getChatJid } from "../core/chat-context.js";
+import { getChatContext } from "../core/chat-context.js";
 import { stripInternalTags } from "../router.js";
 import { createUuid } from "../utils/ids.js";
 import { extractFtsFallbackTerms, isFtsOperatorQuery, prepareFtsQuery } from "../utils/fts-query.js";
@@ -29,6 +31,7 @@ const MessagesSchema = Type.Object({
       Type.Literal("add"),
       Type.Literal("post"),
       Type.Literal("delete"),
+      Type.Literal("secure_delete"),
       Type.Literal("move"),
     ]),
   ),
@@ -36,7 +39,7 @@ const MessagesSchema = Type.Object({
   pattern: Type.Optional(Type.String({ description: "Substring or regex pattern for grep/extract actions." })),
   row_ids: Type.Optional(
     Type.Array(Type.Integer({ minimum: 1 }), {
-      description: "Target row IDs (get/delete/move actions).",
+      description: "Target row IDs (get/delete/secure_delete/move actions).",
       maxItems: 50,
     }),
   ),
@@ -93,8 +96,16 @@ const MessagesSchema = Type.Object({
       description: "Structured content blocks (e.g. adaptive_card) for post action.",
     }),
   ),
-  dry_run: Type.Optional(Type.Boolean({ description: "For delete/move actions, report planned changes without applying." })),
+  dry_run: Type.Optional(Type.Boolean({ description: "For delete/secure_delete/move actions, report planned changes without applying." })),
   force: Type.Optional(Type.Boolean({ description: "For delete action, ignore attachment-safety checks." })),
+  confirmation: Type.Optional(Type.Literal("ERASE", {
+    description: "Required with dry_run=false for owner-authorized secure_delete. Use the exact value ERASE only after reviewing the dry-run plan.",
+  })),
+  confirmation_token: Type.Optional(Type.String({
+    description: "Plan-bound token returned by a secure_delete dry run. Required with confirmation=ERASE and rejected if the affected scope changed.",
+    minLength: 64,
+    maxLength: 64,
+  })),
 });
 
 export type MessagesParams = Static<typeof MessagesSchema>;
@@ -1448,6 +1459,113 @@ function moveMessageRowsToChat(rowIds: number[], targetChatJid: string): {
   };
 }
 
+function executeSecureDelete(
+  params: MessagesParams,
+  defaultChat: string,
+  ownerAuthorizedWebSession: boolean,
+): AgentToolResult<Record<string, unknown>> {
+  if (!ownerAuthorizedWebSession) {
+    return {
+      content: [{ type: "text", text: "Secure erase requires an owner-authorized web session; no content was changed." }],
+      details: {
+        action: "secure_delete",
+        applied: false,
+        error: "owner_authorization_required",
+        requires_confirmation: true,
+      },
+    };
+  }
+  const requested = Array.from(new Set((params.row_ids ?? []).filter((id) => Number.isInteger(id) && id > 0)))
+    .sort((a, b) => a - b);
+  if (requested.length === 0) {
+    return {
+      content: [{ type: "text", text: "Provide row_ids for action=secure_delete." }],
+      details: {
+        action: "secure_delete",
+        applied: false,
+        requires_confirmation: true,
+        requested_row_ids: [],
+        erase_row_ids: [],
+        missing_row_ids: [],
+      },
+    };
+  }
+
+  const chatJid = normalizeChatJid(params.chat_jid, defaultChat);
+  const roleFilter = normalizeRole(params.role);
+  const roots: Array<{ chatJid: string; rowId: number }> = [];
+  const missing = new Set<number>();
+  for (const rowId of requested) {
+    const row = fetchByRowId(chatJid, roleFilter, null, rowId);
+    if (!row) {
+      missing.add(rowId);
+      continue;
+    }
+    roots.push({ chatJid: row.chat_jid, rowId: row.rowid });
+  }
+
+  const confirmed = params.confirmation === "ERASE";
+  const applyRequested = params.dry_run === false && confirmed;
+  const result = applyRequested
+    ? secureEraseMessageThreads(roots, { confirmationToken: params.confirmation_token ?? "" })
+    : {
+        ...inspectSecureEraseMessageThreads(roots),
+        applied: false,
+        erasureId: null,
+        erasedMediaIds: [],
+        detachedMediaIds: [],
+        clearedThinkingRowIds: [],
+        clearedLinkPreviewCacheMediaIds: [],
+        clearedFtsRowIds: [],
+        rejectionReason: "confirmation_required" as const,
+      };
+  for (const rowId of result.missingRootRowIds) missing.add(rowId);
+  const blocked = result.blockedOperationSourceSeqs.length > 0;
+  const requiresConfirmation = !result.applied;
+  const details = {
+    action: "secure_delete",
+    requested_row_ids: requested,
+    erase_row_ids: result.eraseRowIds,
+    erased_row_ids: result.applied ? result.eraseRowIds : [],
+    already_erased_row_ids: result.alreadyErasedRowIds,
+    missing_row_ids: Array.from(missing).sort((a, b) => a - b),
+    operation_evidence: result.operationEvidence,
+    blocked_operation_source_seqs: result.blockedOperationSourceSeqs,
+    blocked_operation_ids: result.blockedOperationIds,
+    affected_media_ids: result.affectedMediaIds,
+    affected_thinking_row_ids: result.affectedThinkingRowIds,
+    affected_link_preview_cache_media_ids: result.affectedLinkPreviewCacheMediaIds,
+    erased_media_ids: result.erasedMediaIds,
+    detached_media_ids: result.detachedMediaIds,
+    cleared_thinking_row_ids: result.clearedThinkingRowIds,
+    cleared_link_preview_cache_media_ids: result.clearedLinkPreviewCacheMediaIds,
+    cleared_fts_row_ids: result.clearedFtsRowIds,
+    erasure_id: result.erasureId,
+    policy: "retained_tombstone_v1",
+    dry_run: params.dry_run !== false,
+    applied: result.applied,
+    requires_confirmation: requiresConfirmation,
+    confirmation_value: requiresConfirmation ? "ERASE" : undefined,
+    confirmation_token: result.confirmationToken,
+    rejection_reason: result.rejectionReason,
+    blocked,
+    chat_jid: chatJid,
+  };
+
+  let text: string;
+  if (blocked) {
+    text = `Secure erase blocked by ${result.blockedOperationSourceSeqs.length} unsettled operation source(s); no content was changed.`;
+  } else if (result.rejectionReason === "plan_changed") {
+    text = "Secure erase plan changed; no content was changed. Review the returned plan and confirmation_token before retrying.";
+  } else if (!result.applied) {
+    text = `Secure erase plan: ${result.eraseRowIds.length} row(s) would be tombstoned. Review operation_evidence, then repeat with dry_run=false, confirmation=ERASE, and the returned confirmation_token.`;
+  } else {
+    text = `Securely erased ${result.eraseRowIds.length} row(s); ${result.alreadyErasedRowIds.length} were already erased.`;
+  }
+
+  return { content: [{ type: "text", text }], details };
+}
+
 function executeDelete(params: MessagesParams, defaultChat: string): AgentToolResult<Record<string, unknown>> {
   const requested = Array.from(new Set((params.row_ids ?? []).filter((id) => Number.isInteger(id) && id > 0)));
   if (requested.length === 0) {
@@ -1657,6 +1775,7 @@ export function runMessagesTool(
   params: MessagesParams,
   defaultChat: string = "web:default",
   postFn?: (chatJid: string, content: string, isBot: boolean, mediaIds: number[], contentBlocks?: unknown[]) => number | null,
+  authority: { ownerAuthorizedWebSession?: boolean } = {},
 ): AgentToolResult<Record<string, unknown>> {
   const action = params.action || "search";
 
@@ -1668,6 +1787,9 @@ export function runMessagesTool(
   if (action === "add") return executeAdd(params, defaultChat);
   if (action === "post") return executePost(params, defaultChat, postFn);
   if (action === "delete") return executeDelete(params, defaultChat);
+  if (action === "secure_delete") {
+    return executeSecureDelete(params, defaultChat, authority.ownerAuthorizedWebSession === true);
+  }
   if (action === "move") return executeMove(params, defaultChat);
 
   return {
@@ -1692,8 +1814,9 @@ export function postMessagesToolMessage(
 
 const MESSAGES_TOOL_HINT = [
   "## Messages",
-  "Use the messages tool to search, retrieve, grep, extract, diff, add, post, move, and delete chat messages.",
+  "Use the messages tool to search, retrieve, grep, extract, diff, add, post, move, delete, and securely erase chat messages.",
   "Read operations are safe by default; move/delete require explicit actions and can be previewed with dry_run=true.",
+  "secure_delete is restricted to owner-authorized web sessions: preview it first, then pass dry_run=false, confirmation=ERASE, and the returned confirmation_token. Ordinary delete guards remain active.",
   "Read/search/get results include message metadata and include parsed content_blocks when available.",
   "The post action stores a message with content_blocks and broadcasts it to connected clients.",
   "Example:",
@@ -1706,6 +1829,8 @@ const MESSAGES_TOOL_HINT = [
   "- post: { action: \"post\", type: \"agent\", content: \"Card fallback\", content_blocks: [...] }",
   "- move: { action: \"move\", row_ids: [123, 124], target_chat_jid: \"web:branch\", dry_run: true }",
   "- delete: { action: \"delete\", row_ids: [123, 124], dry_run: true, force: true }",
+  "- secure delete plan: { action: \"secure_delete\", row_ids: [123], dry_run: true }",
+  "- secure delete apply: { action: \"secure_delete\", row_ids: [123], dry_run: false, confirmation: \"ERASE\", confirmation_token: \"<token from plan>\" }",
 ].join("\n");
 
 /** Post function type for broadcasting messages via the web channel. */
@@ -1733,12 +1858,16 @@ export const messagesCrud: ExtensionFactory = (pi: ExtensionAPI) => {
   pi.registerTool({
     name: "messages",
     label: "messages",
-    description: "Search, retrieve, grep, extract, diff, add, post, move, or delete messages via shared store.",
-    promptSnippet: "messages: search/get/grep/extract/diff/add/post/move/delete rows in the shared message timeline store.",
+    description: "Search, retrieve, grep, extract, diff, add, post, move, delete, or securely erase messages via shared store.",
+    promptSnippet: "messages: search/get/grep/extract/diff/add/post/move/delete/secure_delete rows in the shared message timeline store.",
     parameters: MessagesSchema,
     async execute(_toolCallId, params) {
-      const defaultChat = getChatJid("web:default");
-      return runMessagesTool(params, defaultChat, registeredPostFn);
+      const context = getChatContext();
+      const defaultChat = context?.chatJid ?? "web:default";
+      const ownerAuthorizedWebSession = context?.channel === "web"
+        && context.chatJid.startsWith("web:")
+        && context.ownerAuthorizedWebSession === true;
+      return runMessagesTool(params, defaultChat, registeredPostFn, { ownerAuthorizedWebSession });
     },
   });
 };

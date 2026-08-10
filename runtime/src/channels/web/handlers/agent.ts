@@ -12,6 +12,7 @@ import type { WebChannelLike } from "../core/web-channel-contracts.js";
 import type { AgentMessageAcceptanceHandler } from "../messaging/agent-message-acceptance.js";
 import {
   getTrustedAgentMessageProvenance,
+  isOwnerAuthorizedAgentMessageRequestContext,
   type AgentMessageRequestContext,
   type TrustedAgentMessageProvenance,
 } from "../messaging/agent-message-provenance.js";
@@ -246,6 +247,8 @@ export type BrowserObservabilityContext = {
   userId?: string;
   sessionId?: string;
   clientId?: string;
+  /** In-process provenance only; never read from browser-supplied headers. */
+  ownerAuthorizedWebSession?: boolean;
 };
 
 type QueueDeferredFollowupExtras = {
@@ -721,7 +724,10 @@ export async function handleAgentMessage(
 ): Promise<Response> {
   const agentId = pathname.split("/")[2] || defaultAgentId;
   const trustedProvenance = getTrustedAgentMessageProvenance(context);
-  const browserObservability = getBrowserObservabilityContext(req);
+  const browserObservability: BrowserObservabilityContext = {
+    ...getBrowserObservabilityContext(req),
+    ...(isOwnerAuthorizedAgentMessageRequestContext(context) ? { ownerAuthorizedWebSession: true } : {}),
+  };
   const parsed = await parseAgentMessageRequest(req);
   if (parsed.error || !parsed.payload) return channel.json({ error: parsed.error }, 400);
 
@@ -2567,6 +2573,7 @@ export async function processChat(
     ...(durableOperation ? { operationOwner: durableOperationOwner(durableOperation) } : {}),
     timeoutMs,
     turnId,
+    ownerAuthorizedWebSession: browserObservability?.ownerAuthorizedWebSession === true,
     ...(browserObservability?.userId ? { userId: browserObservability.userId } : {}),
     ...(browserObservability?.sessionId ? { sessionId: browserObservability.sessionId } : {}),
     ...(browserObservability?.clientId ? { clientId: browserObservability.clientId } : {}),

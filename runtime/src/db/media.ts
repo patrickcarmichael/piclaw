@@ -71,6 +71,18 @@ export function getMediaIdsForMessages(messageRowIds: number[]): number[] {
   return rows.map((row) => row.media_id);
 }
 
+/** Rebuild message FTS from canonical rows, then restore searchable attachment text. */
+export function rebuildMessagesFtsWithMedia(): void {
+  const db = getDb();
+  db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
+  const rows = db.prepare("SELECT DISTINCT message_rowid FROM message_media ORDER BY message_rowid")
+    .all() as Array<{ message_rowid: number }>;
+  for (const row of rows) {
+    const mediaIds = getMediaIdsForMessage(row.message_rowid);
+    if (mediaIds.length > 0) appendMediaTextToFts(db, row.message_rowid, mediaIds);
+  }
+}
+
 /**
  * Delete media records that are no longer referenced by any message.
  * Called after message deletion to clean up orphaned blobs.
@@ -81,7 +93,9 @@ export function deleteUnreferencedMedia(mediaIds: number[]): number {
   const db = getDb();
   const placeholders = mediaIds.map(() => "?").join(",");
   const res = db
-    .prepare(`DELETE FROM media WHERE id IN (${placeholders}) AND id NOT IN (SELECT media_id FROM message_media)`)
+    .prepare(`DELETE FROM media WHERE id IN (${placeholders})
+      AND id NOT IN (SELECT media_id FROM message_media)
+      AND id NOT IN (SELECT media_id FROM link_preview_image_cache)`)
     .run(...mediaIds);
   return Number(res.changes || 0);
 }

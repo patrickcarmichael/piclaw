@@ -2,6 +2,8 @@ export interface BrowserObservabilityContext {
   userId?: string;
   sessionId?: string;
   clientId?: string;
+  /** In-process provenance only; never read from browser-supplied headers. */
+  ownerAuthorizedWebSession?: boolean;
 }
 import type { WebChannelLike } from "../core/web-channel-contracts.js";
 import { getPrePromptCompactionForegroundMs } from "../../../core/config.js";

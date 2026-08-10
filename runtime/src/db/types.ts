@@ -52,6 +52,10 @@ export interface InteractionData {
   link_previews?: unknown[];
   /** User-created annotations (highlights, markup) stored on the message. */
   annotations?: unknown[];
+  /** True when owner-authorized secure erasure replaced the message with a content-free tombstone. */
+  content_erased?: boolean;
+  /** Erasure timestamp for a content-free tombstone. */
+  content_erased_at?: string | null;
 }
 
 /**
