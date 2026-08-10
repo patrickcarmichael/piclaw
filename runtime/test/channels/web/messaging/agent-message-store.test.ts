@@ -450,6 +450,7 @@ describe("storeAgentTurn", () => {
       is_terminal_agent_reply: 0,
     });
     expect(getChatOperation(chatJid)).toEqual(running.operation);
+    deleteChatOperationLifecycleState(chatJid);
   });
 
   test("rolls back terminal rows with disposition, cursor, and release on completion faults", () => {

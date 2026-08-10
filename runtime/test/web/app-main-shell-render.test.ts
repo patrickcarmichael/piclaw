@@ -268,6 +268,26 @@ test('renderMainShell passes queue controls to ComposeBox and does not render a 
   expect(topLevelQueueStackCount).toBe(0);
 });
 
+test('renderMainShell binds compose Abort to the operation identity in the authoritative status', () => {
+  const tree = renderMainShell(createMainShellRenderOptions({
+    agentStatus: {
+      type: 'thinking',
+      operation_id: 'operation-visible-1',
+      operation_authority: 'durable',
+    },
+    isComposeBoxAgentActive: true,
+  }));
+
+  let composeVNode: any = null;
+  walkVNodes(tree, (node) => {
+    if (node.type === ComposeBox) composeVNode = node;
+  });
+
+  expect(composeVNode).toBeTruthy();
+  expect(composeVNode.props.activeOperationId).toBe('operation-visible-1');
+  expect(composeVNode.props.activeOperationAuthority).toBe('durable');
+});
+
 test('handleComposePost does nothing while search is active', () => {
   const scrollToBottom = mock(() => {});
   const scrollPostedMessage = mock(() => {});

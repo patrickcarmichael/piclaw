@@ -21,6 +21,8 @@ export interface AgentMessagePayload {
   mode?: "auto" | "queue" | "steer";
   /** Internal trusted relay hint: persist a visible timeline row when a steer is queued. */
   persist_steer?: boolean;
+  /** Exact durable operation owner expected by an interactive Abort request. */
+  expected_operation_id?: string;
   content_blocks?: unknown[];
   link_previews?: unknown[];
   screen_hint?: string;
@@ -72,6 +74,15 @@ export async function parseAgentMessageRequest(req: Request): Promise<{
   }
   if (data.mode !== undefined && data.mode !== "auto" && data.mode !== "queue" && data.mode !== "steer") {
     return { error: "'mode' must be one of: auto, queue, steer" };
+  }
+  if (data.expected_operation_id !== undefined && typeof data.expected_operation_id !== "string") {
+    return { error: "'expected_operation_id' must be a string" };
+  }
+  if (typeof data.expected_operation_id === "string") {
+    data.expected_operation_id = data.expected_operation_id.trim();
+    if (!data.expected_operation_id || data.expected_operation_id.length > 128) {
+      return { error: "'expected_operation_id' must be between 1 and 128 characters" };
+    }
   }
 
   // Content length check — must match the limit used by parsePostPayload()

@@ -1,7 +1,7 @@
 import { html, useRef, useState, useEffect, useCallback, useMemo } from '../vendor/preact-htm.js';
 import { useTranslation } from '../utils/i18n.js';
 import { findPopupTypeaheadMatch, isPopupTypeaheadKey, resolvePopupTypeaheadMatch, updatePopupTypeaheadBuffer } from '../ui/popup-typeahead.js';
-import { getAgentModels, sendAgentMessage, uploadMedia } from '../api.js';
+import { abortAgentOperation, getAgentModels, sendAgentMessage, uploadMedia } from '../api.js';
 import { getLocalStorageItem, setLocalStorageItem } from '../utils/storage.js';
 import { buildMentionValue, filterMentionAgents, parseMentionAutocompleteQuery } from '../ui/agent-mentions.js';
 import { shouldOpenSessionSwitcherFromBlankCompose, shouldRouteComposeValueToSessionSwitcher } from '../ui/compose-session-switcher.js';
@@ -265,6 +265,13 @@ export function resolveComposeAbortButtonState(isAgentActive, isCompacting = fal
 
 export function isComposeSubmitAbortMode(mode) {
     return mode === 'abort' || mode === 'compacting';
+}
+
+export function resolveComposeAbortAuthority(activeOperationId, operationAuthority) {
+    const operationId = typeof activeOperationId === 'string' ? activeOperationId.trim() : '';
+    if (operationId) return { mode: 'exact', operationId };
+    if (operationAuthority === 'legacy') return { mode: 'legacy', operationId: null };
+    return { mode: 'unavailable', operationId: null };
 }
 
 export function resolveComposeExtensionWorkingDisplay(workingState, frameIndex = 0) {
@@ -1115,6 +1122,8 @@ export function ComposeBox({
     onSubmitIntercept,
     onMessageResponse,
     isAgentActive = false,
+    activeOperationId = null,
+    activeOperationAuthority = null,
     activeChatAgents = [],
     currentChatJid = 'web:default',
     connectionStatus = 'connected',
@@ -2359,6 +2368,33 @@ export function ComposeBox({
                 console.error('Failed to post:', error);
             }
         })();
+    };
+
+    const handleAbortActiveOperation = async () => {
+        const authority = resolveComposeAbortAuthority(activeOperationId, activeOperationAuthority);
+        if (authority.mode === 'legacy') {
+            await handleSubmit('/abort', 'steer', { clearAfterSubmit: false, includeMedia: false, includeFileRefs: false, includeFolderRefs: false, includeMessageRefs: false, recordHistory: false });
+            return;
+        }
+        if (authority.mode === 'unavailable') {
+            const message = 'The active operation identity is not available; no cancellation was sent.';
+            setSubmitError(message);
+            onSubmitError?.(message);
+            return;
+        }
+        setSubmitError(null);
+        setSubmitNotice(null);
+        try {
+            const response = await abortAgentOperation(currentAgentId, currentChatJid, authority.operationId);
+            onMessageResponse?.(response);
+            setSubmitNotice(resolveUiOnlyCommandNotice('/abort', response));
+            onPost?.(response);
+        } catch (error) {
+            const message = error?.message || 'Failed to abort the active operation.';
+            setSubmitError(message);
+            onSubmitError?.(message);
+            console.error('Failed to abort active operation:', error);
+        }
     };
 
     const handleInjectQueuedFollowup = (queuedItem) => {
@@ -3698,7 +3734,7 @@ export function ComposeBox({
                                         type="button"
                                         onClick=${() => {
                                             if (isComposeSubmitAbortMode(abortButtonState.mode)) {
-                                                void handleSubmit('/abort', 'steer', { clearAfterSubmit: false, includeMedia: false, includeFileRefs: false, includeFolderRefs: false, includeMessageRefs: false, recordHistory: false });
+                                                void handleAbortActiveOperation();
                                             }
                                         }}
                                         disabled=${abortButtonState.disabled}

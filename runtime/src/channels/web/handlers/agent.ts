@@ -986,14 +986,29 @@ export async function handleAgentMessage(
   }
 
   if (command?.type === "abort" && !hasAttachments) {
-    const activeOperation = getChatOperation(chatJid);
-    if (activeOperation) {
+    const expectedOperationId = typeof parsed.payload.expected_operation_id === "string"
+      ? parsed.payload.expected_operation_id.trim()
+      : "";
+    const activeOperation = expectedOperationId ? null : getChatOperation(chatJid);
+    const requestedOperationId = expectedOperationId || activeOperation?.operationId || "";
+    if (requestedOperationId) {
       const result = await channel.agentPool.cancelOperationAndAbort(
         chatJid,
-        activeOperation.operationId,
+        requestedOperationId,
         "user_abort",
       );
       if (result.status === "cancelled") channel.resumeChat(chatJid);
+      if (expectedOperationId && result.status !== "cancelled") {
+        return channel.json({
+          error: result.reason === "no_active_operation"
+            ? "No active operation matched the Abort request; no action was taken."
+            : "The active operation changed before cancellation; no action was taken.",
+          reason: result.reason,
+          chat_jid: chatJid,
+          expected_operation_id: expectedOperationId,
+          observed_operation_id: result.operation?.operationId ?? null,
+        }, 409);
+      }
       return channel.json(
         {
           thread_id: null,
@@ -1973,7 +1988,7 @@ export async function processChat(
     });
   }
   const streamRuntime = await createProcessChatStreamingRuntime({
-    channel, chatJid, agentId, threadId, turnId, runStartedAt, sourceMessageId: lastMessage.id ?? null,
+    channel, chatJid, agentId, threadId, turnId, operationId: durableOperation?.operationId ?? null, runStartedAt, sourceMessageId: lastMessage.id ?? null,
     withResolvedToolStatusHints, withAgentStatusProgressMetadata,
   });
   const { emitter, trackedEmitter, streamingHandler: trackedStreamingHandler, clearCommittedDraft, timeoutMs } = streamRuntime;
